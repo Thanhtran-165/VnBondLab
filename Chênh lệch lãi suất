@@ -1,0 +1,36 @@
+//@version=5
+indicator("Chênh lệch Lãi suất & Tín hiệu Cắt", shorttitle="Bond Spreads VN")
+
+// Lấy dữ liệu giá đóng cửa của các mã lãi suất
+vnintr = request.security("VNINTR", timeframe.period, close)
+vn10y = request.security("VN10Y", timeframe.period, close)
+us10y = request.security("US10Y", timeframe.period, close)
+
+// Tính toán các chênh lệch
+chenh_lech_interbank = vnintr - vn10y
+chenh_lech_vn_us = vn10y - us10y
+
+// --- VẼ ĐƯỜNG CHÊNH LỆCH ---
+plot(chenh_lech_interbank, title="Chênh lệch (VNINTR - VN10Y)", color=color.blue, linewidth=2)
+plot(chenh_lech_vn_us, title="Chênh lệch (VN10Y - US10Y)", color=color.orange, linewidth=2)
+
+// Vẽ đường 0 dùng làm mức tham chiếu
+hline(0, "Đường 0", color=color.gray, linestyle=hline.style_dashed)
+
+// --- PHẦN TÍN HIỆU KHI HAI ĐƯỜNG CẮT NHAU ---
+
+// Tạo điều kiện cho tín hiệu cắt
+// Tín hiệu cắt lên: Đường xanh dương (Interbank) cắt lên trên đường cam (VN-US)
+cat_lenh = ta.crossover(chenh_lech_interbank, chenh_lech_vn_us)
+
+// Tín hiệu cắt xuống: Đường xanh dương (Interbank) cắt xuống dưới đường cam (VN-US)
+cat_xuong = ta.crossunder(chenh_lech_interbank, chenh_lech_vn_us)
+
+// Vẽ nhãn tại điểm cắt để dễ nhận biết
+// --- DÒNG ĐÃ ĐƯỢC SỬA ---
+plotshape(cat_lenh, title="Cắt lên (Xanh > Cam)", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), text="Cắt Lên", textcolor=color.white, size=size.small)
+plotshape(cat_xuong, title="Cắt xuống (Xanh < Cam)", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="Cắt Xuống", textcolor=color.white, size=size.small)
+
+// (Tùy chọn) Tô màu nền để làm nổi bật các khu vực có tín hiệu
+mau_nen = cat_lenh ? color.new(color.green, 90) : cat_xuong ? color.new(color.red, 90) : na
+bgcolor(mau_nen, title="Nền Tín Hiệu Cắt")
