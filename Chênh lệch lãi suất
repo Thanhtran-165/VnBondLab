@@ -1,6 +1,6 @@
 //@version=5
-indicator("Macro Alert System v3.4.2 Pro (3-pane, labeled P1+P2, dashboard merged & clearer)",
-     shorttitle="MacroPro v3.4.2", overlay=false, max_labels_count=500, max_lines_count=500)
+indicator("Macro Alert System v4.0.0 - Academic w/ VN02Y & 3-Layer Risk",
+     shorttitle="MacroAcademic v4.0.0", overlay=false, max_labels_count=500, max_lines_count=500)
 
 // =====================
 // 0) HÀM PHỤ TRỢ
@@ -12,14 +12,27 @@ f_zscore(src, length) =>
 
 f_statusColor(s) =>
     color c = color.new(color.green, 0)
-    if s == "NGUY HIEM" or s == "CANH BAO" or s == "RUI RO"
+    if s == "CANG THANG" or s == "DAO NGUOC" or s == "AP LUC FX"
         c := color.new(color.red, 0)
     else if s == "THAP"
         c := color.new(color.orange, 0)
     c
 
+f_layerColor(pct) =>
+    color c = color.new(color.green, 0)
+    if pct >= 80
+        c := color.new(color.red, 0)
+    else if pct >= 60
+        c := color.new(color.orange, 0)
+    else if pct >= 40
+        c := color.new(color.yellow, 0)
+    else if pct >= 20
+        c := color.new(color.lime, 0)
+    else
+        c := color.new(color.green, 0)
+    c
+
 f_textColorForBg(bg) =>
-    // Nếu nền vàng -> chữ đen, còn lại chữ trắng
     bg == color.new(color.yellow, 0) ? color.black : color.white
 
 f_delLabel(l) =>
@@ -27,36 +40,39 @@ f_delLabel(l) =>
         label.delete(l)
 
 // =====================
-// 1) CHẾ ĐỘ HIỂN THỊ (3 PANEL)
+// 1) CHẾ ĐỘ HIỂN THỊ (3 PANEL + LAYERS)
 // =====================
 view_mode = input.string(
      "Pane 1 - Lai suat & chinh sach",
      "Che do hien thi",
      options = [
          "Pane 1 - Lai suat & chinh sach",
-         "Pane 2 - Spreads & z-score",
-         "Pane 3 - Risk score & Dashboard"
+         "Pane 2 - Spreads & z-score", 
+         "Pane 3 - Risk score & Dashboard",
+         "Pane 4 - 3-Layer Risk Analysis"
      ])
 
 show_pane1 = view_mode == "Pane 1 - Lai suat & chinh sach"
 show_pane2 = view_mode == "Pane 2 - Spreads & z-score"
 show_pane3 = view_mode == "Pane 3 - Risk score & Dashboard"
+show_pane4 = view_mode == "Pane 4 - 3-Layer Risk Analysis"
 
 // =====================
-// 2) NHẬP DỮ LIỆU
+// 2) NHẬP DỮ LIỆU - ĐÃ BỔ SUNG VN02Y
 // =====================
 policy_rate     = request.security("VNINTR", timeframe.period, close)
+bond_2y         = request.security("VN02Y",  timeframe.period, close)
 bond_10y        = request.security("VN10Y",  timeframe.period, close)
 us_10y          = request.security("US10Y",  timeframe.period, close)
 interbank_rate  = request.security("VNINBR", timeframe.period, close)
 
 // =====================
-// 3) SPREADS
+// 3) SPREADS - CẬP NHẬT HỌC THUẬT VỚI VN02Y
 // =====================
-monetary_transmission = interbank_rate - policy_rate
-yield_curve           = bond_10y - interbank_rate
-international_spread  = bond_10y - us_10y
-term_premium          = bond_10y - policy_rate
+liquidity_stress        = interbank_rate - policy_rate
+yield_curve_standard    = bond_10y - bond_2y
+intl_yield_diff         = bond_10y - us_10y
+long_short_spread       = bond_10y - policy_rate
 
 hline(0, "0", color=color.new(color.gray, 80), linestyle=hline.style_dashed)
 
@@ -65,78 +81,105 @@ hline(0, "0", color=color.new(color.gray, 80), linestyle=hline.style_dashed)
 // =====================
 threshold_mode = input.string("Dynamic (z-score)", "Che do nguong", options = ["Static", "Dynamic (z-score)"])
 
-// Ngưỡng tĩnh
-trans_threshold = input.float(1.5, "Nguong Truyen dan (diem %)", step=0.1)
-curve_threshold = input.float(0.0, "Nguong Dao nguoc", step=0.1)
-intl_threshold  = input.float(2.0, "Nguong Chenh lech QT (diem %)", step=0.1)
-term_threshold  = input.float(3.0, "Nguong Phan bu Ky han (diem %)", step=0.1)
+stress_threshold    = input.float(1.5, "Nguong Cang thanh khoan (diem %)", step=0.1)
+curve_threshold     = input.float(0.0, "Nguong Dao nguoc (10Y-2Y)", step=0.1)
+intl_threshold      = input.float(2.0, "Nguong Chenh lech QT (diem %)", step=0.1)
+spread_threshold    = input.float(3.0, "Nguong Spread ngan-dai (diem %)", step=0.1)
 
-// Ngưỡng động
 len_stats   = input.int(252, "Chu ky thong ke (z-score)", minval=60)
-z_mon_high  = input.float( 1.5, "Z cao – Truyen dan", step=0.1)
-z_mon_low   = input.float(-1.0, "Z thap – Truyen dan", step=0.1)
-z_yc_low    = input.float(-1.0, "Z thap – Yield curve", step=0.1)
-z_intl_low  = input.float(-1.0, "Z thap – QT", step=0.1)
-z_term_low  = input.float(-1.0, "Z thap – Ky han", step=0.1)
+z_stress_high  = input.float( 1.5, "Z cao – Cang thanh khoan", step=0.1)
+z_stress_low   = input.float(-1.0, "Z thap – Cang thanh khoan", step=0.1)
+z_curve_low    = input.float(-1.0, "Z thap – Yield curve (10Y-2Y)", step=0.1)
+z_intl_low     = input.float(-1.0, "Z thap – Chenh lech QT", step=0.1)
+z_spread_low   = input.float(-1.0, "Z thap – Spread ngan-dai", step=0.1)
 
-mon_z  = f_zscore(monetary_transmission, len_stats)
-yc_z   = f_zscore(yield_curve,           len_stats)
-intl_z = f_zscore(international_spread,  len_stats)
-term_z = f_zscore(term_premium,          len_stats)
+stress_z  = f_zscore(liquidity_stress, len_stats)
+curve_z   = f_zscore(yield_curve_standard, len_stats)
+intl_z    = f_zscore(intl_yield_diff, len_stats)
+spread_z  = f_zscore(long_short_spread, len_stats)
 
 use_dynamic = threshold_mode == "Dynamic (z-score)"
 
 // =====================
-// 5) TÍN HIỆU 4 TRỤ
+// 5) TÍN HIỆU 4 TRỤ - CẬP NHẬT CHO YIELD CURVE CHUẨN
 // =====================
-bool monetary_stress = false
-bool monetary_ease   = false
-bool yield_inversion = false
-bool intl_warning    = false
-bool term_warning    = false
+bool stress_high    = false
+bool stress_low     = false
+bool curve_inversion= false
+bool intl_warning   = false
+bool spread_warning = false
 
 if use_dynamic
-    monetary_stress := mon_z > z_mon_high
-    monetary_ease   := mon_z < z_mon_low
+    stress_high     := stress_z > z_stress_high
+    stress_low      := stress_z < z_stress_low
 else
-    monetary_stress := monetary_transmission > trans_threshold
-    monetary_ease   := monetary_transmission < -trans_threshold * 0.5
+    stress_high     := liquidity_stress > stress_threshold
+    stress_low      := liquidity_stress < -stress_threshold * 0.5
 
 if use_dynamic
-    yield_inversion := yc_z < z_yc_low
+    curve_inversion := curve_z < z_curve_low
 else
-    yield_inversion := yield_curve < curve_threshold
+    curve_inversion := yield_curve_standard < curve_threshold
 
 if use_dynamic
     intl_warning := intl_z < z_intl_low
 else
-    intl_warning := international_spread < intl_threshold
+    intl_warning := intl_yield_diff < intl_threshold
 
 if use_dynamic
-    term_warning := term_z < z_term_low
+    spread_warning := spread_z < z_spread_low
 else
-    term_warning := term_premium < term_threshold
+    spread_warning := long_short_spread < spread_threshold
 
 // =====================
-// 6) RISK SCORE (TRỌNG SỐ) + MÀU SẮC
+// 6) PHÂN TÁCH 3 LỚP RỦI RO - CẬP NHẬT VỚI DỮ LIỆU CHUẨN
 // =====================
-w_monetary = input.int(2, "Trong so Truyen dan")
-w_curve    = input.int(2, "Trong so Yield curve")
-w_intl     = input.int(1, "Trong so QT")
-w_term     = input.int(1, "Trong so Ky han")
+show_risk_layers = input.bool(true, "🔽 Hien thi phan tich 3 lop rui ro")
+
+layer1_weight_stress = input.int(3, "🟥 Lop 1: Trong so Cang thanh khoan", minval=1, maxval=5)
+layer1_weight_curve_funding = input.int(1, "🟥 Lop 1: Trong so Curve (funding proxy)", minval=0, maxval=2)
+
+layer1_score = 0.0
+layer1_score := (stress_high ? layer1_weight_stress : 0) + (curve_inversion ? layer1_weight_curve_funding : 0)
+layer1_max = layer1_weight_stress + layer1_weight_curve_funding
+layer1_pct = layer1_max > 0 ? (layer1_score / layer1_max) * 100 : 0.0
+
+layer2_weight_curve_macro = input.int(3, "🟨 Lop 2: Trong so Yield curve (10Y-2Y)", minval=1, maxval=5)
+layer2_weight_spread = input.int(2, "🟨 Lop 2: Trong so Spread ngan-dai", minval=1, maxval=5)
+
+layer2_score = 0.0
+layer2_score := (curve_inversion ? layer2_weight_curve_macro : 0) + (spread_warning ? layer2_weight_spread : 0)
+layer2_max = layer2_weight_curve_macro + layer2_weight_spread
+layer2_pct = layer2_max > 0 ? (layer2_score / layer2_max) * 100 : 0.0
+
+layer3_weight_intl = input.int(2, "🟦 Lop 3: Trong so Chenh lech QT", minval=1, maxval=5)
+layer3_weight_fx = input.int(1, "🟦 Lop 3: Trong so FX pressure", minval=1, maxval=5)
+
+layer3_score = 0.0
+layer3_score := (intl_warning ? layer3_weight_intl : 0) + (stress_high and intl_warning ? layer3_weight_fx : 0)
+layer3_max = layer3_weight_intl + layer3_weight_fx
+layer3_pct = layer3_max > 0 ? (layer3_score / layer3_max) * 100 : 0.0
+
+// =====================
+// 7) RISK SCORE TỔNG HỢP (Legacy)
+// =====================
+w_stress = input.int(2, "Trong so Cang thanh khoan")
+w_curve  = input.int(2, "Trong so Yield curve (10Y-2Y)")
+w_intl   = input.int(1, "Trong so Chenh lech QT")
+w_spread = input.int(1, "Trong so Spread ngan-dai")
 
 int risk_score = 0
 risk_score := 0
-if monetary_stress
-    risk_score += w_monetary
-if yield_inversion
+if stress_high
+    risk_score += w_stress
+if curve_inversion
     risk_score += w_curve
 if intl_warning
     risk_score += w_intl
-if term_warning
-    risk_score += w_term
+if spread_warning
+    risk_score += w_spread
 
-max_score  = w_monetary + w_curve + w_intl + w_term
+max_score  = w_stress + w_curve + w_intl + w_spread
 risk_ratio = max_score > 0 ? risk_score / max_score : 0.0
 risk_pct   = risk_ratio * 100.0
 
@@ -151,11 +194,12 @@ color risk_bg   = color.new(risk_base, 92)
 color risk_fill = color.new(risk_base, 85)
 
 // =====================
-// 7) PANE 1 – LÃI SUẤT & CHÍNH SÁCH + LABELS
+// 8) PANE 1 – LÃI SUẤT & CHÍNH SÁCH - BỔ SUNG VN02Y (ĐÃ SỬA LỖI)
 // =====================
 show_pane1_labels = input.bool(true, "Pane 1: Show line labels (last bar)")
 
 plot(show_pane1 ? bond_10y       : na, title="VN10Y",        color=color.new(color.orange, 0), linewidth=2)
+plot(show_pane1 ? bond_2y        : na, title="VN02Y",        color=color.new(color.purple, 0), linewidth=2)
 plot(show_pane1 ? interbank_rate : na, title="VN Interbank", color=color.new(color.teal,   0), linewidth=2)
 plot(show_pane1 ? policy_rate    : na, title="SBV Policy",   color=color.new(color.red,    0), linewidth=2)
 plot(show_pane1 ? us_10y         : na, title="US10Y",        color=color.new(color.blue,  40), linewidth=1)
@@ -164,68 +208,71 @@ var label p1_l1 = na
 var label p1_l2 = na
 var label p1_l3 = na
 var label p1_l4 = na
+var label p1_l5 = na
 
 if barstate.islast
-    f_delLabel(p1_l1), f_delLabel(p1_l2), f_delLabel(p1_l3), f_delLabel(p1_l4)
+    f_delLabel(p1_l1)
+    f_delLabel(p1_l2)
+    f_delLabel(p1_l3)
+    f_delLabel(p1_l4)
+    f_delLabel(p1_l5)
     if show_pane1 and show_pane1_labels
         p1_l1 := label.new(bar_index, bond_10y,       "VN10Y",        style=label.style_label_left, textcolor=color.white, color=color.new(color.orange, 10))
-        p1_l2 := label.new(bar_index, interbank_rate, "VN Interbank", style=label.style_label_left, textcolor=color.white, color=color.new(color.teal,   10))
-        p1_l3 := label.new(bar_index, policy_rate,    "SBV Policy",   style=label.style_label_left, textcolor=color.white, color=color.new(color.red,    10))
-        p1_l4 := label.new(bar_index, us_10y,         "US10Y",        style=label.style_label_left, textcolor=color.white, color=color.new(color.blue,   30))
+        p1_l2 := label.new(bar_index, bond_2y,        "VN02Y",        style=label.style_label_left, textcolor=color.white, color=color.new(color.purple, 10))
+        p1_l3 := label.new(bar_index, interbank_rate, "VN Interbank", style=label.style_label_left, textcolor=color.white, color=color.new(color.teal,   10))
+        p1_l4 := label.new(bar_index, policy_rate,    "SBV Policy",   style=label.style_label_left, textcolor=color.white, color=color.new(color.red,    10))
+        p1_l5 := label.new(bar_index, us_10y,         "US10Y",        style=label.style_label_left, textcolor=color.white, color=color.new(color.blue,   30))
 
 // =====================
-// 8) PANE 2 – SPREADS / Z-SCORE + EVENT MARKERS + LABELS
+// 9) PANE 2 – SPREADS / Z-SCORE - CẬP NHẬT HIỂN THỊ
 // =====================
-pane2_view = input.string("Z-scores", "Pane 2: Hien thi", options=["Spreads","Z-scores"])
+pane2_view = input.string("Spreads", "Pane 2: Hien thi", options=["Spreads","Z-scores"])
 show_pane2_events = input.bool(true, "Pane 2: Event markers (edge)")
 show_pane2_labels = input.bool(true, "Pane 2: Show line labels (last bar)")
 
 use_spreads = pane2_view == "Spreads"
 use_zscores = pane2_view == "Z-scores"
 
-p2_a = use_spreads ? monetary_transmission : mon_z
-p2_b = use_spreads ? yield_curve           : yc_z
-p2_c = use_spreads ? international_spread  : intl_z
-p2_d = use_spreads ? term_premium          : term_z
+p2_a = use_spreads ? liquidity_stress : stress_z
+p2_b = use_spreads ? yield_curve_standard : curve_z
+p2_c = use_spreads ? intl_yield_diff : intl_z
+p2_d = use_spreads ? long_short_spread : spread_z
 
-name_a = use_spreads ? "Truyen dan (LNH-Policy)" : "Z Truyen dan"
-name_b = use_spreads ? "Yield curve (10Y-LNH)"   : "Z Yield curve"
-name_c = use_spreads ? "QT spread (VN10Y-US10Y)" : "Z QT spread"
-name_d = use_spreads ? "Term premium (10Y-Pol.)" : "Z Term premium"
+name_a = use_spreads ? "Liquidity stress (IB-Pol)" : "Z Liquidity stress"
+name_b = use_spreads ? "Yield curve (10Y-2Y)" : "Z Yield curve"
+name_c = use_spreads ? "Intl yield diff (VN-US)" : "Z Intl yield diff"
+name_d = use_spreads ? "Long-short spread (10Y-Pol)" : "Z Long-short spread"
 
-// Plot SPREADS (title const)
-plot(show_pane2 and use_spreads ? monetary_transmission : na, title="Truyen dan (LNH-Policy)", color=color.new(#FF6B6B, 0), linewidth=2)
-plot(show_pane2 and use_spreads ? yield_curve           : na, title="Yield curve (10Y-LNH)",   color=color.new(#4ECDC4, 0), linewidth=2)
-plot(show_pane2 and use_spreads ? international_spread  : na, title="QT spread (VN10Y-US10Y)", color=color.new(#45B7D1, 0), linewidth=2)
-plot(show_pane2 and use_spreads ? term_premium          : na, title="Term premium (10Y-Pol.)", color=color.new(#96CEB4, 0), linewidth=2)
+plot(show_pane2 and use_spreads ? liquidity_stress : na, title="Liquidity stress (IB-Pol)", color=color.new(#FF6B6B, 0), linewidth=2)
+plot(show_pane2 and use_spreads ? yield_curve_standard : na, title="Yield curve (10Y-2Y)", color=color.new(#4ECDC4, 0), linewidth=2)
+plot(show_pane2 and use_spreads ? intl_yield_diff : na, title="Intl yield diff (VN-US)", color=color.new(#45B7D1, 0), linewidth=2)
+plot(show_pane2 and use_spreads ? long_short_spread : na, title="Long-short spread (10Y-Pol)", color=color.new(#96CEB4, 0), linewidth=2)
 
-// Plot Z-SCORES (title const)
-plot(show_pane2 and use_zscores ? mon_z  : na, title="Z Truyen dan",   color=color.new(#FF6B6B, 0), linewidth=2)
-plot(show_pane2 and use_zscores ? yc_z   : na, title="Z Yield curve",  color=color.new(#4ECDC4, 0), linewidth=2)
-plot(show_pane2 and use_zscores ? intl_z : na, title="Z QT spread",    color=color.new(#45B7D1, 0), linewidth=2)
-plot(show_pane2 and use_zscores ? term_z : na, title="Z Term premium", color=color.new(#96CEB4, 0), linewidth=2)
+plot(show_pane2 and use_zscores ? stress_z : na, title="Z Liquidity stress", color=color.new(#FF6B6B, 0), linewidth=2)
+plot(show_pane2 and use_zscores ? curve_z : na, title="Z Yield curve (10Y-2Y)", color=color.new(#4ECDC4, 0), linewidth=2)
+plot(show_pane2 and use_zscores ? intl_z : na, title="Z Intl yield diff", color=color.new(#45B7D1, 0), linewidth=2)
+plot(show_pane2 and use_zscores ? spread_z : na, title="Z Long-short spread", color=color.new(#96CEB4, 0), linewidth=2)
 
-// Event markers
-stress_evt = show_pane2 and show_pane2_events and monetary_stress and not monetary_stress[1]
-ease_evt   = show_pane2 and show_pane2_events and monetary_ease   and not monetary_ease[1]
-inv_evt    = show_pane2 and show_pane2_events and yield_inversion and not yield_inversion[1]
-fx_evt     = show_pane2 and show_pane2_events and intl_warning    and not intl_warning[1]
-tp_evt     = show_pane2 and show_pane2_events and term_warning    and not term_warning[1]
+stress_high_evt = show_pane2 and show_pane2_events and stress_high and not stress_high[1]
+inv_evt         = show_pane2 and show_pane2_events and curve_inversion and not curve_inversion[1]
+fx_evt          = show_pane2 and show_pane2_events and intl_warning and not intl_warning[1]
+spread_evt      = show_pane2 and show_pane2_events and spread_warning and not spread_warning[1]
 
-plotshape(stress_evt, title="Evt Stress",    style=shape.triangledown, location=location.top, color=color.red,    size=size.tiny)
-plotshape(ease_evt,   title="Evt Ease",      style=shape.triangleup,   location=location.top, color=color.green,  size=size.tiny)
-plotshape(inv_evt,    title="Evt Inversion", style=shape.xcross,       location=location.top, color=color.orange, size=size.tiny)
-plotshape(fx_evt,     title="Evt FX",        style=shape.diamond,      location=location.top, color=color.purple, size=size.tiny)
-plotshape(tp_evt,     title="Evt TP",        style=shape.circle,       location=location.top, color=color.blue,   size=size.tiny)
+plotshape(stress_high_evt, title="Evt Stress High", style=shape.triangledown, location=location.top, color=color.red,    size=size.tiny)
+plotshape(inv_evt,         title="Evt Curve Inversion",   style=shape.xcross,       location=location.top, color=color.orange, size=size.tiny)
+plotshape(fx_evt,          title="Evt FX Pressure", style=shape.diamond,      location=location.top, color=color.purple, size=size.tiny)
+plotshape(spread_evt,      title="Evt Spread Low",  style=shape.circle,       location=location.top, color=color.blue,   size=size.tiny)
 
-// Labels Panel 2 (bar cuối)
 var label p2_l1 = na
 var label p2_l2 = na
 var label p2_l3 = na
 var label p2_l4 = na
 
 if barstate.islast
-    f_delLabel(p2_l1), f_delLabel(p2_l2), f_delLabel(p2_l3), f_delLabel(p2_l4)
+    f_delLabel(p2_l1)
+    f_delLabel(p2_l2)
+    f_delLabel(p2_l3)
+    f_delLabel(p2_l4)
     if show_pane2 and show_pane2_labels
         p2_l1 := label.new(bar_index, p2_a, name_a, style=label.style_label_left, textcolor=color.white, color=color.new(#FF6B6B, 10))
         p2_l2 := label.new(bar_index, p2_b, name_b, style=label.style_label_left, textcolor=color.white, color=color.new(#4ECDC4, 10))
@@ -233,23 +280,23 @@ if barstate.islast
         p2_l4 := label.new(bar_index, p2_d, name_d, style=label.style_label_left, textcolor=color.white, color=color.new(#96CEB4, 10))
 
 // =====================
-// 9) KỊCH BẢN VĨ MÔ
+// 10) KỊCH BẢN VĨ MÔ
 // =====================
-liquidity_crisis  = monetary_stress and yield_inversion and intl_warning
-recession_warning = yield_inversion and term_warning
-fx_pressure       = intl_warning and monetary_stress
-inflation_high    = term_premium > term_threshold * 1.5 and yield_curve > 0
+liquidity_crisis  = stress_high and curve_inversion and intl_warning
+recession_warning = curve_inversion and spread_warning
+fx_pressure       = intl_warning and stress_high
+inflation_proxy   = long_short_spread > spread_threshold * 1.5 and yield_curve_standard > 0
 
-scenario_display = input.string("Latest label only", "Scenario hien thi (Pane 2/3)", options=["Off","Markers on transitions","Latest label only"])
+scenario_display = input.string("Latest label only", "Scenario hien thi", options=["Off","Markers on transitions","Latest label only"])
 
-sc_show = (show_pane2 or show_pane3)
+sc_show = (show_pane2 or show_pane3 or show_pane4)
 sc_mark = sc_show and scenario_display == "Markers on transitions"
 sc_last = sc_show and scenario_display == "Latest label only" and barstate.islast
 
 liq_evt = sc_mark and liquidity_crisis  and not liquidity_crisis[1]
 rec_evt = sc_mark and recession_warning and not recession_warning[1]
 fxp_evt = sc_mark and fx_pressure       and not fx_pressure[1]
-inf_evt = sc_mark and inflation_high    and not inflation_high[1]
+inf_evt = sc_mark and inflation_proxy   and not inflation_proxy[1]
 
 plotshape(liq_evt, title="SC_LIQ", style=shape.square, location=location.top, color=color.red,    size=size.tiny)
 plotshape(rec_evt, title="SC_REC", style=shape.square, location=location.top, color=color.orange, size=size.tiny)
@@ -259,102 +306,93 @@ plotshape(inf_evt, title="SC_INF", style=shape.square, location=location.top, co
 plotshape(sc_last and liquidity_crisis,  title="SC_LIQ_LAST", style=shape.labeldown, location=location.top, color=color.red,    text="LIQ", textcolor=color.white, size=size.small)
 plotshape(sc_last and recession_warning, title="SC_REC_LAST", style=shape.labeldown, location=location.top, color=color.orange, text="REC", textcolor=color.white, size=size.small)
 plotshape(sc_last and fx_pressure,       title="SC_FX_LAST",  style=shape.labeldown, location=location.top, color=color.purple, text="FX",  textcolor=color.white, size=size.small)
-plotshape(sc_last and inflation_high,    title="SC_INF_LAST", style=shape.labeldown, location=location.top, color=color.yellow, text="INF", textcolor=color.black, size=size.small)
+plotshape(sc_last and inflation_proxy,   title="SC_INF_LAST", style=shape.labeldown, location=location.top, color=color.yellow, text="INF", textcolor=color.black, size=size.small)
 
 // =====================
-// 10) PANE 3 – RISK SCORE & DASHBOARD (MERGE CELLS + RÕ HƠN)
+// 11) PANE 3 – RISK SCORE & DASHBOARD
 // =====================
 p3_risk = show_pane3 ? risk_pct : na
 plot(p3_risk, title="Risk % (0-100)", color=color.new(color.white, 0), linewidth=2, style=plot.style_stepline)
 plot(p3_risk, title="Risk fill", style=plot.style_area, color=show_pane3 ? risk_fill : na)
 bgcolor(show_pane3 ? risk_bg : na, title="Risk background")
 
-// Table styles (đậm hơn)
 tbl_border = color.new(color.white, 20)
 tbl_bg1    = color.new(color.black, 10)
 tbl_bg2    = color.new(color.black, 25)
 hdr_bg     = color.new(color.white, 5)
 row_bg     = color.new(color.black, 20)
 
-var risk_table = table.new(position.top_right, 2, 6, bgcolor=tbl_bg2, border_width=2, border_color=tbl_border)
+var risk_table = table.new(position.top_right, 2, 7, bgcolor=tbl_bg2, border_width=2, border_color=tbl_border)
 var dashboard  = table.new(position.bottom_right, 3, 7, bgcolor=tbl_bg1, border_width=2, border_color=tbl_border)
 
 show_z_in_dash = input.bool(true, "Pane 3: Dashboard show z-score (when Dynamic)")
 
 if barstate.islast and show_pane3
-    // ===== Risk table: merge title across 2 columns =====
     table.merge_cells(risk_table, 0, 0, 1, 0)
-    table.cell(risk_table, 0, 0, " HE THONG CANH BAO VI MO ",
+    table.cell(risk_table, 0, 0, " HE THONG CANH BAO VI MO CHUAN ",
          bgcolor=color.new(color.blue, 0), text_color=color.white, text_size=size.normal)
+    
+    table.merge_cells(risk_table, 0, 1, 1, 1)
+    table.cell(risk_table, 0, 1, "✓ Dung duong cong loi suat chuan (10Y-2Y)",
+         bgcolor=color.new(#4CAF50, 30), text_color=color.white, text_size=size.tiny)
 
-    table.cell(risk_table, 0, 1, " Truyen dan ",  bgcolor=monetary_stress ? color.red : color.green, text_color=color.white, text_size=size.small)
-    table.cell(risk_table, 0, 2, " Yield curve ", bgcolor=yield_inversion ? color.red : color.green, text_color=color.white, text_size=size.small)
-    table.cell(risk_table, 0, 3, " QT ",          bgcolor=intl_warning ? color.red : color.green,    text_color=color.white, text_size=size.small)
-    table.cell(risk_table, 0, 4, " Ky han ",      bgcolor=term_warning ? color.red : color.green,    text_color=color.white, text_size=size.small)
+    table.cell(risk_table, 0, 2, " Cang TK ",  bgcolor=stress_high ? color.red : color.green, text_color=color.white, text_size=size.small)
+    table.cell(risk_table, 0, 3, " Yield curve ", bgcolor=curve_inversion ? color.red : color.green, text_color=color.white, text_size=size.small)
+    table.cell(risk_table, 0, 4, " Intl diff ", bgcolor=intl_warning ? color.red : color.green, text_color=color.white, text_size=size.small)
+    table.cell(risk_table, 0, 5, " Long-short ", bgcolor=spread_warning ? color.red : color.green, text_color=color.white, text_size=size.small)
 
-    table.cell(risk_table, 1, 1, monetary_stress ? " STRESS " : " OK ", bgcolor=monetary_stress ? color.red : color.green, text_color=color.white, text_size=size.small)
-    table.cell(risk_table, 1, 2, yield_inversion ? " INV "    : " OK ", bgcolor=yield_inversion ? color.red : color.green, text_color=color.white, text_size=size.small)
-    table.cell(risk_table, 1, 3, intl_warning    ? " WARN "   : " OK ", bgcolor=intl_warning ? color.red : color.green, text_color=color.white, text_size=size.small)
-    table.cell(risk_table, 1, 4, term_warning    ? " LOW "    : " OK ", bgcolor=term_warning ? color.red : color.green, text_color=color.white, text_size=size.small)
+    table.cell(risk_table, 1, 2, stress_high ? " CAO " : " ON ", bgcolor=stress_high ? color.red : color.green, text_color=color.white, text_size=size.small)
+    table.cell(risk_table, 1, 3, curve_inversion ? " DAO " : " ON ", bgcolor=curve_inversion ? color.red : color.green, text_color=color.white, text_size=size.small)
+    table.cell(risk_table, 1, 4, intl_warning ? " THAP " : " ON ", bgcolor=intl_warning ? color.red : color.green, text_color=color.white, text_size=size.small)
+    table.cell(risk_table, 1, 5, spread_warning ? " THAP " : " ON ", bgcolor=spread_warning ? color.red : color.green, text_color=color.white, text_size=size.small)
 
-    table.merge_cells(risk_table, 0, 5, 1, 5)
-    table.cell(risk_table, 0, 5,
-         " Diem rui ro: " + str.tostring(risk_score) + "/" + str.tostring(max_score) + "  (" + str.tostring(risk_pct, "#.0") + "%) ",
-         bgcolor=risk_base, text_color=color.white, text_size=size.normal)
-
-    // ===== Dashboard: merge title across 3 columns =====
     table.merge_cells(dashboard, 0, 0, 2, 0)
-    table.cell(dashboard, 0, 0, " DASHBOARD VI MO ",
+    table.cell(dashboard, 0, 0, " DASHBOARD VI MO CHUAN ",
          bgcolor=color.new(color.blue, 0), text_color=color.white, text_size=size.normal)
 
-    table.cell(dashboard, 0, 1, " Chi so ",     bgcolor=hdr_bg, text_color=color.black, text_size=size.small)
-    table.cell(dashboard, 1, 1, " Gia tri ",    bgcolor=hdr_bg, text_color=color.black, text_size=size.small)
+    table.cell(dashboard, 0, 1, " Chi bao ", bgcolor=hdr_bg, text_color=color.black, text_size=size.small)
+    table.cell(dashboard, 1, 1, " Gia tri ", bgcolor=hdr_bg, text_color=color.black, text_size=size.small)
     table.cell(dashboard, 2, 1, " Trang thai ", bgcolor=hdr_bg, text_color=color.black, text_size=size.small)
 
-    st1 = monetary_stress ? "NGUY HIEM" : "ON"
-    st2 = yield_inversion ? "CANH BAO"  : "ON"
-    st3 = intl_warning    ? "RUI RO"    : "AN TOAN"
-    st4 = term_warning    ? "THAP"      : "CAO"
+    st1 = stress_high ? "CANG THANG" : "ON"
+    st2 = curve_inversion ? "DAO NGUOC" : "ON"
+    st3 = intl_warning ? "AP LUC FX" : "AN TOAN"
+    st4 = spread_warning ? "THAP" : "CAO"
 
-    v1 = use_dynamic and show_z_in_dash ? mon_z  : monetary_transmission
-    v2 = use_dynamic and show_z_in_dash ? yc_z   : yield_curve
-    v3 = use_dynamic and show_z_in_dash ? intl_z : international_spread
-    v4 = use_dynamic and show_z_in_dash ? term_z : term_premium
+    v1 = use_dynamic and show_z_in_dash ? stress_z : liquidity_stress
+    v2 = use_dynamic and show_z_in_dash ? curve_z : yield_curve_standard
+    v3 = use_dynamic and show_z_in_dash ? intl_z : intl_yield_diff
+    v4 = use_dynamic and show_z_in_dash ? spread_z : long_short_spread
 
-    // Row 1
-    table.cell(dashboard, 0, 2, " Truyen dan ", bgcolor=row_bg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 0, 2, " Liquidity stress\n(IB-Policy) ", bgcolor=row_bg, text_color=color.white, text_size=size.small)
     table.cell(dashboard, 1, 2, " " + str.tostring(v1, "#.##") + " ", bgcolor=row_bg, text_color=color.white, text_size=size.small)
     table.cell(dashboard, 2, 2, " " + st1 + " ", bgcolor=f_statusColor(st1), text_color=color.white, text_size=size.small)
 
-    // Row 2
-    table.cell(dashboard, 0, 3, " Yield curve ", bgcolor=row_bg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 0, 3, " Yield curve\n(10Y-2Y) ", bgcolor=row_bg, text_color=color.white, text_size=size.small)
     table.cell(dashboard, 1, 3, " " + str.tostring(v2, "#.##") + " ", bgcolor=row_bg, text_color=color.white, text_size=size.small)
     table.cell(dashboard, 2, 3, " " + st2 + " ", bgcolor=f_statusColor(st2), text_color=color.white, text_size=size.small)
 
-    // Row 3
-    table.cell(dashboard, 0, 4, " QT ", bgcolor=row_bg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 0, 4, " Intl yield diff\n(VN10Y-US10Y) ", bgcolor=row_bg, text_color=color.white, text_size=size.small)
     table.cell(dashboard, 1, 4, " " + str.tostring(v3, "#.##") + " ", bgcolor=row_bg, text_color=color.white, text_size=size.small)
     table.cell(dashboard, 2, 4, " " + st3 + " ", bgcolor=f_statusColor(st3), text_color=color.white, text_size=size.small)
 
-    // Row 4
-    table.cell(dashboard, 0, 5, " Ky han ", bgcolor=row_bg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 0, 5, " Long-short spread\n(10Y-Policy) ", bgcolor=row_bg, text_color=color.white, text_size=size.small)
     table.cell(dashboard, 1, 5, " " + str.tostring(v4, "#.##") + " ", bgcolor=row_bg, text_color=color.white, text_size=size.small)
     table.cell(dashboard, 2, 5, " " + st4 + " ", bgcolor=f_statusColor(st4), text_color=color.white, text_size=size.small)
 
-    // Scenario row (merge cols 1..2)
     scen = "BINH THUONG"
     scol = color.new(color.green, 0)
     if liquidity_crisis
         scen := "KHUNG HOANG THANH KHOAN"
         scol := color.new(color.red, 0)
     else if recession_warning
-        scen := "SUY THOAI"
+        scen := "CANH BAO SUY THOAI (Chuan)"
         scol := color.new(color.orange, 0)
     else if fx_pressure
         scen := "AP LUC TY GIA"
         scol := color.new(color.purple, 0)
-    else if inflation_high
-        scen := "LAM PHAT CAO"
+    else if inflation_proxy
+        scen := "PROXY LAM PHAT CAO"
         scol := color.new(color.yellow, 0)
 
     table.cell(dashboard, 0, 6, " KICH BAN: ", bgcolor=hdr_bg, text_color=color.black, text_size=size.small)
@@ -362,21 +400,113 @@ if barstate.islast and show_pane3
     table.cell(dashboard, 1, 6, " " + scen + " ", bgcolor=scol, text_color=f_textColorForBg(scol), text_size=size.small)
 
 // =====================
-// 11) ALERT (chỉ pane 3)
+// 12) PANE 4 – 3-LAYER RISK ANALYSIS
+// =====================
+plot(show_pane4 ? layer1_pct : na, title="Layer 1: Rui ro thanh khoan", color=color.new(#FF6B6B, 0), linewidth=2)
+plot(show_pane4 ? layer2_pct : na, title="Layer 2: Rui ro chu ky (10Y-2Y)", color=color.new(#FFA726, 0), linewidth=2)
+plot(show_pane4 ? layer3_pct : na, title="Layer 3: Rui ro ngoai vi", color=color.new(#42A5F5, 0), linewidth=2)
+
+bgcolor(show_pane4 and layer1_pct >= 60 ? color.new(#FF6B6B, 90) : na, title="Layer1 High")
+bgcolor(show_pane4 and layer2_pct >= 60 ? color.new(#FFA726, 90) : na, title="Layer2 High")
+bgcolor(show_pane4 and layer3_pct >= 60 ? color.new(#42A5F5, 90) : na, title="Layer3 High")
+
+var layer_table = table.new(position.top_right, 4, 6, bgcolor=color.new(#1A237E, 95), border_width=2, border_color=color.white)
+
+if barstate.islast and (show_pane4 or show_risk_layers)
+    table.merge_cells(layer_table, 0, 0, 3, 0)
+    table.cell(layer_table, 0, 0, " PHAN TICH 3 LOP RUI RO (CHUAN) ", 
+         bgcolor=color.new(#0D47A1, 0), text_color=color.white, text_size=size.normal)
+    
+    table.cell(layer_table, 0, 1, " LOP RUI RO ", bgcolor=color.new(#3949AB, 0), text_color=color.white, text_size=size.small)
+    table.cell(layer_table, 1, 1, " DIEM ", bgcolor=color.new(#3949AB, 0), text_color=color.white, text_size=size.small)
+    table.cell(layer_table, 2, 1, " % ", bgcolor=color.new(#3949AB, 0), text_color=color.white, text_size=size.small)
+    table.cell(layer_table, 3, 1, " TRANG THAI ", bgcolor=color.new(#3949AB, 0), text_color=color.white, text_size=size.small)
+    
+    layer1_status = layer1_pct >= 80 ? "NGUY HIEM" : layer1_pct >= 60 ? "CAO" : layer1_pct >= 40 ? "TRUNG BINH" : layer1_pct >= 20 ? "THAP" : "RAT THAP"
+    layer1_bg = f_layerColor(layer1_pct)
+    
+    table.cell(layer_table, 0, 2, " 🟥 Thanh khoan ngan han ", 
+         bgcolor=color.new(#FF5252, 20), text_color=color.white, text_size=size.small)
+    table.cell(layer_table, 1, 2, str.tostring(layer1_score, "#.0") + "/" + str.tostring(layer1_max), 
+         bgcolor=color.new(#FF5252, 20), text_color=color.white, text_size=size.small)
+    table.cell(layer_table, 2, 2, str.tostring(layer1_pct, "#.0") + "%", 
+         bgcolor=layer1_bg, text_color=color.white, text_size=size.small)
+    table.cell(layer_table, 3, 2, " " + layer1_status + " ", 
+         bgcolor=layer1_bg, text_color=color.white, text_size=size.small)
+    
+    layer2_status = layer2_pct >= 80 ? "NONG (DAO)" : layer2_pct >= 60 ? "AM" : layer2_pct >= 40 ? "TRUNG TINH" : layer2_pct >= 20 ? "MAT" : "LANH"
+    layer2_bg = f_layerColor(layer2_pct)
+    
+    table.cell(layer_table, 0, 3, " 🟨 Chu ky vi mo (10Y-2Y) ", 
+         bgcolor=color.new(#FF9800, 20), text_color=color.white, text_size=size.small)
+    table.cell(layer_table, 1, 3, str.tostring(layer2_score, "#.0") + "/" + str.tostring(layer2_max), 
+         bgcolor=color.new(#FF9800, 20), text_color=color.white, text_size=size.small)
+    table.cell(layer_table, 2, 3, str.tostring(layer2_pct, "#.0") + "%", 
+         bgcolor=layer2_bg, text_color=color.white, text_size=size.small)
+    table.cell(layer_table, 3, 3, " " + layer2_status + " ", 
+         bgcolor=layer2_bg, text_color=color.white, text_size=size.small)
+    
+    layer3_status = layer3_pct >= 80 ? "MANH" : layer3_pct >= 60 ? "VUA" : layer3_pct >= 40 ? "TRUNG BINH" : layer3_pct >= 20 ? "YEU" : "RAT YEU"
+    layer3_bg = f_layerColor(layer3_pct)
+    
+    table.cell(layer_table, 0, 4, " 🟦 Ngoai vi & FX ", 
+         bgcolor=color.new(#2196F3, 20), text_color=color.white, text_size=size.small)
+    table.cell(layer_table, 1, 4, str.tostring(layer3_score, "#.0") + "/" + str.tostring(layer3_max), 
+         bgcolor=color.new(#2196F3, 20), text_color=color.white, text_size=size.small)
+    table.cell(layer_table, 2, 4, str.tostring(layer3_pct, "#.0") + "%", 
+         bgcolor=layer3_bg, text_color=color.white, text_size=size.small)
+    table.cell(layer_table, 3, 4, " " + layer3_status + " ", 
+         bgcolor=layer3_bg, text_color=color.white, text_size=size.small)
+    
+    table.merge_cells(layer_table, 0, 5, 3, 5)
+    total_judgement = ""
+    if layer2_pct >= 70 and curve_inversion
+        total_judgement := "⚠️ CANH BAO SUY THOAI (Chuan)"
+    else if layer1_pct >= 60 and layer2_pct >= 60
+        total_judgement := "⚠️ CANG THANG TOAN DIEN"
+    else if layer1_pct >= 60
+        total_judgement := "📉 RUI RO THANH KHOAN CAO"
+    else if layer2_pct >= 60
+        total_judgement := "📊 CHU KY XAU (10Y-2Y)"
+    else if layer3_pct >= 60
+        total_judgement := "🌍 AP LUC NGOAI VI"
+    else
+        total_judgement := "✅ ON DINH"
+    
+    table.cell(layer_table, 0, 5, " " + total_judgement + " ", 
+         bgcolor=color.new(#4CAF50, 0), text_color=color.white, text_size=size.small)
+
+// =====================
+// 13) ALERT
 // =====================
 risk_alert_level = input.int(4, "Nguong canh bao diem rui ro", minval=1)
+layer1_alert = input.float(60, "Nguong canh bao Lop 1 (%)", minval=0, maxval=100)
+layer2_alert = input.float(60, "Nguong canh bao Lop 2 (%)", minval=0, maxval=100)
+layer3_alert = input.float(60, "Nguong canh bao Lop 3 (%)", minval=0, maxval=100)
+
 change_threshold = input.float(0.5, "Nguong bien dong lon (diem %)", step=0.1)
 
 big_move =
-     math.abs(monetary_transmission - monetary_transmission[1]) > change_threshold or
-     math.abs(yield_curve           - yield_curve[1])           > change_threshold or
-     math.abs(international_spread  - international_spread[1])  > change_threshold or
-     math.abs(term_premium          - term_premium[1])          > change_threshold
+     math.abs(liquidity_stress - liquidity_stress[1]) > change_threshold or
+     math.abs(yield_curve_standard - yield_curve_standard[1]) > change_threshold or
+     math.abs(intl_yield_diff - intl_yield_diff[1]) > change_threshold or
+     math.abs(long_short_spread - long_short_spread[1]) > change_threshold
 
-if barstate.islast and show_pane3
+if barstate.islast
+    if layer1_pct >= layer1_alert
+        alert("CANH BAO LOP 1: Rui ro thanh khoan = " + str.tostring(layer1_pct, "#.0") + "%", alert.freq_once_per_bar)
+    
+    if layer2_pct >= layer2_alert
+        alert("CANH BAO LOP 2: Rui ro chu ky (10Y-2Y) = " + str.tostring(layer2_pct, "#.0") + "%", alert.freq_once_per_bar)
+    
+    if layer3_pct >= layer3_alert
+        alert("CANH BAO LOP 3: Rui ro ngoai vi = " + str.tostring(layer3_pct, "#.0") + "%", alert.freq_once_per_bar)
+    
     if risk_score >= risk_alert_level
-        alert("CANH BAO: Diem rui ro vi mo = " + str.tostring(risk_score) + "/" + str.tostring(max_score), alert.freq_once_per_bar)
+        alert("CANH BAO TONG: Diem rui ro = " + str.tostring(risk_score) + "/" + str.tostring(max_score), alert.freq_once_per_bar)
+    
     if liquidity_crisis
         alert("CANH BAO KHAN: Khung hoang thanh khoan", alert.freq_once_per_bar)
+    
     if big_move
-        alert("CANH BAO: Bien dong lon trong cac chi bao vi mo lai suat", alert.freq_once_per_bar)
+        alert("CANH BAO: Bien dong lon cac chi bao", alert.freq_once_per_bar)
