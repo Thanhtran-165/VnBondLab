@@ -1,163 +1,235 @@
-VN YieldCurveLab (Academic Research Mode)
-Version: v1.4.2
-Platform: TradingView – Pine Script v5
-Timeframe khuyến nghị: Daily (D)
-Mục tiêu: Công cụ nghiên cứu vĩ mô–trái phiếu (macro-financial research tool) cho đường cong lợi suất VN theo khung 3 nhân tố (Level–Slope–Curvature), kèm Regime và Stress score, trình bày theo multi-panel UI kiểu Bloomberg.
-1) Academic Disclaimer (Tuyên bố học thuật)
-Đây là công cụ mô tả & chẩn đoán (descriptive/diagnostic), không phải mô hình dự báo hay khuyến nghị đầu tư.
-Không sử dụng lookahead; toàn bộ dữ liệu gọi bằng request.security(... lookahead_off).
-Các ngưỡng phân loại (ví dụ 20/80 percentile) là heuristic có kiểm soát (research heuristic), có thể tinh chỉnh theo dữ liệu/chu kỳ.
-Do giới hạn Pine, mô hình Nelson–Siegel đầy đủ (ước lượng tham số phi tuyến) không được triển khai; thay vào đó dùng xấp xỉ factor chuẩn trong nghiên cứu ứng dụng.
-2) Data & Tickers
-2.1. Yields (6 tenor)
-Mặc định dùng các ticker dạng:
-TVC:VN01Y, TVC:VN02Y, TVC:VN03Y, TVC:VN05Y, TVC:VN07Y, TVC:VN10Y
-Lưu ý: TradingView có thể khác nguồn dữ liệu/ticker theo region. Bạn có thể thay bằng ticker khác trong phần Inputs.
-2.2. Short rates
-Interbank: VNINBR
-Policy rate: VNINTR
-3) Methodology (Khung định lượng)
-3.1. 3 Factors (Chuẩn nghiên cứu)
-Level: (2Y + 5Y + 10Y) / 3
-Slope: 10Y − 2Y
-Curvature: 2*5Y − 2Y − 10Y
-Ý nghĩa:
-Level: mặt bằng lãi suất dài hạn/chi phí vốn chung
-Slope: kỳ vọng tăng trưởng/lạm phát và trạng thái chu kỳ (steep/flat/inverted)
-Curvature: biến dạng “bụng” (belly) – phản ứng chính sách & lực cung–cầu kỳ hạn trung bình
-3.2. Robust Statistics
-Robust z-score: dùng winsorization (clip outliers bằng mean±k*std), sau đó tính z-score lại.
-Percentile rank: ta.percentrank() trong cửa sổ len_stats.
-Mục đích: giảm nhiễu outlier và đánh giá “cao/thấp so với lịch sử”.
-3.3. Momentum / Derivative
-level_d, slope_d, curve_d: thay đổi trong len_deriv ngày để đọc xu hướng (UP/DN).
-4) Regime Framework (Khung chế độ YC)
-4.1. Level regime (theo percentile)
-LOW / MID / HIGH theo ngưỡng low_th_pct và high_th_pct.
-4.2. Slope regime
-Nếu slope <= -0.2 → INVERTED
-Còn lại phân theo percentile: STEEP_LOW / FLAT / STEEP_HIGH
-4.3. YC Regime Code (YC1–YC4)
-YC4 (Tight): Level HIGH + Flat/Inverted
-YC3 (Late tightening): Level HIGH + Steep_high
-YC2 (Early easing): Level LOW + Steep_high
-YC1 (Easing mature): Level LOW + Flat/Steep_low
-YC0: trường hợp còn lại (Neutral/Mixed)
-Các “code” là cách chuẩn hoá để báo cáo & so sánh theo thời gian, dễ dùng cho research note.
-5) Stress Score (Chỉ số áp lực)
-5.1. Logic
-Level component: dùng level_pct (hoặc 50 nếu NA)
-Slope risk: nếu slope <= 0 → 100 (rủi ro cao), nếu dương → 100 - slope_pct
-Macro stress: trung bình của 2 thành phần
-5.2. Stress regime
->= 70 → STRESS CAO
-<= 40 → STRESS THAP
-còn lại → TRUNG TINH
-5.3. Stress overlay (mapped)
-Stress (0–100) được map vào khoảng yield [min..max] trong len_stats để vẽ chung trục mà không làm “crush” chart.
-Đây là “visual gauge”, không phải series cùng đơn vị với yield.
-6) Distortion & Signal Quality (Độ méo & chất lượng tín hiệu)
-6.1. Distortion
-Tính độ phân tán của z-score giữa các tenor (std-like).
-Thấp → curve dịch chuyển “thuần” (parallel move)
-Cao → biến dạng cục bộ (segmented/distorted)
-6.2. Quality score
-Chuyển distortion thành thang 0–100:
-HIGHQ / MEDQ / LOWQ
-Khi LOWQ, script sẽ đưa thông điệp “Noisy -> avoid strong conclusion”.
-7) UI / UX (Bloomberg-like, Multi-Panel)
-Panel 1 — Shape Dashboard
-Tập trung “big picture”: Level/Slope/Curve, YC regime, Stress bar, Quality
-Có Curve snapshot (đường cong dạng “mini curve” bên phải)
-Panel 2 — Heatmap Grid
-Trọng tâm: trạng thái từng tenor:
-STATE (percentile)
-VALUATION (z-score bucket)
-MOVE (UP/DN)
-STRUCTURE: shift/focus/quality
-Panel 3 — Diagnostics (Meaning-first)
-Đưa “ý nghĩa” lên trước số:
-Stress + regime + quality + momentum + shift
-8) Inputs (Gợi ý cấu hình)
-len_stats: 120–252 (tuỳ độ dài dữ liệu)
-low_th_pct / high_th_pct: 20/80 là mặc định “academic heuristic”
-len_change: 20–60 ngày (1–3 tháng)
-len_deriv: 3–10 ngày (momentum)
-9) Practical Notes / Limitations
-Pine không phù hợp cho tối ưu hoá phi tuyến (Nelson–Siegel full fit), nên curvature là xấp xỉ.
-Dữ liệu yield trên TradingView có thể:
-khác nguồn
-thiếu lịch sử
-có gaps
-→ Khi dữ liệu ngắn, percentile/zscore sẽ NA hoặc kém ổn định.
-Stress overlay là mapped visualization, dùng để “nhìn nhanh” chứ không cùng đơn vị.
-10) Roadmap đề xuất (V1 → V2)
-Thêm “dynamic threshold” theo phân phối (z-based) và so sánh với percentile.
-Thêm module research: correlation rolling với VNINDEX / Credit / FX (nếu dư request.security).
-Thêm “event tags”: pivot points khi YC regime đổi, stress vượt ngưỡng.
-Export-friendly table mode (compact) cho chụp ảnh.
-11) Changelog (tóm tắt)
-v1.4.2
-Panel 2/3 khôi phục time-series (không còn “trống chart” khi đổi panel)
-Bổ sung Stress overlay mapped để tăng tính trực quan mà không cần plot(scale=...)
-Label line chỉ hiển thị tên ticker theo yêu cầu
+# VN YieldCurveLab — README (v1.6.9)
 
-Research Interpretation Guide (How to Read VN YieldCurveLab)
-Mục tiêu của guide này là giúp bạn chuyển từ “thấy số” → “hiểu trạng thái” → “đặt câu hỏi nghiên cứu đúng”.
-1) Trình tự đọc (workflow 20 giây)
-Quality trước (HIGHQ/MEDQ/LOWQ)
-LOWQ = đường cong “méo/segmented”, tín hiệu nhiễu.
-→ Giảm mức tự tin, ưu tiên quan sát thêm (không kết luận mạnh).
-HIGHQ = dịch chuyển “thuần” hơn (parallel/clean), dễ đọc regime.
-YC Regime (YC1–YC4) = “khung bối cảnh”
-Đây là nhãn tóm tắt cấu trúc: Level + Slope.
-Stress (0–100) = “cường độ”
-Stress cao không chỉ nói “xấu”, mà nói: môi trường nhạy cảm (risk of shocks / policy tightening).
-Shift + Focus (Panel 2/3)
-FLATTENING / STEEPENING và SHORT/BELLY/LONG cho biết điểm nóng nằm ở đâu trên curve.
-2) Ý nghĩa 3 nhân tố (đọc như macro lens)
-Level = mặt bằng chi phí vốn
-Câu hỏi nghiên cứu: Khi Level lên “HIGH”, nhóm tài sản nào nhạy nhất? (BĐS? smallcap? bank?)
-Slope (10–2) = trạng thái chu kỳ & kỳ vọng tăng trưởng
-Câu hỏi nghiên cứu: slope giảm/flat có đi trước các giai đoạn giảm kỳ vọng/siết thanh khoản không?
-Curvature = “bụng curve” (kỳ hạn trung gian) phản ánh kỳ vọng chính sách + lực cung cầu
-Câu hỏi nghiên cứu: curvature bất thường có liên quan tới thay đổi chính sách/OMO/tín phiếu không?
-3) Cách diễn giải YC Regime (không dự báo, chỉ hypothesis)
-Lưu ý: đây là “research hypothesis”, không phải khuyến nghị.
-YC4 — Tight: High Level + Flat/Inverted
-Thông điệp: chi phí vốn cao + curve không dốc (hoặc đảo).
-Giả thuyết: môi trường rủi ro “tight/fragile”, dễ nhạy với news/policy.
-Theo dõi thêm: Stress có >70 không? Focus nằm ở SHORT hay LONG? Nếu SHORT bị kéo lên mạnh → dấu hiệu thắt chặt mạnh hơn.
-YC3 — Late tightening: High Level + Steep
-Thông điệp: level đã cao, nhưng slope còn dốc → kỳ vọng/term premium vẫn lớn.
-Giả thuyết: thị trường đang “định giá rủi ro” hoặc kỳ vọng lãi còn biến động.
-Theo dõi thêm: curve_shift có đang FLATTENING không? Nếu flattening dần → tiến tới YC4.
-YC2 — Early easing: Low Level + Steep
-Thông điệp: mặt bằng thấp, slope dốc → thường gặp khi kỳ vọng hồi phục/đi vào chu kỳ nới.
-Giả thuyết: môi trường có thể “risk-on” hơn, nhưng vẫn cần xác nhận.
-Theo dõi thêm: Stress có giảm về vùng 40–50 không? Quality phải MEDQ/HIGHQ thì kết luận mới đáng tin.
-YC1 — Easing mature: Low Level + Flat
-Thông điệp: level thấp, slope phẳng → giai đoạn nới đã “phản ánh nhiều”.
-Giả thuyết: upside của “nới lỏng” có thể giảm dần; thị trường nhạy với dữ liệu mới.
-Theo dõi thêm: momentum (level_d/slope_d) đổi chiều chưa? nếu level bắt đầu UP + slope DOWN → chuyển pha.
-YC0 — Neutral/Mixed
-Thông điệp: không thuộc nhóm “cực trị”, cần đọc thêm shift/focus/quality.
-Cách làm: nhìn Panel 2 xem tenor nào bị “DISTORTED” và shift đang hướng nào.
-4) Stress Score: diễn giải “đúng chất học thuật”
-Stress không nói “thị trường sập”, nó nói:
-độ nhạy (sensitivity) của hệ thống đang tăng hay giảm.
-Stress cao + YC4 + Quality tốt → “risk regime rõ ràng” (môi trường dễ bị shock).
-Stress cao nhưng LOWQ → “nhiễu/segmented” (cẩn thận kết luận: có thể do data gaps, event đơn lẻ).
-5) Distortion / Quality: Khi nào nên “tin” curve?
-PURE MOVE + HIGHQ: curve dịch chuyển khá đồng bộ → regime đọc đáng tin.
-DISTORTED + LOWQ: chỉ một vài tenor lệch mạnh → có thể:
-thiếu thanh khoản cục bộ,
-cú sốc supply/demand ở một kỳ hạn,
-dữ liệu nguồn có vấn đề.
-→ Khi đó, panel 2 (grid) quan trọng hơn panel 1.
-6) “Research Questions” gợi ý (đúng hướng Academic)
-Bạn có thể dùng script để tạo note nghiên cứu theo các câu hỏi:
-Regime transitions: YC2→YC3→YC4 có diễn ra theo chu kỳ VN không? thời gian trung bình mỗi pha?
-Stress threshold: Stress >70 có đi kèm widening credit spread / áp lực FX không?
-Focus mapping: SHORT/BELLY/LONG focus có liên hệ với hành động chính sách (OMO/tín phiếu/điều hành) không?
-Signal quality filter: Nếu chỉ xét HIGHQ, hiệu quả mô tả regime có “sạch” hơn không?
+## 1) Mục tiêu & phạm vi
+
+**VN YieldCurveLab** là một dashboard nghiên cứu đường cong lợi suất Việt Nam (1Y/2Y/3Y/5Y/7Y/10Y) + **Interbank (VNINBR)** + **Policy rate (VNINTR)**, tập trung 3 lớp:
+
+1. **Shape/Regime**: Level–Slope–Curve và phân loại chế độ YC (YC0…YC4)
+2. **Quality/Distortion**: đo “độ méo” theo dispersion của z-score các kỳ hạn → gán nhãn HIGHQ/MEDQ/LOWQ
+3. **Research vs VNINDEX** (Panel 3): tương quan/cov/beta giữa **Stress** (raw/adjusted) và **log-return VNINDEX**, có:
+
+* **EffN (effective sample)**: kiểm soát độ đủ mẫu
+* **Regime filter**: nghiên cứu theo chế độ (YC4/INVERTED/Stress High…)
+* **BestLag (3 lags)** + **Lag Stability**: kiểm tra độ ổn định của “lag tốt nhất”
+
+> Script được thiết kế cho **Daily (1D)**: dữ liệu đều được `request.security(..., "D", ...)` để giảm nhiễu và đồng nhất.
+
+---
+
+## 2) Cấu trúc Panel
+
+### Panel 1 — Shape Dashboard
+
+Hiển thị:
+
+* **LEVEL** = (2Y + 5Y + 10Y) / 3
+* **SLOPE** = 10Y − 2Y
+* **CURVE** = 2·5Y − 2Y − 10Y
+* **YC Regime**: YC1…YC4 dựa trên percentile của Level và trạng thái Slope
+* **STRESS**: chỉ số 0–100 (raw) và **Stress_ADJ** (điều chỉnh theo quality)
+* **QUALITY**: HIGHQ/MEDQ/LOWQ + **MOVE FOCUS** (short/belly/long)
+
+### Panel 2 — Grid
+
+Bảng lưới theo kỳ hạn:
+
+* **Z STATE**: CHEAP/FAIR/RICH (z-score robust)
+* **MOVE**: UP/DN theo chênh lệch `len_change` ngày
+* **STRUCT/QUAL/FOCUS**
+
+### Panel 3 — Diagnostics + Research
+
+* Diagnostic: stress, momentum, z-score
+* Research (ALL / OKQ / FILTER):
+
+  * **Corr** (t0) raw/adj
+  * **Beta** (OLS slope x→y)
+  * **R2**
+  * **BestLag** trong {lag1, lag2, lag3}
+  * **EffN** và **Ratio** (độ đủ mẫu)
+  * **Lag Stability** (% ổn định bestlag trong `len_lag_stab` ngày)
+
+---
+
+## 3) Ý nghĩa các khối chính
+
+### 3.1 Robust Z-score (winsorized)
+
+Dùng mean/std + clip outliers để giảm ảnh hưởng điểm cực trị:
+
+* Phù hợp khi dữ liệu yield có “spike” do lỗi/đứt chuỗi.
+
+### 3.2 Percentile rank
+
+Dùng `ta.percentrank` để định nghĩa LOW/MID/HIGH cho Level/Slope/Curve.
+Ưu điểm: **phi tham số** (không giả định phân phối chuẩn).
+
+### 3.3 Quality/Distortion
+
+* Tính z-score cho 6 kỳ hạn → lấy **độ phân tán** quanh mean z-score
+* Distortion cao → **LOWQ**: đường cong “méo” hoặc dữ liệu nhiễu/không đồng bộ
+* **Stress_ADJ = Stress * (Quality/100)** nhằm “trừ điểm” cho giai đoạn dữ liệu kém.
+
+### 3.4 Research vs VNINDEX
+
+* VNINDEX return: **log return** `log(close/close[1])`
+* Có tùy chọn **winsorize return** (clip theo stdev) để giảm outlier.
+* Tính:
+
+  * `corr = correlation(stress, return, len_research)`
+  * `beta = cov(stress, return)/var(stress)`
+  * `r2 = corr^2`
+* 3 chế độ:
+
+  * **ALL**: toàn bộ mẫu hợp lệ
+  * **OKQ**: chỉ tính khi quality != LOWQ
+  * **FILTER**: chỉ tính khi thỏa `reg_filter`
+
+---
+
+## 4) Cách sử dụng nhanh (Workflow)
+
+1. Mở chart bất kỳ, **khuyến nghị timeframe = 1D**
+2. Add indicator → chọn Panel:
+
+   * Panel 1 để đọc regime nhanh
+   * Panel 2 để xem “độ đắt/rẻ” theo kỳ hạn
+   * Panel 3 để xem nghiên cứu/độ đủ mẫu
+3. Nếu Panel 3 báo **VNINDEX ticker invalid/NA**:
+
+   * đổi `VNINDEX (research)` thành đúng mã bạn dùng (thường: `HOSE:VNINDEX`)
+4. Bật/tắt:
+
+   * `Show Stress overlay`
+   * `Show Stress_ADJ overlay`
+   * `Event Tags` (nhãn biến cố)
+
+---
+
+## 5) “Academic Guideline” — Hướng dẫn học thuật & diễn giải
+
+### A) Nguyên tắc 1: Không kết luận khi LOWQ
+
+* Nếu **quality_label = LOWQ**, coi đó là **giai đoạn nhiễu**:
+
+  * Stress raw có thể “đúng số” nhưng **không đáng tin để diễn giải cấu trúc**
+  * Ưu tiên dùng **Stress_ADJ**, hoặc chuyển sang **OKQ research**
+
+### B) Nguyên tắc 2: EffN ≥ ngưỡng trước khi tin Corr/Beta
+
+* **EffN** là số quan sát hợp lệ trong cửa sổ `len_research`
+* Dùng `min_eff_ratio` (mặc định 70%) để tránh “ảo giác thống kê” do thiếu dữ liệu.
+* Nếu **READY = WAIT/LOW N** → chỉ xem như tín hiệu tham khảo.
+
+### C) Nguyên tắc 3: Corr ≠ Causality
+
+* Correlation chỉ là đồng biến/ nghịch biến, không khẳng định nguyên nhân.
+* Với macro: có thể xảy ra **đảo chiều quan hệ** theo chu kỳ (regime dependence).
+
+### D) Nguyên tắc 4: Multiple-testing risk (BestLag)
+
+* Chọn BestLag trong 3 lag là một dạng “tối ưu hoá” → tăng rủi ro overfit.
+* Vì vậy script thêm:
+
+  * **Lag Stability**: nếu stability thấp, bestlag chỉ là nhiễu.
+* Quy tắc dùng:
+
+  * BestLag **chỉ đáng xem** khi:
+
+    * READY = true
+    * |bestCorr| đủ lớn (tự đặt chuẩn)
+    * Lag Stability cao (ví dụ >60–70%)
+
+### E) Nguyên tắc 5: Regime-conditioned inference
+
+* Macro thường **phi tuyến**: quan hệ stress→equity khác nhau giữa YC4 vs YC1.
+* Khuyến nghị:
+
+  * So sánh **ALL vs FILTER(YC4)**, **ALL vs FILTER(STRESS_HIGH)**
+  * Nếu dấu corr đổi khi đổi regime → đó là dấu hiệu **regime dependence** (quan trọng hơn một con số corr tổng).
+
+### F) Nguyên tắc 6: Robustness checklist (tối thiểu)
+
+Khi bạn thấy một kết luận “có vẻ đúng”, hãy check:
+
+1. Có LOWQ không?
+2. EffN đủ không?
+3. Corr/beta có ổn định qua thời gian không? (đổi `len_research`)
+4. Kết quả có giữ được trong OKQ không?
+5. Có bị “ăn may” do lag search không? (Lag Stability)
+
+---
+
+## 6) Giải thích nhãn YC Regime (gợi ý diễn giải)
+
+* **YC4**: “Tight” (level cao + slope phẳng/đảo) → thường rủi ro chu kỳ cao hơn
+* **YC3**: “Late tightening” (level cao + slope dốc)
+* **YC2**: “Early easing” (level thấp + slope dốc)
+* **YC1**: “Easing mature” (level thấp)
+* **YC0**: trung tính / mixed
+
+> Đây là heuristic theo phân phối (percentile), không phải mô hình kinh tế cấu trúc.
+
+---
+
+## 7) Tham số quan trọng nên chỉnh
+
+* `len_stats` (robust stats): 120–252 ngày tuỳ “chu kỳ” bạn muốn
+* `len_research`: 120–250 ngày để nghiên cứu tương quan
+* `min_eff_ratio`: 0.7–0.9 nếu bạn muốn nghiêm ngặt hơn
+* `lag1/lag2/lag3`: nên đại diện **ngắn / trung / dài** (1,5,20) là hợp lý
+* `len_lag_stab`: 60–120 ngày để đánh giá ổn định bestlag
+* `reg_filter`: dùng để test “regime dependence”
+
+---
+
+## 8) Giới hạn & lưu ý của TradingView/Pine
+
+* Pine không thuận tiện cho kiểm định thống kê nâng cao (p-value, HAC, bootstrap) với hiệu năng tốt.
+* `request.security` nhiều series + bảng + labels có thể nặng. Nếu lag/đơ:
+
+  * tắt `Event Tags`
+  * tắt `Panel 2/3: show yield time-series`
+  * giảm `max_labels_count` (nếu bạn custom)
+* Dữ liệu TVC/tickers có thể đổi chuẩn; script đã có cảnh báo VNINDEX NA.
+
+---
+
+## 9) Changelog tóm tắt (v1.6.9)
+
+* Fix các lỗi phổ biến: “end of line without line continuation”, type `na` trong function, label API
+* Thêm **Stress_ADJ**
+* Research: **EffN**, **Regime filter**, **BestLag**, **Lag Stability**, màu nền Corr theo strength
+* Không dùng `ta.covariance` (đã tự viết cov/var TV-safe)
+
+---
+
+## 10) Đánh giá “đã tạm ổn chưa?”
+
+Theo tiêu chí học thuật thực dụng trong TradingView: **đã đạt mức có thể “tạm dừng”** để sử dụng nghiên cứu/quan sát một thời gian, vì:
+
+* Có robust + percentile (phi tham số)
+* Có quality gating
+* Có EffN (sample adequacy)
+* Có kiểm soát overfit thô (bestlag + stability)
+* Có regime-conditioned analysis
+
+**Nâng cấp tiếp theo chỉ nên làm khi bạn đã “quan sát live” 2–4 tuần** và ghi lại: khi nào sai, sai vì ticker/quality/regime, hay do định nghĩa stress.
+
+---
+
+# Research Interpretation Guide (ngắn gọn để dùng hàng ngày)
+
+1. **Xem Panel 1**: YC regime + Stress (raw/adj) + Quality
+2. Nếu **LOWQ** → tránh kết luận; ưu tiên Stress_ADJ và OKQ research
+3. **Panel 3**:
+
+   * READY? EffN đủ?
+   * Corr dấu gì? mạnh không?
+   * BestLag có ổn định không?
+4. Bật `reg_filter` (YC4 hoặc STRESS_HIGH) để xem quan hệ có “đổi chế độ” không
+5. Nếu kết quả chỉ đúng ở 1 filter và lag stability thấp → coi là **nhiễu/overfit**
+
+---
+
+
