@@ -1,0 +1,1631 @@
+//@version=5
+indicator("Macro Alert System v4.4 - Full (Macro + Indices Research)",
+     shorttitle="MacroAcademic v4.4 Full",
+     overlay=false,
+     max_labels_count=500,
+     max_lines_count=500,
+     max_bars_back=5000)
+
+// =====================
+// 0) ADVANCED HELPER FUNCTIONS (FULL EDITION)
+// =====================
+
+// Robust z-score with winsorization (clip outliers)
+// v4.4-style: cho phép chọn chế độ "Shock-sensitive" vs "Fully-robust"
+robust_mode = input.string("Shock-sensitive", "Robust Mode (Academic)",
+     options = ["Shock-sensitive", "Fully-robust"])
+
+f_robust_zscore(src, length, clip_multiplier) =>
+    _mean = ta.sma(src, length)
+    _std  = ta.stdev(src, length)
+
+    upper_bound = _mean + clip_multiplier * _std
+    lower_bound = _mean - clip_multiplier * _std
+    clipped_src = math.max(lower_bound, math.min(upper_bound, src))
+
+    clipped_mean = ta.sma(clipped_src, length)
+    clipped_std  = ta.stdev(clipped_src, length)
+
+    robust_mode == "Fully-robust" ?
+         (clipped_std > 0 ? (clipped_src - clipped_mean) / clipped_std : 0.0) :
+         (clipped_std > 0 ? (src - clipped_mean) / clipped_std : 0.0)
+
+// Percentile threshold
+f_percentile_threshold(src, length, percentile_val) =>
+    ta.percentile_linear_interpolation(src, length, percentile_val)
+
+// Percentile warning check
+f_check_percentile_warning(src, length, percentile_val, is_low_bad) =>
+    threshold_val = f_percentile_threshold(src, length, percentile_val)
+    is_low_bad ? src <= threshold_val : src >= threshold_val
+
+// Bucket mapping from risk_pct (0–100) to 5 regimes
+f_bucket_from_risk(risk) =>
+    int b = na
+    if not na(risk)
+        b := risk < 20 ? 0 :
+             risk < 40 ? 1 :
+             risk < 60 ? 2 :
+             risk < 80 ? 3 : 4
+    b
+
+f_bucket_label(b) =>
+    b == 0 ? "B0 (0–20)" :
+     b == 1 ? "B1 (20–40)" :
+     b == 2 ? "B2 (40–60)" :
+     b == 3 ? "B3 (60–80)" :
+     b == 4 ? "B4 (80–100)" : "NA"
+
+// Simple helpers for stats
+f_avg(sum, cnt) =>
+    cnt > 0 ? sum / cnt : na
+
+f_winrate(win, cnt) =>
+    cnt > 0 ? win / cnt * 100.0 : na
+
+// Academic return handling: optional log return + clipping
+group_acad = "Academic options"
+
+use_log_return = input.bool(false, "Use log returns (hoc thuat hon)", group=group_acad)
+ret_clip_up    = input.float(2.0,  "Clip upper return (R max)",  minval=0.1,  maxval=10.0,  step=0.1,  group=group_acad)
+ret_clip_down  = input.float(-0.8, "Clip lower return (R min)",  minval=-0.99, maxval=0.0, step=0.05, group=group_acad)
+
+f_clip_ret(r) =>
+    na(r) ? na : math.max(ret_clip_down, math.min(ret_clip_up, r))
+
+f_compute_return(c, c_L) =>
+    not na(c) and not na(c_L) ?
+     (use_log_return ? math.log(c / c_L) : c / c_L - 1.0) :
+     na
+
+f_update_return_stats(float[] sumArr, float[] cntArr, float[] winArr, int idx, float ret_raw) =>
+    float ret = f_clip_ret(ret_raw)
+    if not na(ret)
+        float prevSum = array.get(sumArr, idx)
+        float prevCnt = array.get(cntArr, idx)
+        float prevWin = array.get(winArr, idx)
+        float newCnt  = prevCnt + 1.0
+        array.set(sumArr, idx, prevSum + ret)
+        array.set(cntArr, idx, newCnt)
+        if ret > 0
+            array.set(winArr, idx, prevWin + 1.0)
+
+f_update_dd_stats(float[] sumArr, float[] cntArr, int idx, float dd) =>
+    if not na(dd)
+        float prevSum = array.get(sumArr, idx)
+        float prevCnt = array.get(cntArr, idx)
+        float newCnt  = prevCnt + 1.0
+        array.set(sumArr, idx, prevSum + dd)
+        array.set(cntArr, idx, newCnt)
+
+// Status color (for labels / background)
+f_statusColor(s) =>
+    color c = color.new(color.green, 0)
+    if s == "CANG THANG" or s == "DAO NGUOC" or s == "AP LUC FX"
+        c := color.new(color.red, 0)
+    else if s == "THAP"
+        c := color.new(color.orange, 0)
+    c
+
+// Risk-side color (higher = worse)
+f_layerColor(pct) =>
+    color c = color.new(color.green, 0)
+    if pct >= 80
+        c := color.new(color.red, 0)
+    else if pct >= 60
+        c := color.new(color.orange, 0)
+    else if pct >= 40
+        c := color.new(color.yellow, 0)
+    else if pct >= 20
+        c := color.new(color.lime, 0)
+    else
+        c := color.new(color.green, 0)
+    c
+
+f_textColorForBg(bg) =>
+    bg == color.new(color.yellow, 0) ? color.black : color.white
+
+// Generic "follow price" label
+f_markLine(lbl, show_line, txt, y, txt_color) =>
+    label _lbl = lbl
+    if show_line and not na(y)
+        if na(_lbl)
+            _lbl := label.new(bar_index, y, txt,
+                 style=label.style_label_left,
+                 textcolor=txt_color,
+                 color=color.new(color.black, 90),
+                 size=size.tiny)
+        label.set_x(_lbl, bar_index)
+        label.set_y(_lbl, y)
+        label.set_text(_lbl, txt)
+        label.set_textcolor(_lbl, txt_color)
+    else if not na(_lbl)
+        label.delete(_lbl)
+        _lbl := na
+    _lbl
+
+// =====================
+// 1) VIEW MODE (PANELS)
+// =====================
+view_mode = input.string("Pane 1 - Lai suat & chinh sach", "Che do hien thi",
+     options = [
+         "Pane 1 - Lai suat & chinh sach",
+         "Pane 2 - Spreads & z-score",
+         "Pane 3 - Risk score & Dashboard",
+         "Pane 4 - 3-Layer Risk Analysis",
+         "Pane 5 - Pressure & Policy"
+     ])
+
+show_pane1 = view_mode == "Pane 1 - Lai suat & chinh sach"
+show_pane2 = view_mode == "Pane 2 - Spreads & z-score"
+show_pane3 = view_mode == "Pane 3 - Risk score & Dashboard"
+show_pane4 = view_mode == "Pane 4 - 3-Layer Risk Analysis"
+show_pane5 = view_mode == "Pane 5 - Pressure & Policy"
+
+// =====================
+// 2) DATA INPUT (ANTI-REPAINT)
+// =====================
+tf_macro = input.timeframe("D", "Macro timeframe (khuyen nghị: D)")
+
+policy_rate     = request.security("VNINTR", tf_macro, close, barmerge.gaps_off, barmerge.lookahead_off)
+bond_2y         = request.security("VN02Y",  tf_macro, close, barmerge.gaps_off, barmerge.lookahead_off)
+bond_10y        = request.security("VN10Y",  tf_macro, close, barmerge.gaps_off, barmerge.lookahead_off)
+us_10y          = request.security("US10Y",  tf_macro, close, barmerge.gaps_off, barmerge.lookahead_off)
+interbank_rate  = request.security("VNINBR", tf_macro, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+// FX & Fed symbols (user inputs)
+fx_symbol  = input.string("USDVND", "FX ticker (VD: USDVND)")
+fed_symbol = input.string("USINTR", "Fed policy rate symbol")
+
+fx_rate         = request.security(fx_symbol,  tf_macro, close, barmerge.gaps_off, barmerge.lookahead_off)
+fed_policy_rate = request.security(fed_symbol, tf_macro, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+// =====================
+// 3) SPREADS + SIGN CONVENTION
+// =====================
+liquidity_stress     = interbank_rate - policy_rate   // HIGH = BAD
+yield_curve_standard = bond_10y - bond_2y             // LOW  = BAD
+intl_yield_diff      = bond_10y - us_10y              // LOW  = BAD
+long_short_spread    = bond_10y - policy_rate         // LOW  = BAD
+
+// =====================
+// 4) THRESHOLD MODES
+// =====================
+threshold_mode = input.string("Percentile-based", "Che do nguong",
+     options = ["Static", "Dynamic (z-score)", "Percentile-based"])
+
+percentile_lookback = input.int(504, "Chu ky phan phoi (bars)", minval=100, maxval=2000)
+
+// Percentile thresholds
+stress_percentile  = input.int(85, "Stress % (cao = xau)",     minval=50, maxval=99)
+curve_percentile   = input.int(15, "Curve % (thap = xau)",     minval=1,  maxval=50)
+intl_percentile    = input.int(15, "Intl diff % (thap = xau)", minval=1,  maxval=50)
+spread_percentile  = input.int(15, "Spread % (thap = xau)",    minval=1,  maxval=50)
+
+// Robust z-score parameters
+len_stats       = input.int(252, "Chu ky thong ke (z-score)", minval=60)
+clip_multiplier = input.float(2.5, "Clip outliers (std)", minval=1.5, maxval=4.0, step=0.1)
+
+// Z-score thresholds (for Dynamic mode)
+z_stress_threshold = input.float(1.0,  "[Z-score] Stress threshold (Z >)", step=0.1)
+z_curve_threshold  = input.float(-1.0, "[Z-score] Curve threshold  (Z <)", step=0.1)
+z_intl_threshold   = input.float(-1.0, "[Z-score] Intl threshold   (Z <)", step=0.1)
+z_spread_threshold = input.float(-1.0, "[Z-score] Spread threshold (Z <)", step=0.1)
+
+// Static thresholds
+stress_threshold = input.float(1.5, "[Static] Cang thanh khoan",   step=0.1)
+curve_threshold  = input.float(0.0, "[Static] Dao nguoc (10Y-2Y)", step=0.1)
+intl_threshold   = input.float(2.0, "[Static] Chenh lech QT",      step=0.1)
+spread_threshold = input.float(3.0, "[Static] Spread ngan-dai",    step=0.1)
+
+// Compute percentile thresholds
+stress_percentile_val = f_percentile_threshold(liquidity_stress,     percentile_lookback, stress_percentile)
+curve_percentile_val  = f_percentile_threshold(yield_curve_standard, percentile_lookback, curve_percentile)
+intl_percentile_val   = f_percentile_threshold(intl_yield_diff,      percentile_lookback, intl_percentile)
+spread_percentile_val = f_percentile_threshold(long_short_spread,    percentile_lookback, spread_percentile)
+
+// Robust z-scores
+stress_z_robust = f_robust_zscore(liquidity_stress,     len_stats, clip_multiplier)
+curve_z_robust  = f_robust_zscore(yield_curve_standard, len_stats, clip_multiplier)
+intl_z_robust   = f_robust_zscore(intl_yield_diff,      len_stats, clip_multiplier)
+spread_z_robust = f_robust_zscore(long_short_spread,    len_stats, clip_multiplier)
+
+// Regular z-scores for Stress & Curve (for comparison)
+stress_mean = ta.sma(liquidity_stress, len_stats)
+stress_std  = ta.stdev(liquidity_stress, len_stats)
+curve_mean  = ta.sma(yield_curve_standard, len_stats)
+curve_std   = ta.stdev(yield_curve_standard, len_stats)
+
+stress_z_regular = stress_std > 0 ? (liquidity_stress - stress_mean) / stress_std : 0.0
+curve_z_regular  = curve_std  > 0 ? (yield_curve_standard - curve_mean) / curve_std : 0.0
+
+use_percentile = threshold_mode == "Percentile-based"
+use_dynamic    = threshold_mode == "Dynamic (z-score)"
+use_static     = threshold_mode == "Static"
+
+// =====================
+// 5) 4-PILLAR SIGNALS
+// =====================
+bool stress_high     = false
+bool curve_inversion = false
+bool intl_warning    = false
+bool spread_warning  = false
+
+if use_percentile
+    stress_high     := f_check_percentile_warning(liquidity_stress,     percentile_lookback, stress_percentile, false)
+    curve_inversion := f_check_percentile_warning(yield_curve_standard, percentile_lookback, curve_percentile,  true)
+    intl_warning    := f_check_percentile_warning(intl_yield_diff,      percentile_lookback, intl_percentile,   true)
+    spread_warning  := f_check_percentile_warning(long_short_spread,    percentile_lookback, spread_percentile, true)
+else if use_dynamic
+    stress_high     := stress_z_robust  > z_stress_threshold
+    curve_inversion := curve_z_robust   < z_curve_threshold
+    intl_warning    := intl_z_robust    < z_intl_threshold
+    spread_warning  := spread_z_robust  < z_spread_threshold
+else
+    stress_high     := liquidity_stress     > stress_threshold
+    curve_inversion := yield_curve_standard < curve_threshold
+    intl_warning    := intl_yield_diff      < intl_threshold
+    spread_warning  := long_short_spread    < spread_threshold
+
+// Threshold text (for labels)
+stress_threshold_txt = str.tostring(stress_threshold, "#.##")
+if use_dynamic
+    stress_threshold_txt := "Z > " + str.tostring(z_stress_threshold, "#.#")
+if use_percentile
+    stress_threshold_txt := str.tostring(stress_percentile_val, "#.##") + " (" + str.tostring(stress_percentile) + "th %)"
+
+curve_threshold_txt = str.tostring(curve_threshold, "#.##")
+if use_dynamic
+    curve_threshold_txt := "Z < " + str.tostring(z_curve_threshold, "#.#")
+if use_percentile
+    curve_threshold_txt := str.tostring(curve_percentile_val, "#.##") + " (" + str.tostring(curve_percentile) + "th %)"
+
+intl_threshold_txt = str.tostring(intl_threshold, "#.##")
+if use_dynamic
+    intl_threshold_txt := "Z < " + str.tostring(z_intl_threshold, "#.#")
+if use_percentile
+    intl_threshold_txt := str.tostring(intl_percentile_val, "#.##") + " (" + str.tostring(intl_percentile) + "th %)"
+
+spread_threshold_txt = str.tostring(spread_threshold, "#.##")
+if use_dynamic
+    spread_threshold_txt := "Z < " + str.tostring(z_spread_threshold, "#.#")
+if use_percentile
+    spread_threshold_txt := str.tostring(spread_percentile_val, "#.##") + " (" + str.tostring(spread_percentile) + "th %)"
+
+st_liquidity = stress_high     ? "CANG THANG" : "ON"
+st_curve     = curve_inversion ? "DAO NGUOC"  : "ON"
+st_intl      = intl_warning    ? "AP LUC FX"  : "AN TOAN"
+st_spread    = spread_warning  ? "THAP"       : "CAO"
+
+// =====================
+// 6) 3-LAYER RISK
+// =====================
+show_risk_layers = input.bool(true, "🔽 Hien thi phan tich 3 lop rui ro")
+
+// Layer 1: Funding/Liquidity
+layer1_weight_stress = input.int(3, "🟥 Lop 1: Trong so Cang thanh khoan", minval=1, maxval=5)
+layer1_score = stress_high ? layer1_weight_stress : 0
+layer1_max   = layer1_weight_stress
+layer1_pct   = layer1_max > 0 ? (layer1_score / layer1_max) * 100.0 : 0.0
+
+// Layer 2: Cycle/Macro
+layer2_weight_curve_macro = input.int(3, "🟨 Lop 2: Trong so Yield curve (10Y-2Y)", minval=1, maxval=5)
+layer2_weight_spread      = input.int(2, "🟨 Lop 2: Trong so Spread ngan-dai",      minval=1, maxval=5)
+layer2_score = (curve_inversion ? layer2_weight_curve_macro : 0) + (spread_warning ? layer2_weight_spread : 0)
+layer2_max   = layer2_weight_curve_macro + layer2_weight_spread
+layer2_pct   = layer2_max > 0 ? (layer2_score / layer2_max) * 100.0 : 0.0
+
+// Layer 3: External
+layer3_weight_intl = input.int(2, "🟦 Lop 3: Trong so Chenh lech QT", minval=1, maxval=5)
+layer3_weight_fx   = input.int(1, "🟦 Lop 3: Trong so FX pressure",  minval=1, maxval=5)
+layer3_score = (intl_warning ? layer3_weight_intl : 0) + (stress_high and intl_warning ? layer3_weight_fx : 0)
+layer3_max   = layer3_weight_intl + layer3_weight_fx
+layer3_pct   = layer3_max > 0 ? (layer3_score / layer3_max) * 100.0 : 0.0
+
+// Alert thresholds
+risk_alert_level = input.int(4, "Nguong canh bao diem rui ro", minval=1)
+layer1_alert     = input.float(60, "Nguong canh bao Lop 1 (%)", minval=0, maxval=100)
+layer2_alert     = input.float(60, "Nguong canh bao Lop 2 (%)", minval=0, maxval=100)
+layer3_alert     = input.float(60, "Nguong canh bao Lop 3 (%)", minval=0, maxval=100)
+
+// =====================
+// 7) COMPOSITE RISK SCORE
+// =====================
+w_stress = input.int(2, "Trong so Cang thanh khoan")
+w_curve  = input.int(2, "Trong so Yield curve (10Y-2Y)")
+w_intl   = input.int(1, "Trong so Chenh lech QT")
+w_spread = input.int(1, "Trong so Spread ngan-dai")
+
+int risk_score = 0
+risk_score += stress_high     ? w_stress : 0
+risk_score += curve_inversion ? w_curve  : 0
+risk_score += intl_warning    ? w_intl   : 0
+risk_score += spread_warning  ? w_spread : 0
+
+max_score  = w_stress + w_curve + w_intl + w_spread
+risk_ratio = max_score > 0 ? risk_score / max_score : 0.0
+risk_pct   = risk_ratio * 100.0
+
+color risk_base =
+     risk_ratio == 0     ? color.new(color.green, 0) :
+     risk_ratio <= 0.25  ? color.new(color.lime, 0)  :
+     risk_ratio <= 0.5   ? color.new(color.yellow, 0):
+     risk_ratio <= 0.75  ? color.new(color.orange, 0):
+                           color.new(color.red, 0)
+
+color risk_bg   = color.new(risk_base, 92)
+color risk_fill = color.new(risk_base, 85)
+
+// =====================
+// 8) PANE 1 – RATES
+// =====================
+plot(show_pane1 ? bond_10y       : na, title="VN10Y",        color=color.new(color.orange, 0), linewidth=2)
+plot(show_pane1 ? bond_2y        : na, title="VN02Y",        color=color.new(color.purple, 0), linewidth=2)
+plot(show_pane1 ? interbank_rate : na, title="VN Interbank", color=color.new(color.teal, 0),   linewidth=2)
+plot(show_pane1 ? policy_rate    : na, title="SBV Policy",   color=color.new(color.red, 0),    linewidth=2)
+plot(show_pane1 ? us_10y         : na, title="US10Y",        color=color.new(color.blue, 40),  linewidth=1)
+plot(show_pane1 ? 0              : na, title="0",            color=color.new(color.gray, 80),  linewidth=1, style=plot.style_line)
+
+var label lbl_vn10   = na
+var label lbl_vn02   = na
+var label lbl_ib     = na
+var label lbl_policy = na
+var label lbl_us10   = na
+
+lbl_vn10   := f_markLine(lbl_vn10,   show_pane1, "VN10Y " + str.tostring(bond_10y, "#.##"),   bond_10y,        color.new(color.orange, 0))
+lbl_vn02   := f_markLine(lbl_vn02,   show_pane1, "VN02Y " + str.tostring(bond_2y, "#.##"),    bond_2y,         color.new(color.purple, 0))
+lbl_ib     := f_markLine(lbl_ib,     show_pane1, "IB "    + str.tostring(interbank_rate, "#.##"), interbank_rate, color.new(color.teal, 0))
+lbl_policy := f_markLine(lbl_policy, show_pane1, "Policy " + str.tostring(policy_rate, "#.##"),    policy_rate,    color.new(color.red, 0))
+lbl_us10   := f_markLine(lbl_us10,   show_pane1, "US10Y " + str.tostring(us_10y, "#.##"),     us_10y,           color.new(color.blue, 0))
+
+// =====================
+// 9) PANE 2 – SPREADS / Z-SCORE
+// =====================
+pane2_view = input.string("Spreads", "Pane 2: Hien thi",
+     options = ["Spreads", "Z-scores", "Percentile-thresholds", "Robust Z-scores"])
+
+p2_line1 = pane2_view == "Spreads"               ? liquidity_stress                     :
+           pane2_view == "Z-scores"              ? stress_z_regular                     :
+           pane2_view == "Robust Z-scores"       ? stress_z_robust                      :
+           pane2_view == "Percentile-thresholds" ? (liquidity_stress - stress_percentile_val) : na
+
+p2_line2 = pane2_view == "Spreads"               ? yield_curve_standard                 :
+           pane2_view == "Z-scores"              ? curve_z_regular                      :
+           pane2_view == "Robust Z-scores"       ? curve_z_robust                       :
+           pane2_view == "Percentile-thresholds" ? (yield_curve_standard - curve_percentile_val) : na
+
+p2_line3 = pane2_view == "Spreads"               ? intl_yield_diff                      :
+           pane2_view == "Z-scores"              ? intl_z_robust                        :
+           pane2_view == "Robust Z-scores"       ? intl_z_robust                        :
+           pane2_view == "Percentile-thresholds" ? (intl_yield_diff - intl_percentile_val) : na
+
+p2_line4 = pane2_view == "Spreads"               ? long_short_spread                    :
+           pane2_view == "Z-scores"              ? spread_z_robust                      :
+           pane2_view == "Robust Z-scores"       ? spread_z_robust                      :
+           pane2_view == "Percentile-thresholds" ? (long_short_spread - spread_percentile_val) : na
+
+plot(show_pane2 ? p2_line1 : na, title="Stress Line",  color=color.new(#FF6B6B, 0), linewidth=2)
+plot(show_pane2 ? p2_line2 : na, title="Curve Line",   color=color.new(#4ECDC4, 0), linewidth=2)
+plot(show_pane2 ? p2_line3 : na, title="Intl Line",    color=color.new(#45B7D1, 0), linewidth=2)
+plot(show_pane2 ? p2_line4 : na, title="Spread Line",  color=color.new(#96CEB4, 0), linewidth=2)
+plot(show_pane2 ? 0        : na, title="0",            color=color.new(color.gray, 80), linewidth=1, style=plot.style_line)
+
+// Percentile threshold lines when in Spreads mode
+plot(show_pane2 and pane2_view == "Spreads" and use_percentile ? stress_percentile_val : na,
+     title="Stress Percentile", color=color.new(#FF6B6B, 50), linewidth=1, style=plot.style_line)
+
+plot(show_pane2 and pane2_view == "Spreads" and use_percentile ? curve_percentile_val : na,
+     title="Curve Percentile", color=color.new(#4ECDC4, 50), linewidth=1, style=plot.style_line)
+
+plot(show_pane2 and pane2_view == "Spreads" and use_percentile ? intl_percentile_val : na,
+     title="Intl Percentile", color=color.new(#45B7D1, 50), linewidth=1, style=plot.style_line)
+
+plot(show_pane2 and pane2_view == "Spreads" and use_percentile ? spread_percentile_val : na,
+     title="Spread Percentile", color=color.new(#96CEB4, 50), linewidth=1, style=plot.style_line)
+
+var label lbl_p2_line1 = na
+var label lbl_p2_line2 = na
+var label lbl_p2_line3 = na
+var label lbl_p2_line4 = na
+
+p2_lbl1 = pane2_view == "Spreads"               ? "Stress"      :
+          pane2_view == "Z-scores"              ? "Z-Stress"    :
+          pane2_view == "Robust Z-scores"       ? "RZ-Stress"   : "Stress Δ"
+
+p2_lbl2 = pane2_view == "Spreads"               ? "Curve"       :
+          pane2_view == "Z-scores"              ? "Z-Curve"     :
+          pane2_view == "Robust Z-scores"       ? "RZ-Curve"    : "Curve Δ"
+
+p2_lbl3 = pane2_view == "Spreads"               ? "Intl"        :
+          pane2_view == "Z-scores"              ? "Z-Intl"      :
+          pane2_view == "Robust Z-scores"       ? "RZ-Intl"     : "Intl Δ"
+
+p2_lbl4 = pane2_view == "Spreads"               ? "Spread"      :
+          pane2_view == "Z-scores"              ? "Z-Spread"    :
+          pane2_view == "Robust Z-scores"       ? "RZ-Spread"   : "Spread Δ"
+
+lbl_p2_line1 := f_markLine(lbl_p2_line1, show_pane2 and not na(p2_line1), p2_lbl1 + " " + str.tostring(p2_line1, "#.##"), p2_line1, color.new(#FF6B6B, 0))
+lbl_p2_line2 := f_markLine(lbl_p2_line2, show_pane2 and not na(p2_line2), p2_lbl2 + " " + str.tostring(p2_line2, "#.##"), p2_line2, color.new(#4ECDC4, 0))
+lbl_p2_line3 := f_markLine(lbl_p2_line3, show_pane2 and not na(p2_line3), p2_lbl3 + " " + str.tostring(p2_line3, "#.##"), p2_line3, color.new(#45B7D1, 0))
+lbl_p2_line4 := f_markLine(lbl_p2_line4, show_pane2 and not na(p2_line4), p2_lbl4 + " " + str.tostring(p2_line4, "#.##"), p2_line4, color.new(#96CEB4, 0))
+
+// =====================
+// 10) MACRO SCENARIOS
+// =====================
+liquidity_crisis  = stress_high and curve_inversion and intl_warning
+recession_warning = curve_inversion and spread_warning
+fx_pressure       = intl_warning and stress_high
+inflation_proxy   = long_short_spread > spread_percentile_val * 1.5 and yield_curve_standard > 0
+
+// =====================
+// 11) PANE 3 – RISK SCORE & SIMPLE DASHBOARD
+// =====================
+p3_risk = show_pane3 ? risk_pct : na
+plot(p3_risk, title="Risk % (0-100)", color=color.new(color.white, 0), linewidth=2, style=plot.style_stepline)
+plot(p3_risk, title="Risk fill",       style=plot.style_area,         color=show_pane3 ? risk_fill : na)
+bgcolor(show_pane3 ? risk_bg : na, title="Risk background")
+
+var label lbl_risk_pct = na
+lbl_risk_pct := f_markLine(lbl_risk_pct, show_pane3 and not na(p3_risk),
+     "Risk " + str.tostring(p3_risk, "#.#") + "%",
+     p3_risk,
+     color.white)
+
+// Percent-rank for components (risk-side view)
+current_stress_pct = ta.percentrank(liquidity_stress,     percentile_lookback)
+current_curve_pct  = ta.percentrank(yield_curve_standard, percentile_lookback)
+current_intl_pct   = ta.percentrank(intl_yield_diff,      percentile_lookback)
+current_spread_pct = ta.percentrank(long_short_spread,    percentile_lookback)
+
+stress_risk_pct = current_stress_pct
+curve_risk_pct  = 100.0 - current_curve_pct
+intl_risk_pct   = 100.0 - current_intl_pct
+spread_risk_pct = 100.0 - current_spread_pct
+
+// =====================
+// 12) PANE 4 – 3-LAYER RISK
+// =====================
+plot(show_pane4 ? layer1_pct : na, title="🟥 Lop 1: Thanh khoan", color=color.new(#FF6B6B, 0), linewidth=3)
+plot(show_pane4 ? layer2_pct : na, title="🟨 Lop 2: Chu ky",      color=color.new(#FFA726, 0), linewidth=3)
+plot(show_pane4 ? layer3_pct : na, title="🟦 Lop 3: Ngoai vi",    color=color.new(#42A5F5, 0), linewidth=3)
+
+plot(show_pane4 ? 80 : na, title="Rat Cao (80%)", color=color.new(color.red, 50),    linewidth=1, style=plot.style_line)
+plot(show_pane4 ? 60 : na, title="Cao (60%)",     color=color.new(color.orange, 50), linewidth=1, style=plot.style_line)
+plot(show_pane4 ? 40 : na, title="TB (40%)",      color=color.new(color.yellow, 50), linewidth=1, style=plot.style_line)
+plot(show_pane4 ? 20 : na, title="Thap (20%)",    color=color.new(color.green, 50),  linewidth=1, style=plot.style_line)
+plot(show_pane4 ? 0  : na, title="0",             color=color.new(color.gray, 80),   linewidth=1, style=plot.style_line)
+
+var label lbl_layer1 = na
+var label lbl_layer2 = na
+var label lbl_layer3 = na
+var label lbl_thr80  = na
+var label lbl_thr60  = na
+var label lbl_thr40  = na
+var label lbl_thr20  = na
+var label lbl_thr0   = na
+
+lbl_layer1 := f_markLine(lbl_layer1, show_pane4 and not na(layer1_pct), "L1 " + str.tostring(layer1_pct, "#.#") + "%", layer1_pct, color.new(#FF6B6B, 0))
+lbl_layer2 := f_markLine(lbl_layer2, show_pane4 and not na(layer2_pct), "L2 " + str.tostring(layer2_pct, "#.#") + "%", layer2_pct, color.new(#FFA726, 0))
+lbl_layer3 := f_markLine(lbl_layer3, show_pane4 and not na(layer3_pct), "L3 " + str.tostring(layer3_pct, "#.#") + "%", layer3_pct, color.new(#42A5F5, 0))
+lbl_thr80  := f_markLine(lbl_thr80,  show_pane4, "80%", 80, color.new(color.red, 50))
+lbl_thr60  := f_markLine(lbl_thr60,  show_pane4, "60%", 60, color.new(color.orange, 50))
+lbl_thr40  := f_markLine(lbl_thr40,  show_pane4, "40%", 40, color.new(color.yellow, 50))
+lbl_thr20  := f_markLine(lbl_thr20,  show_pane4, "20%", 20, color.new(color.green, 50))
+lbl_thr0   := f_markLine(lbl_thr0,   show_pane4, "0%",  0,  color.new(color.gray, 80))
+
+// =====================
+// 13) PANEL 5 – MARKET-BASED POLICY PRESSURE (DATA-DRIVEN)
+// =====================
+group_panel5 = "Panel 5 – Policy pressure"
+
+w_fp = input.float(0.35, "Trong so Funding pressure", minval=0.0, maxval=1.0, step=0.05, group=group_panel5)
+w_cp = input.float(0.25, "Trong so Curve pressure",   minval=0.0, maxval=1.0, step=0.05, group=group_panel5)
+w_ep = input.float(0.2,  "Trong so External pressure", minval=0.0, maxval=1.0, step=0.05, group=group_panel5)
+w_fx = input.float(0.2,  "Trong so FX pressure",       minval=0.0, maxval=1.0, step=0.05, group=group_panel5)
+
+norm_mode = input.string("Percentile", "Normalization mode", options=["Percentile", "Robust Z-score", "Hybrid"], group=group_panel5)
+external_weight_mode = input.string("Fixed", "External weight mode", options=["Fixed", "Fed-sensitive"], group=group_panel5)
+fx_shock_mult = input.float(1.2, "FX shock multiplier", minval=0.5, maxval=2.0, step=0.05, group=group_panel5)
+
+zone_low_pct = input.int(30, "Nguong zone thap (%)", minval=1, maxval=49, group=group_panel5)
+int zone_high_pct = input.int(70, "Nguong zone cao (%)", minval=51, maxval=99, group=group_panel5)
+if zone_high_pct <= zone_low_pct
+    zone_high_pct := zone_low_pct + 1
+
+show_sub_pressures = input.bool(false, "Hien thi 4 ap luc thanh phan", group=group_panel5)
+
+fed_gap      = fed_policy_rate - policy_rate
+fx_yoy_change = ta.roc(fx_rate, 252)
+fx_return_21  = ta.roc(fx_rate, 21)
+fx_vol_3m     = ta.stdev(fx_return_21, 63)
+fx_yoy_abs    = math.abs(fx_yoy_change)
+
+f_z_to_score(z) =>
+    float score = 50.0 + 25.0 * z
+    math.max(0.0, math.min(100.0, score))
+
+f_apply_norm(percentile_val, z_val) =>
+    float perc = percentile_val
+    float zScore = na(z_val) ? na : f_z_to_score(z_val)
+    if norm_mode == "Percentile"
+        perc
+    else if norm_mode == "Robust Z-score"
+        zScore
+    else
+        not na(perc) and not na(zScore) ? (perc + zScore) / 2.0 : (not na(perc) ? perc : zScore)
+
+funding_pressure = f_apply_norm(stress_risk_pct, stress_z_robust)
+
+float curve_sum = 0.0
+float curve_cnt = 0.0
+curve_component = f_apply_norm(curve_risk_pct, -curve_z_robust)
+spread_component = f_apply_norm(spread_risk_pct, -spread_z_robust)
+if not na(curve_component)
+    curve_sum += curve_component
+    curve_cnt += 1.0
+if not na(spread_component)
+    curve_sum += spread_component
+    curve_cnt += 1.0
+curve_pressure = curve_cnt > 0 ? curve_sum / curve_cnt : na
+
+fed_gap_pct = ta.percentrank(fed_gap, percentile_lookback)
+fed_gap_z   = f_robust_zscore(fed_gap, len_stats, clip_multiplier)
+intl_component = f_apply_norm(intl_risk_pct, -intl_z_robust)
+fed_component  = f_apply_norm(fed_gap_pct, fed_gap_z)
+float external_sum = 0.0
+float external_cnt = 0.0
+if not na(intl_component)
+    external_sum += intl_component
+    external_cnt += 1.0
+if not na(fed_component)
+    external_sum += fed_component
+    external_cnt += 1.0
+external_pressure = external_cnt > 0 ? external_sum / external_cnt : na
+
+fx_yoy_pct = ta.percentrank(fx_yoy_abs, percentile_lookback)
+fx_vol_pct = ta.percentrank(fx_vol_3m, percentile_lookback)
+fx_yoy_z   = f_robust_zscore(fx_yoy_abs, len_stats, clip_multiplier)
+fx_vol_z   = f_robust_zscore(fx_vol_3m, len_stats, clip_multiplier)
+float fx_sum = 0.0
+float fx_cnt = 0.0
+fx_yoy_component = f_apply_norm(fx_yoy_pct, fx_yoy_z)
+fx_vol_component = f_apply_norm(fx_vol_pct, fx_vol_z)
+if not na(fx_yoy_component)
+    fx_sum += fx_yoy_component
+    fx_cnt += 1.0
+if not na(fx_vol_component)
+    fx_sum += fx_vol_component
+    fx_cnt += 1.0
+fx_pressure_core = fx_cnt > 0 ? fx_sum / fx_cnt : na
+fx_pressure_idx = not na(fx_pressure_core) ? math.max(0.0, math.min(100.0, fx_pressure_core * fx_shock_mult)) : na
+
+float w_fp_eff = w_fp
+float w_cp_eff = w_cp
+float fed_z_pos = na(fed_gap_z) ? 0.0 : math.max(0.0, fed_gap_z)
+float w_ep_eff = external_weight_mode == "Fed-sensitive" ? (w_ep + fed_z_pos * 0.1) : w_ep
+float w_fx_eff = w_fx
+
+float pressure_num = 0.0
+float pressure_den = 0.0
+if not na(funding_pressure)
+    pressure_num += funding_pressure * w_fp_eff
+    pressure_den += w_fp_eff
+if not na(curve_pressure)
+    pressure_num += curve_pressure * w_cp_eff
+    pressure_den += w_cp_eff
+if not na(external_pressure)
+    pressure_num += external_pressure * w_ep_eff
+    pressure_den += w_ep_eff
+if not na(fx_pressure_idx)
+    pressure_num += fx_pressure_idx * w_fx_eff
+    pressure_den += w_fx_eff
+policy_pressure = pressure_den > 0 ? pressure_num / pressure_den : na
+
+float contrib_fp = na
+float contrib_cp = na
+float contrib_ep = na
+float contrib_fx = na
+
+if pressure_den > 0
+    contrib_fp := not na(funding_pressure)  ? funding_pressure  * w_fp_eff / pressure_den : na
+    contrib_cp := not na(curve_pressure)    ? curve_pressure    * w_cp_eff / pressure_den : na
+    contrib_ep := not na(external_pressure) ? external_pressure * w_ep_eff / pressure_den : na
+    contrib_fx := not na(fx_pressure_idx)   ? fx_pressure_idx   * w_fx_eff / pressure_den : na
+
+bool zone_ease    = not na(policy_pressure) and policy_pressure <= zone_low_pct
+bool zone_tight   = not na(policy_pressure) and policy_pressure >= zone_high_pct
+bool zone_neutral = not na(policy_pressure) and not zone_ease and not zone_tight
+
+string policy_zone_txt = zone_ease ? "Zone: De noi" :
+     zone_tight ? "Zone: Ap luc cao" :
+     zone_neutral ? "Zone: Trung tinh" : "Zone: --"
+
+color policy_zone_bg = zone_ease ? color.new(color.green, 85) :
+     zone_tight ? color.new(color.red, 85) :
+     zone_neutral ? color.new(color.orange, 90) : na
+
+// Panel 5 guide describing the three regimes
+var table policy_zone_table = na
+if barstate.islast
+    if show_pane5
+        if na(policy_zone_table)
+            policy_zone_table := table.new(position.bottom_center, 2, 4,
+                 bgcolor=color.new(color.black, 80), border_width=1, border_color=color.new(color.white, 20))
+            table.merge_cells(policy_zone_table, 0, 0, 1, 0)
+    else
+        if not na(policy_zone_table)
+            table.delete(policy_zone_table)
+            policy_zone_table := na
+
+if barstate.islast and show_pane5 and not na(policy_zone_table)
+    table.cell(policy_zone_table, 0, 0, "Policy Pressure – Research Guide", bgcolor=color.new(color.blue, 40), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_zone_table, 0, 1, "Easing window (<= " + str.tostring(zone_low_pct) + "%)", text_color=color.white, text_size=size.tiny)
+    table.cell(policy_zone_table, 1, 1,
+         "Hien tai " + str.tostring(policy_pressure, "#.#") + "% → " + (zone_ease ? "dang trong easing window" : "khong con du dia ro rang"),
+         text_color=color.white, text_size=size.tiny)
+    table.cell(policy_zone_table, 0, 2, "Neutral window", text_color=color.white, text_size=size.tiny)
+    table.cell(policy_zone_table, 1, 2,
+         str.tostring(zone_low_pct) + "% – " + str.tostring(zone_high_pct) + "% : Can bang noi-ngoai, SBV giu lap truong",
+         text_color=color.white, text_size=size.tiny)
+    table.cell(policy_zone_table, 0, 3, "Constraint window (>= " + str.tostring(zone_high_pct) + "%)", text_color=color.white, text_size=size.tiny)
+    table.cell(policy_zone_table, 1, 3,
+         "Hien tai " + str.tostring(policy_pressure, "#.#") + "% → " + (zone_tight ? "ap luc cao, nguy co that chat" : "chua vao constraint zone"),
+         text_color=color.white, text_size=size.tiny)
+
+var table policy_decomp_table = na
+
+if barstate.islast
+    if show_pane5
+        if na(policy_decomp_table)
+            policy_decomp_table := table.new(position.top_right, 4, 6,
+                 bgcolor=color.new(color.black, 80), border_width=1, border_color=color.new(color.white, 20))
+            table.merge_cells(policy_decomp_table, 0, 0, 3, 0)
+    else
+        if not na(policy_decomp_table)
+            table.delete(policy_decomp_table)
+            policy_decomp_table := na
+
+f_txt_pct(v) =>
+    not na(v) ? str.tostring(v, "#.#") + "%" : "--"
+
+f_txt_w(v) =>
+    str.tostring(v, "#.00")
+
+f_txt_pts(v) =>
+    not na(v) ? str.tostring(v, "#.#") + " pts" : "--"
+
+if barstate.islast and show_pane5 and not na(policy_decomp_table)
+    table.cell(policy_decomp_table, 0, 0, "Policy Pressure – Decomposition", bgcolor=color.new(color.blue, 40), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_decomp_table, 0, 1, "Block", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(policy_decomp_table, 1, 1, "Index %", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(policy_decomp_table, 2, 1, "Weight", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(policy_decomp_table, 3, 1, "Contribution", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+
+    table.cell(policy_decomp_table, 0, 2, "Funding", bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_decomp_table, 1, 2, f_txt_pct(funding_pressure), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_decomp_table, 2, 2, f_txt_w(w_fp_eff), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_decomp_table, 3, 2, f_txt_pts(contrib_fp), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+
+    table.cell(policy_decomp_table, 0, 3, "Curve", bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_decomp_table, 1, 3, f_txt_pct(curve_pressure), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_decomp_table, 2, 3, f_txt_w(w_cp_eff), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_decomp_table, 3, 3, f_txt_pts(contrib_cp), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+
+    table.cell(policy_decomp_table, 0, 4, "External", bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_decomp_table, 1, 4, f_txt_pct(external_pressure), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_decomp_table, 2, 4, f_txt_w(w_ep_eff), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_decomp_table, 3, 4, f_txt_pts(contrib_ep), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+
+    table.cell(policy_decomp_table, 0, 5, "FX", bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_decomp_table, 1, 5, f_txt_pct(fx_pressure_idx), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_decomp_table, 2, 5, f_txt_w(w_fx_eff), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+    table.cell(policy_decomp_table, 3, 5, f_txt_pts(contrib_fx), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+
+// =====================
+// 14) PANE 5 – DATA-ONLY PRESSURE VIEW
+// =====================
+pane5_policy_view = show_pane5
+
+plot(pane5_policy_view ? policy_pressure : na, title="Policy Pressure (0-100)", color=color.new(color.white, 0), linewidth=3, style=plot.style_line)
+plot(pane5_policy_view ? policy_pressure : na, title="Policy Pressure fill",   color=pane5_policy_view ? color.new(color.white, 85) : na, style=plot.style_area)
+
+plot(pane5_policy_view and show_sub_pressures ? funding_pressure : na,
+     title="Funding pressure", color=color.new(#D32F2F, 0), linewidth=2)
+plot(pane5_policy_view and show_sub_pressures ? curve_pressure : na,
+     title="Curve pressure", color=color.new(#FFA726, 0), linewidth=2)
+plot(pane5_policy_view and show_sub_pressures ? external_pressure : na,
+     title="External pressure", color=color.new(#42A5F5, 0), linewidth=2)
+plot(pane5_policy_view and show_sub_pressures ? fx_pressure_idx : na,
+     title="FX pressure", color=color.new(#7B1FA2, 0), linewidth=2)
+
+plot(pane5_policy_view ? zone_low_pct  : na, title="Zone thap", color=color.new(color.green, 60), linewidth=1, style=plot.style_line)
+plot(pane5_policy_view ? zone_high_pct : na, title="Zone cao",  color=color.new(color.red, 60),   linewidth=1, style=plot.style_line)
+
+plot(pane5_policy_view ? 0   : na, title="0",   color=color.new(color.gray, 85), linewidth=1)
+plot(pane5_policy_view ? 100 : na, title="100", color=color.new(color.gray, 85), linewidth=1)
+
+bgcolor(pane5_policy_view ? policy_zone_bg : na, title="Policy Pressure zone")
+
+var label lbl_policy_pressure = na
+lbl_policy_pressure := f_markLine(
+     lbl_policy_pressure,
+     pane5_policy_view and not na(policy_pressure),
+     "PolicyPressure " + str.tostring(policy_pressure, "#.#") + "% | " + policy_zone_txt,
+     policy_pressure,
+     color.white)
+
+var label lbl_fp  = na
+var label lbl_cp  = na
+var label lbl_ep  = na
+var label lbl_fx  = na
+var label lbl_zlo = na
+var label lbl_zhi = na
+
+lbl_fp := f_markLine(
+     lbl_fp,
+     pane5_policy_view and show_sub_pressures and not na(funding_pressure),
+     "Funding " + str.tostring(funding_pressure, "#.#") + "%",
+     funding_pressure,
+     color.new(#D32F2F, 0))
+
+lbl_cp := f_markLine(
+     lbl_cp,
+     pane5_policy_view and show_sub_pressures and not na(curve_pressure),
+     "Curve " + str.tostring(curve_pressure, "#.#") + "%",
+     curve_pressure,
+     color.new(#FFA726, 0))
+
+lbl_ep := f_markLine(
+     lbl_ep,
+     pane5_policy_view and show_sub_pressures and not na(external_pressure),
+     "External " + str.tostring(external_pressure, "#.#") + "%",
+     external_pressure,
+     color.new(#42A5F5, 0))
+
+lbl_fx := f_markLine(
+     lbl_fx,
+     pane5_policy_view and show_sub_pressures and not na(fx_pressure_idx),
+     "FX " + str.tostring(fx_pressure_idx, "#.#") + "%",
+     fx_pressure_idx,
+     color.new(#7B1FA2, 0))
+
+lbl_zlo := f_markLine(
+     lbl_zlo,
+     pane5_policy_view and not na(zone_low_pct),
+     "Zone Low " + str.tostring(zone_low_pct) + "%",
+     zone_low_pct,
+     color.new(color.green, 40))
+
+lbl_zhi := f_markLine(
+     lbl_zhi,
+     pane5_policy_view and not na(zone_high_pct),
+     "Zone High " + str.tostring(zone_high_pct) + "%",
+     zone_high_pct,
+     color.new(color.red, 40))
+
+// =====================
+// 15) ALERT SYSTEM (MACRO PANELS)
+// =====================
+if barstate.islast
+    if layer1_pct >= layer1_alert
+        alert("CANH BAO LOP 1: Rui ro thanh khoan = " + str.tostring(layer1_pct, "#.0") + "%", alert.freq_once_per_bar)
+    if layer2_pct >= layer2_alert
+        alert("CANH BAO LOP 2: Rui ro chu ky = " + str.tostring(layer2_pct, "#.0") + "%", alert.freq_once_per_bar)
+    if layer3_pct >= layer3_alert
+        alert("CANH BAO LOP 3: Rui ro ngoai vi = " + str.tostring(layer3_pct, "#.0") + "%", alert.freq_once_per_bar)
+    if risk_score >= risk_alert_level
+        alert("CANH BAO TONG: Diem rui ro = " + str.tostring(risk_score) + "/" + str.tostring(max_score), alert.freq_once_per_bar)
+    if liquidity_crisis
+        alert("CANH BAO KHAN: Khung hoang thanh khoan", alert.freq_once_per_bar)
+
+// =====================================================================
+// 16) INDICES RESEARCH BLOCK (HOSE INDICES + SECTOR ROTATION + TRANSITION)
+// =====================================================================
+
+// 2) EQUITY CONFIG (HOSE INDICES + FEATURES)
+// (ported from MacroAcademic_v4_3_Indices_Research_B_v4_4fix.pine)
+
+group_equity = "Equity mapping & features"
+
+tf_equity   = input.timeframe("D", "Equity timeframe (khuyen nghi: D)", group=group_equity)
+
+// Feature toggles – kiểm soát tải nhưng không cắt danh sách symbol
+calc_R5   = input.bool(false, "Tinh R5 (5-bar return)", group=group_equity)
+calc_R20  = input.bool(true,  "Tinh R20 (20-bar return)", group=group_equity)
+calc_R60  = input.bool(false, "Tinh R60 (60-bar return)", group=group_equity)
+calc_DD20 = input.bool(false, "Tinh Drawdown 20", group=group_equity)
+calc_DD60 = input.bool(false, "Tinh Drawdown 60", group=group_equity)
+
+// View options
+group_view = "View / Bucket"
+
+bucket_view = input.string("Auto (current)", "Bucket view",
+     options = ["Auto (current)", "B0 (0–20)", "B1 (20–40)", "B2 (40–60)", "B3 (60–80)", "B4 (80–100)"],
+     group   = group_view)
+show_bucket_guide = input.bool(true, "Panel 1: Hien thi Bucket Guide", group=group_view)
+
+show_R60_cols = input.bool(true,  "Bang A: Hien thi AvgR60", group=group_view)
+show_DD_cols  = input.bool(true,  "Bang A: Hien thi AvgDD20", group=group_view)
+min_N_market  = input.int(30, "Min N20 de hien thi (Table A)", minval=1, group=group_view)
+min_N_sector  = input.int(30, "Min N (RR20) de ranking (Table B)", minval=1, group=group_view)
+
+// UI – PANEL VIEW (indices research panels)
+group_ui = "UI / Panel view"
+
+panel_view = input.string(
+     "Panel 1 – Macro Weather",
+     "Chon panel hien thi",
+     options = [
+         "Panel 1 – Macro Weather",
+         "Panel 2 – Market Regime Map",
+         "Panel 3 – Sector Rotation Map",
+         "Panel 4 – Transition Summary"
+     ],
+     group = group_ui)
+
+bool show_panel1 = panel_view == "Panel 1 – Macro Weather"
+bool show_panel2 = panel_view == "Panel 2 – Market Regime Map"
+bool show_panel3 = panel_view == "Panel 3 – Sector Rotation Map"
+bool show_panel4 = panel_view == "Panel 4 – Transition Summary"
+
+// 9) TRANSITION MATRIX (TABLE C)
+group_trans = "Table C – Transition (Macro buckets)"
+
+show_trans_table  = input.bool(true,  "Hien thi Table C (Transition matrix)", group=group_trans)
+trans_L           = input.int(20,     "Transition horizon L (bars)", minval=5, maxval=252, group=group_trans)
+trans_show_avgRet = input.bool(true,  "Hien thi Avg benchmark return", group=group_trans)
+trans_show_prob   = input.bool(true,  "Hien thi Row probability %", group=group_trans)
+min_N_trans       = input.int(30,     "Min N cho o Transition", minval=1, group=group_trans)
+
+// Academic / sample controls
+group_sample = "Sample window (Academic)"
+group_debug  = "Academic / Debug"
+
+use_start_year = input.bool(false, "Chi thong ke tu nam ...", group=group_sample)
+start_year     = input.int(2015, "Nam bat dau thong ke", minval=2000, maxval=2100, group=group_sample)
+
+use_non_overlap = input.bool(false, "Use NON-overlapping samples (hoc thuat hon)", group=group_acad)
+
+reset_stats = input.bool(false, "Reset statistics (toggle = reset)", group=group_debug)
+
+// 5x5 = 25 cells: fromBucket * 5 + toBucket
+var float[] transCnt    = array.new_float(25, 0.0)
+var float[] transSumRet = array.new_float(25, 0.0)
+var float[] transWin    = array.new_float(25, 0.0)
+
+// 3) EQUITY DATA – 17 HOSE INDICES + BENCHMARK
+
+// Market / size / breadth indices (6)
+mkt_vnindex   = request.security("HOSE:VNINDEX",     tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vn30      = request.security("HOSE:VN30",        tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vn100     = request.security("HOSE:VN100",       tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vnall     = request.security("HOSE:VNALLSHARE",  tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vnmid     = request.security("HOSE:VNMIDCAP",    tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vnsmall   = request.security("HOSE:VNSMALLCAP",  tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+mkt_vnindex_low = request.security("HOSE:VNINDEX",    tf_equity, low, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vn30_low    = request.security("HOSE:VN30",       tf_equity, low, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vn100_low   = request.security("HOSE:VN100",      tf_equity, low, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vnall_low   = request.security("HOSE:VNALLSHARE", tf_equity, low, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vnmid_low   = request.security("HOSE:VNMIDCAP",   tf_equity, low, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vnsmall_low = request.security("HOSE:VNSMALLCAP", tf_equity, low, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Sector indices (11)
+sec_vnfin      = request.security("HOSE:VNFIN",      tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnfin_sel  = request.security("HOSE:VNFINSELECT", tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnind      = request.security("HOSE:VNIND",      tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnit       = request.security("HOSE:VNIT",       tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnreal     = request.security("HOSE:VNREAL",     tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vncons     = request.security("HOSE:VNCONS",     tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vncond     = request.security("HOSE:VNCOND",     tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnene      = request.security("HOSE:VNENE",      tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnmat      = request.security("HOSE:VNMAT",      tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnheal     = request.security("HOSE:VNHEAL",     tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnuti      = request.security("HOSE:VNUTI",      tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Benchmark dùng cho RR ngành – cố định HOSE:VNINDEX, tái sử dụng series đã fetch
+benchmark_close = mkt_vnindex
+
+// Arrays để xử lý tên theo index (series dữ liệu sẽ lấy bằng hàm getter)
+var string[] market_name = array.new_string()
+var string[] sector_name = array.new_string()
+
+if barstate.isfirst
+    // Market names
+    array.push(market_name, "VNINDEX")
+    array.push(market_name, "VN30")
+    array.push(market_name, "VN100")
+    array.push(market_name, "VNALLSHARE")
+    array.push(market_name, "VNMIDCAP")
+    array.push(market_name, "VNSMALLCAP")
+
+    // Sector names
+    array.push(sector_name, "VNFIN")
+    array.push(sector_name, "VNFINSELECT")
+    array.push(sector_name, "VNIND")
+    array.push(sector_name, "VNIT")
+    array.push(sector_name, "VNREAL")
+    array.push(sector_name, "VNCONS")
+    array.push(sector_name, "VNCOND")
+    array.push(sector_name, "VNENE")
+    array.push(sector_name, "VNMAT")
+    array.push(sector_name, "VNHEAL")
+    array.push(sector_name, "VNUTI")
+
+// Getter helpers: trả về series theo index (đúng cú pháp Pine, không dùng arr[m])
+f_market_close(int m) =>
+    m == 0 ? mkt_vnindex :
+     m == 1 ? mkt_vn30 :
+     m == 2 ? mkt_vn100 :
+     m == 3 ? mkt_vnall :
+     m == 4 ? mkt_vnmid :
+     m == 5 ? mkt_vnsmall : na
+
+f_market_low(int m) =>
+    m == 0 ? mkt_vnindex_low :
+     m == 1 ? mkt_vn30_low :
+     m == 2 ? mkt_vn100_low :
+     m == 3 ? mkt_vnall_low :
+     m == 4 ? mkt_vnmid_low :
+     m == 5 ? mkt_vnsmall_low : na
+
+f_sector_close(int s) =>
+    s == 0  ? sec_vnfin :
+     s == 1 ? sec_vnfin_sel :
+     s == 2 ? sec_vnind :
+     s == 3 ? sec_vnit :
+     s == 4 ? sec_vnreal :
+     s == 5 ? sec_vncons :
+     s == 6 ? sec_vncond :
+     s == 7 ? sec_vnene :
+     s == 8 ? sec_vnmat :
+     s == 9 ? sec_vnheal :
+     s == 10 ? sec_vnuti : na
+
+// Precomputed lows for drawdown calculations (L=20 -> len 21, L=60 -> len 61)
+mkt_vnindex_lowest21 = ta.lowest(mkt_vnindex_low, 21)
+mkt_vn30_lowest21    = ta.lowest(mkt_vn30_low, 21)
+mkt_vn100_lowest21   = ta.lowest(mkt_vn100_low, 21)
+mkt_vnall_lowest21   = ta.lowest(mkt_vnall_low, 21)
+mkt_vnmid_lowest21   = ta.lowest(mkt_vnmid_low, 21)
+mkt_vnsmall_lowest21 = ta.lowest(mkt_vnsmall_low, 21)
+
+mkt_vnindex_lowest61 = ta.lowest(mkt_vnindex_low, 61)
+mkt_vn30_lowest61    = ta.lowest(mkt_vn30_low, 61)
+mkt_vn100_lowest61   = ta.lowest(mkt_vn100_low, 61)
+mkt_vnall_lowest61   = ta.lowest(mkt_vnall_low, 61)
+mkt_vnmid_lowest61   = ta.lowest(mkt_vnmid_low, 61)
+mkt_vnsmall_lowest61 = ta.lowest(mkt_vnsmall_low, 61)
+
+f_market_lowest_cached(int m, int L) =>
+    if L == 20
+        m == 0 ? mkt_vnindex_lowest21 :
+         m == 1 ? mkt_vn30_lowest21 :
+         m == 2 ? mkt_vn100_lowest21 :
+         m == 3 ? mkt_vnall_lowest21 :
+         m == 4 ? mkt_vnmid_lowest21 :
+         m == 5 ? mkt_vnsmall_lowest21 : na
+    else if L == 60
+        m == 0 ? mkt_vnindex_lowest61 :
+         m == 1 ? mkt_vn30_lowest61 :
+         m == 2 ? mkt_vn100_lowest61 :
+         m == 3 ? mkt_vnall_lowest61 :
+         m == 4 ? mkt_vnmid_lowest61 :
+         m == 5 ? mkt_vnsmall_lowest61 : na
+    else
+        na
+
+// 4) DATA MODEL – ARRAYS FOR BUCKETED STATS
+
+// 6 market indices * 5 buckets = 30
+var float[] sumR5_market   = array.new_float(30, 0.0)
+var float[] cntR5_market   = array.new_float(30, 0.0)
+var float[] winR5_market   = array.new_float(30, 0.0)
+
+var float[] sumR20_market  = array.new_float(30, 0.0)
+var float[] cntR20_market  = array.new_float(30, 0.0)
+var float[] winR20_market  = array.new_float(30, 0.0)
+
+var float[] sumR60_market  = array.new_float(30, 0.0)
+var float[] cntR60_market  = array.new_float(30, 0.0)
+var float[] winR60_market  = array.new_float(30, 0.0)
+
+// Drawdown (market only)
+var float[] sumDD20_market = array.new_float(30, 0.0)
+var float[] cntDD20_market = array.new_float(30, 0.0)
+
+var float[] sumDD60_market = array.new_float(30, 0.0)
+var float[] cntDD60_market = array.new_float(30, 0.0)
+
+// 11 sectors * 5 buckets = 55 (Relative Return vs benchmark)
+var float[] sumRR5_sector  = array.new_float(55, 0.0)
+var float[] cntRR5_sector  = array.new_float(55, 0.0)
+var float[] winRR5_sector  = array.new_float(55, 0.0)
+
+var float[] sumRR20_sector = array.new_float(55, 0.0)
+var float[] cntRR20_sector = array.new_float(55, 0.0)
+var float[] winRR20_sector = array.new_float(55, 0.0)
+
+var float[] sumRR60_sector = array.new_float(55, 0.0)
+var float[] cntRR60_sector = array.new_float(55, 0.0)
+var float[] winRR60_sector = array.new_float(55, 0.0)
+
+// Academic reset helpers for reproducibility
+
+f_reset_float_array(float[] arr) =>
+    for i = 0 to array.size(arr) - 1
+        array.set(arr, i, 0.0)
+
+f_reset_all_stats() =>
+    // Market returns
+    f_reset_float_array(sumR5_market)
+    f_reset_float_array(cntR5_market)
+    f_reset_float_array(winR5_market)
+
+    f_reset_float_array(sumR20_market)
+    f_reset_float_array(cntR20_market)
+    f_reset_float_array(winR20_market)
+
+    f_reset_float_array(sumR60_market)
+    f_reset_float_array(cntR60_market)
+    f_reset_float_array(winR60_market)
+
+    // Drawdowns
+    f_reset_float_array(sumDD20_market)
+    f_reset_float_array(cntDD20_market)
+    f_reset_float_array(sumDD60_market)
+    f_reset_float_array(cntDD60_market)
+
+    // Sector relative returns
+    f_reset_float_array(sumRR5_sector)
+    f_reset_float_array(cntRR5_sector)
+    f_reset_float_array(winRR5_sector)
+
+    f_reset_float_array(sumRR20_sector)
+    f_reset_float_array(cntRR20_sector)
+    f_reset_float_array(winRR20_sector)
+
+    f_reset_float_array(sumRR60_sector)
+    f_reset_float_array(cntRR60_sector)
+    f_reset_float_array(winRR60_sector)
+
+    // Transition matrix
+    f_reset_float_array(transCnt)
+    f_reset_float_array(transSumRet)
+    f_reset_float_array(transWin)
+
+// Thực hiện reset tại bar đầu tiên, hoặc khi người dùng bật reset_stats
+bool do_reset = barstate.isfirst or (reset_stats and not reset_stats[1])
+if do_reset
+    f_reset_all_stats()
+
+// 5) UPDATE RULE – LEAD-LAG MAPPING (NO LOOKAHEAD)
+
+// Helper: update market stats for horizon L
+f_update_market_for_L(bool should_run, int L, float[] sumR, float[] cntR, float[] winR,
+                      bool doDD, float[] sumDD, float[] cntDD) =>
+    float risk_L = risk_pct[L]
+    int bucket   = f_bucket_from_risk(risk_L)
+    float c      = na
+    float c_L    = na
+    float ret    = na
+    float entry  = na
+    float lo_val = na
+    float dd     = na
+    // 6 market indices (always evaluate series for stability)
+    for m = 0 to 5
+        c   := f_market_close(m)
+        c_L := c[L]
+        ret := f_compute_return(c, c_L)
+
+        if doDD
+            lo_val := f_market_lowest_cached(m, L)
+            entry  := c_L
+            dd     := not na(entry) and not na(lo_val) ? lo_val / entry - 1.0 : na
+        else
+            dd := na
+
+        if should_run and not na(bucket) and not na(ret)
+            int idx = m * 5 + bucket
+            f_update_return_stats(sumR, cntR, winR, idx, ret)
+            if doDD and not na(dd)
+                f_update_dd_stats(sumDD, cntDD, idx, dd)
+
+// Helper: update sector RR stats for horizon L
+f_update_sector_RR_for_L(bool should_run, int L, float[] sumRR, float[] cntRR, float[] winRR) =>
+    float risk_L = risk_pct[L]
+    int bucket   = f_bucket_from_risk(risk_L)
+    float cb     = benchmark_close
+    float cb_L   = cb[L]
+    float rb     = not na(cb) and not na(cb_L) ? cb / cb_L - 1.0 : na
+
+    float c   = na
+    float c_L = na
+    float rs = na
+    float rr = na
+    for s = 0 to 10
+        c   := f_sector_close(s)
+        c_L := c[L]
+        rs  := f_compute_return(c, c_L)
+        rr := not na(rs) and not na(rb) ? rs - rb : na
+        if should_run and not na(bucket) and not na(rr) and not na(rb)
+            int idx = s * 5 + bucket
+            f_update_return_stats(sumRR, cntRR, winRR, idx, rr)
+
+// Helper: update transition matrix for horizon L
+f_update_transition(bool should_run, int L) =>
+    // Always compute current buckets to keep series consistent
+    int b_from = f_bucket_from_risk(risk_pct[L])
+    int b_to   = f_bucket_from_risk(risk_pct)
+    float cb   = benchmark_close
+    float cb_L = cb[L]
+    float rb   = not na(cb) and not na(cb_L) ? cb / cb_L - 1.0 : na
+
+    if should_run and not na(b_from) and not na(b_to) and not na(rb)
+        int idx = b_from * 5 + b_to
+
+        // Count
+        array.set(transCnt, idx, array.get(transCnt, idx) + 1.0)
+
+        array.set(transSumRet, idx, array.get(transSumRet, idx) + rb)
+        if rb > 0
+            array.set(transWin, idx, array.get(transWin, idx) + 1.0)
+
+// Only update once per equity timeframe bar – mỗi quan sát = 1 bar theo tf_equity
+bool is_new_equity_bar = ta.change(time(tf_equity)) != 0
+// Đếm số bar equity để hỗ trợ non-overlapping sampling
+var int eq_bar_count = 0
+
+f_should_update_for_L(int L) =>
+    not use_non_overlap ? true : (eq_bar_count % L == 0)
+
+if is_new_equity_bar
+    eq_bar_count += 1
+
+// Kiểm soát sample window (theo năm)
+bool valid_sample_bar = true
+if use_start_year
+    valid_sample_bar := year(time(tf_equity)) >= start_year
+
+bool update_allowed = is_new_equity_bar and valid_sample_bar
+
+bool run_R5  = update_allowed and calc_R5  and f_should_update_for_L(5)
+bool run_R20 = update_allowed and calc_R20 and f_should_update_for_L(20)
+bool run_R60 = update_allowed and calc_R60 and f_should_update_for_L(60)
+bool run_trans = update_allowed and show_trans_table and f_should_update_for_L(trans_L)
+
+f_update_market_for_L(run_R5, 5,  sumR5_market,  cntR5_market,  winR5_market,  false,        sumDD20_market, cntDD20_market)
+f_update_sector_RR_for_L(run_R5, 5, sumRR5_sector, cntRR5_sector, winRR5_sector)
+
+f_update_market_for_L(run_R20, 20, sumR20_market, cntR20_market, winR20_market, calc_DD20,   sumDD20_market, cntDD20_market)
+f_update_sector_RR_for_L(run_R20, 20, sumRR20_sector, cntRR20_sector, winRR20_sector)
+
+f_update_market_for_L(run_R60, 60, sumR60_market, cntR60_market, winR60_market, calc_DD60,   sumDD60_market, cntDD60_market)
+f_update_sector_RR_for_L(run_R60, 60, sumRR60_sector, cntRR60_sector, winRR60_sector)
+
+f_update_transition(run_trans, trans_L)
+
+// 6) BUCKET SELECTION FOR VIEW
+
+int bucket_auto = f_bucket_from_risk(risk_pct)
+int bucket_sel  = na
+
+if bucket_view == "Auto (current)"
+    bucket_sel := bucket_auto
+else if bucket_view == "B0 (0–20)"
+    bucket_sel := 0
+else if bucket_view == "B1 (20–40)"
+    bucket_sel := 1
+else if bucket_view == "B2 (40–60)"
+    bucket_sel := 2
+else if bucket_view == "B3 (60–80)"
+    bucket_sel := 3
+else if bucket_view == "B4 (80–100)"
+    bucket_sel := 4
+
+if na(bucket_sel)
+    bucket_sel := 2 // fallback: trung tính
+
+// 6a) PANEL 1 – MACRO WEATHER SUMMARY (BLOOMBERG STYLE)
+
+// Xác định bucket hiện tại (dựa trên risk_pct), fallback về 2 nếu NA
+int bucket_cur = f_bucket_from_risk(risk_pct)
+if na(bucket_cur)
+    bucket_cur := 2
+
+// Helper: mô tả ngắn cho 4 trụ
+f_pillar_status(bool flag, string okTxt, string badTxt) =>
+    flag ? badTxt : okTxt
+
+string stress_txt = f_pillar_status(stress_high,     "BINH THUONG", "CANG THANG")
+string curve_txt  = f_pillar_status(curve_inversion, "BINH THUONG", "DAO NGUOC")
+string intl_txt   = f_pillar_status(intl_warning,    "ON DINH",     "AP LUC QT")
+string spread_txt = f_pillar_status(spread_warning,  "ON DINH",     "HEP / XAU")
+
+// Lấy thống kê cho VNINDEX tại bucket hiện tại (L=20)
+int idx20_cur = 0 * 5 + bucket_cur
+float s20_cur = array.get(sumR20_market, idx20_cur)
+float c20_cur = array.get(cntR20_market, idx20_cur)
+float w20_cur = array.get(winR20_market, idx20_cur)
+float avgR20_cur = f_avg(s20_cur, c20_cur)
+float winR20_cur = f_winrate(w20_cur, c20_cur)
+
+float sd20_cur = array.get(sumDD20_market, idx20_cur)
+float cd20_cur = array.get(cntDD20_market, idx20_cur)
+float avgDD20_cur = f_avg(sd20_cur, cd20_cur)
+
+string txt_avgR20_cur = c20_cur > 0 ? str.tostring(avgR20_cur * 100.0, "#.##") + "%" : "--"
+string txt_winR20_cur = c20_cur > 0 ? str.tostring(winR20_cur, "#.#") + "%"        : "--"
+string txt_avgDD20_cur = cd20_cur > 0 ? str.tostring(avgDD20_cur * 100.0, "#.##") + "%" : "--"
+
+// Bảng tóm tắt macro weather
+var table summary_table = na
+var table bucket_table  = na
+if barstate.islast
+    bool allow_summary = show_panel1 and not show_pane5
+    if allow_summary
+        if na(summary_table)
+            // 3 cột: Label | Value | Ghi chú
+            // 7 hàng: header + risk + 4 pillars + VNINDEX stats
+            summary_table := table.new(position.top_left, 3, 7, bgcolor=color.new(color.black, 20), border_width=2, border_color=color.new(color.white, 20))
+            table.merge_cells(summary_table, 0, 0, 2, 0)
+    else
+        if not na(summary_table)
+            table.delete(summary_table)
+            summary_table := na
+
+if barstate.islast and show_panel1 and not show_pane5 and not na(summary_table)
+    string head_txt = " MACRO WEATHER – " + f_bucket_label(bucket_cur) + " | Risk " +
+         (na(risk_pct) ? "--" : str.tostring(risk_pct, "#.#") + "%")
+
+    color bg_head = color.new(color.red, 0)
+    if bucket_cur == 0
+        bg_head := color.new(color.lime, 0)
+    else if bucket_cur == 1
+        bg_head := color.new(color.teal, 0)
+    else if bucket_cur == 2
+        bg_head := color.new(color.orange, 0)
+    else if bucket_cur == 3
+        bg_head := color.new(color.red, 10)
+
+    table.cell(summary_table, 0, 0, head_txt, bgcolor=bg_head, text_color=color.white, text_size=size.small)
+
+    // Risk bucket
+    table.cell(summary_table, 0, 1, "Bucket hien tai", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(summary_table, 1, 1, f_bucket_label(bucket_cur), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+    table.cell(summary_table, 2, 1, "", bgcolor=color.new(color.black, 20))
+
+    // 4 trụ macro
+    table.cell(summary_table, 0, 2, "Stress", bgcolor=color.new(color.white, 5), text_color=color.black, text_size=size.tiny)
+    table.cell(summary_table, 1, 2, stress_txt, bgcolor=color.new(stress_high ? color.red : color.green, 70), text_color=color.white, text_size=size.tiny)
+    table.cell(summary_table, 2, 2, "", bgcolor=color.new(color.black, 20))
+
+    table.cell(summary_table, 0, 3, "Yield curve", bgcolor=color.new(color.white, 5), text_color=color.black, text_size=size.tiny)
+    table.cell(summary_table, 1, 3, curve_txt, bgcolor=color.new(curve_inversion ? color.red : color.green, 70), text_color=color.white, text_size=size.tiny)
+    table.cell(summary_table, 2, 3, "", bgcolor=color.new(color.black, 20))
+
+    table.cell(summary_table, 0, 4, "Intl diff", bgcolor=color.new(color.white, 5), text_color=color.black, text_size=size.tiny)
+    table.cell(summary_table, 1, 4, intl_txt, bgcolor=color.new(intl_warning ? color.red : color.green, 70), text_color=color.white, text_size=size.tiny)
+    table.cell(summary_table, 2, 4, "", bgcolor=color.new(color.black, 20))
+
+    table.cell(summary_table, 0, 5, "Spread LS", bgcolor=color.new(color.white, 5), text_color=color.black, text_size=size.tiny)
+    table.cell(summary_table, 1, 5, spread_txt, bgcolor=color.new(spread_warning ? color.red : color.green, 70), text_color=color.white, text_size=size.tiny)
+    table.cell(summary_table, 2, 5, "", bgcolor=color.new(color.black, 20))
+
+    // VNINDEX behavior (L=20) trong regime hiện tại
+    table.cell(summary_table, 0, 6, "VNINDEX (20 bars)", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(summary_table, 1, 6, "AvgR20=" + txt_avgR20_cur + " | Win=" + txt_winR20_cur, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(summary_table, 2, 6, "AvgDD20=" + txt_avgDD20_cur, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+
+// Panel 1 – Bucket Guide o goc trai
+if barstate.islast
+    bool allow_bucket = show_panel1 and show_bucket_guide and not show_pane5
+    if allow_bucket
+        if na(bucket_table)
+            bucket_table := table.new(position.bottom_left, 2, 6,
+                                      bgcolor=color.new(color.black, 80),
+                                      border_width=1,
+                                      border_color=color.new(color.white, 30))
+            table.merge_cells(bucket_table, 0, 0, 1, 0)
+    else
+        if not na(bucket_table)
+            table.delete(bucket_table)
+            bucket_table := na
+
+if barstate.islast and show_panel1 and show_bucket_guide and not show_pane5 and not na(bucket_table)
+    table.cell(bucket_table, 0, 0, "Macro Risk Buckets",
+               bgcolor=color.new(color.blue, 40),
+               text_color=color.white,
+               text_size=size.tiny)
+
+    table.cell(bucket_table, 0, 1, "B0", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 1, 1, "0–20  : rui ro rat thap", text_color=color.white, text_size=size.tiny)
+
+    table.cell(bucket_table, 0, 2, "B1", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 1, 2, "20–40 : rui ro thap / on", text_color=color.white, text_size=size.tiny)
+
+    table.cell(bucket_table, 0, 3, "B2", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 1, 3, "40–60 : trung lap", text_color=color.white, text_size=size.tiny)
+
+    table.cell(bucket_table, 0, 4, "B3", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 1, 4, "60–80 : rui ro cao", text_color=color.white, text_size=size.tiny)
+
+    table.cell(bucket_table, 0, 5, "B4", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 1, 5, "80–100: cang thang / nguy hiem", text_color=color.white, text_size=size.tiny)
+
+// 7) TABLE A – MARKET INDICES REGIME MAP
+
+var table market_table = na
+if barstate.islast
+    bool allow_market_table = show_panel2 and not show_pane5
+    if allow_market_table
+        if na(market_table)
+            // 6 columns: Symbol | AvgR20 | Win20 | AvgR60 | AvgDD20 | N20
+            // 8 rows   : header + col headers + 6 indices
+            market_table := table.new(position.top_right, 6, 8, bgcolor=color.new(color.black, 20), border_width=2, border_color=color.new(color.white, 20))
+            table.merge_cells(market_table, 0, 0, 5, 0)
+    else
+        if not na(market_table)
+            table.delete(market_table)
+            market_table := na
+
+if barstate.islast and show_panel2 and not show_pane5 and not na(market_table)
+    string header_txt = " Market Regime Map  –  " + f_bucket_label(bucket_sel) + "  |  Risk " + (na(risk_pct) ? "--" : str.tostring(risk_pct, "#.#") + "%")
+    table.cell(market_table, 0, 0, header_txt, bgcolor=color.new(color.blue, 0), text_color=color.white, text_size=size.small)
+
+    // Header row
+    table.cell(market_table, 0, 1, "Symbol",  bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 1, 1, "AvgR20",  bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 2, 1, "Win20%",  bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 3, 1, "AvgR60",  bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 4, 1, "AvgDD20", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 5, 1, "N20",     bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+
+    // Rows for 6 market indices
+    for m = 0 to 5
+        int row = m + 2
+        string name = array.get(market_name, m)
+
+        int idx20 = m * 5 + bucket_sel
+        float s20 = array.get(sumR20_market, idx20)
+        float c20 = array.get(cntR20_market, idx20)
+        float w20 = array.get(winR20_market, idx20)
+        float avgR20 = f_avg(s20, c20)
+        float winR20 = f_winrate(w20, c20)
+
+        int idx60 = m * 5 + bucket_sel
+        float s60 = array.get(sumR60_market, idx60)
+        float c60 = array.get(cntR60_market, idx60)
+        float avgR60 = f_avg(s60, c60)
+
+        float sd20 = array.get(sumDD20_market, idx20)
+        float cd20 = array.get(cntDD20_market, idx20)
+        float avgDD20 = f_avg(sd20, cd20)
+
+        bool enough_market = c20 >= min_N_market
+
+        string txt_avgR20 = enough_market and c20 > 0 ? str.tostring(avgR20 * 100.0, "#.##") + "%" : "--"
+        string txt_winR20 = enough_market and c20 > 0 ? str.tostring(winR20, "#.#") + "%"        : "--"
+
+        string txt_avgR60 = ""
+        if show_R60_cols
+            if calc_R60 and enough_market and c60 > 0
+                txt_avgR60 := str.tostring(avgR60 * 100.0, "#.##") + "%"
+            else if calc_R60
+                txt_avgR60 := "--"
+            else
+                txt_avgR60 := "OFF"
+
+        string txt_avgDD20 = ""
+        if show_DD_cols
+            if calc_DD20 and enough_market and cd20 > 0
+                txt_avgDD20 := str.tostring(avgDD20 * 100.0, "#.##") + "%"
+            else if calc_DD20
+                txt_avgDD20 := "--"
+            else
+                txt_avgDD20 := "OFF"
+        string txt_N20     = c20 > 0 ? str.tostring(math.round(c20)) : "0"
+        if not enough_market and c20 > 0
+            txt_N20 := "N<" + str.tostring(min_N_market)
+
+        table.cell(market_table, 0, row, name,        bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 1, row, txt_avgR20,  bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 2, row, txt_winR20,  bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 3, row, txt_avgR60,  bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 4, row, txt_avgDD20, bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 5, row, txt_N20,     bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+
+// 8) TABLE B – SECTOR ROTATION MAP (RR20)
+
+var table sector_table = na
+if barstate.islast
+    bool allow_sector_table = show_panel3 and not show_pane5
+    if allow_sector_table
+        if na(sector_table)
+            // 4 columns: Rank | Sector | AvgRR20 | N
+            // 12 rows  : header + info + top3 + bottom3
+            sector_table := table.new(position.bottom_right, 4, 12, bgcolor=color.new(color.black, 15), border_width=2, border_color=color.new(color.white, 20))
+            table.merge_cells(sector_table, 0, 0, 3, 0)
+    else
+        if not na(sector_table)
+            table.delete(sector_table)
+            sector_table := na
+
+if barstate.islast and show_panel3 and not show_pane5 and not na(sector_table)
+    string headB = " Sector Rotation Map – " + f_bucket_label(bucket_sel) + "  |  RR vs HOSE:VNINDEX"
+    table.cell(sector_table, 0, 0, headB, bgcolor=color.new(color.teal, 0), text_color=color.white, text_size=size.small)
+
+    table.cell(sector_table, 0, 1, "Bucket: " + f_bucket_label(bucket_sel), bgcolor=color.new(color.white, 5), text_color=color.black, text_size=size.tiny)
+
+    // Prepare AvgRR20 per sector in current bucket
+    float[] avgRR = array.new_float(11, na)
+    float[] cntRR = array.new_float(11, na)
+    for s = 0 to 10
+        int idx = s * 5 + bucket_sel
+        float sum_rr = array.get(sumRR20_sector, idx)
+        float cnt_rr = array.get(cntRR20_sector, idx)
+        float avg    = f_avg(sum_rr, cnt_rr)
+        array.set(avgRR, s, avg)
+        array.set(cntRR, s, cnt_rr)
+
+    // Helper arrays for ranking
+    int[] topIdx = array.new_int(3, -1)
+    int[] botIdx = array.new_int(3, -1)
+    bool[] usedTop = array.new_bool(11, false)
+    bool[] usedBot = array.new_bool(11, false)
+
+    // Top 3 (largest AvgRR)
+    for k = 0 to 2
+        float bestVal = na
+        int   bestIdx = -1
+        for s = 0 to 10
+            float v   = array.get(avgRR, s)
+            float cnt = array.get(cntRR, s)
+            bool used = array.get(usedTop, s)
+            if not used and not na(v) and cnt >= min_N_sector
+                if bestIdx == -1 or v > bestVal
+                    bestVal := v
+                    bestIdx := s
+        array.set(topIdx, k, bestIdx)
+        if bestIdx != -1
+            array.set(usedTop, bestIdx, true)
+
+    // Bottom 3 (smallest AvgRR)
+    for k = 0 to 2
+        float worstVal = na
+        int   worstIdx = -1
+        for s = 0 to 10
+            float v   = array.get(avgRR, s)
+            float cnt = array.get(cntRR, s)
+            bool used = array.get(usedBot, s)
+            if not used and not na(v) and cnt >= min_N_sector
+                if worstIdx == -1 or v < worstVal
+                    worstVal := v
+                    worstIdx := s
+        array.set(botIdx, k, worstIdx)
+        if worstIdx != -1
+            array.set(usedBot, worstIdx, true)
+
+    // Top 3 section
+    table.cell(sector_table, 0, 2, "Top 3 outperform (AvgRR20)", bgcolor=color.new(color.green, 20), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 0, 3, "Rank",   bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 1, 3, "Sector", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 2, 3, "AvgRR20",bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 3, 3, "N",      bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+
+    for k = 0 to 2
+        int row  = 4 + k
+        int idxS = array.get(topIdx, k)
+        string rankTxt = "T" + str.tostring(k + 1)
+        if idxS == -1
+            table.cell(sector_table, 0, row, rankTxt, bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 1, row, "--",    bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 2, row, "--",    bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 3, row, "0",     bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        else
+            string nm  = array.get(sector_name, idxS)
+            float avg  = array.get(avgRR, idxS)
+            float cnt  = array.get(cntRR, idxS)
+            string avgTxt = str.tostring(avg * 100.0, "#.##") + "%"
+            string cntTxt = str.tostring(math.round(cnt))
+
+            table.cell(sector_table, 0, row, rankTxt, bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 1, row, nm,      bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 2, row, avgTxt,  bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 3, row, cntTxt,  bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+
+    // Bottom 3 section
+    table.cell(sector_table, 0, 7, "Bottom 3 underperform (AvgRR20)", bgcolor=color.new(color.red, 20), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 0, 8, "Rank",   bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 1, 8, "Sector", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 2, 8, "AvgRR20",bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 3, 8, "N",      bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+
+    for k = 0 to 2
+        int row  = 9 + k
+        int idxS = array.get(botIdx, k)
+        string rankTxt = "B" + str.tostring(k + 1)
+        if idxS == -1
+            table.cell(sector_table, 0, row, rankTxt, bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 1, row, "--",    bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 2, row, "--",    bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 3, row, "0",     bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        else
+            string nm  = array.get(sector_name, idxS)
+            float avg  = array.get(avgRR, idxS)
+            float cnt  = array.get(cntRR, idxS)
+            string avgTxt = str.tostring(avg * 100.0, "#.##") + "%"
+            string cntTxt = str.tostring(math.round(cnt))
+
+            table.cell(sector_table, 0, row, rankTxt, bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 1, row, nm,      bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 2, row, avgTxt,  bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 3, row, cntTxt,  bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+
+// 9) PANEL 3 – TRANSITION PROBABILITY SUMMARY (MACRO BUCKETS)
+
+var table trans_table_indices = na
+
+if barstate.islast
+    bool allow_trans_table = show_panel4 and show_trans_table and not show_pane5
+    if allow_trans_table
+        if na(trans_table_indices)
+            // 3 columns: Direction | Prob | N
+            // 5 rows   : header + Up + Same + Down
+            trans_table_indices := table.new(position.bottom_left, 3, 5, bgcolor=color.new(color.black, 15),
+                                     border_width=2, border_color=color.new(color.white, 20))
+            table.merge_cells(trans_table_indices, 0, 0, 2, 0)
+    else
+        if not na(trans_table_indices)
+            table.delete(trans_table_indices)
+            trans_table_indices := na
+
+if barstate.islast and show_panel4 and show_trans_table and not show_pane5 and not na(trans_table_indices)
+    int b_now = f_bucket_from_risk(risk_pct)
+    if na(b_now)
+        b_now := 2
+
+    string h = " Transition Summary (L=" + str.tostring(trans_L) + ")  |  From " + "B" + str.tostring(b_now)
+    table.cell(trans_table_indices, 0, 0, h, bgcolor=color.new(color.orange, 0), text_color=color.white, text_size=size.small)
+
+    // Tính tổng theo hàng của bucket hiện tại
+    float rowTot = 0.0
+    for c = 0 to 4
+        rowTot += array.get(transCnt, b_now * 5 + c)
+
+    float upCnt   = 0.0
+    float sameCnt = 0.0
+    float downCnt = 0.0
+
+    for c = 0 to 4
+        float cnt = array.get(transCnt, b_now * 5 + c)
+        if c > b_now
+            upCnt += cnt
+        else if c == b_now
+            sameCnt += cnt
+        else
+            downCnt += cnt
+
+    float p_up   = rowTot > 0 ? upCnt   / rowTot * 100.0 : na
+    float p_same = rowTot > 0 ? sameCnt / rowTot * 100.0 : na
+    float p_down = rowTot > 0 ? downCnt / rowTot * 100.0 : na
+
+    // Header row
+    table.cell(trans_table_indices, 0, 1, "Huong chuyen", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(trans_table_indices, 1, 1, "Xac suat %",  bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(trans_table_indices, 2, 1, "So mau (N)",  bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+
+    // Up
+    table.cell(trans_table_indices, 0, 2, "Len bucket cao hon", bgcolor=color.new(color.green, 20), text_color=color.white, text_size=size.small)
+    table.cell(trans_table_indices, 1, 2, na(p_up) ? "--" : str.tostring(p_up, "#.#") + "%", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(trans_table_indices, 2, 2, str.tostring(math.round(upCnt)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+    // Same
+    table.cell(trans_table_indices, 0, 3, "O lai bucket hien tai", bgcolor=color.new(color.gray, 20), text_color=color.white, text_size=size.small)
+    table.cell(trans_table_indices, 1, 3, na(p_same) ? "--" : str.tostring(p_same, "#.#") + "%", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(trans_table_indices, 2, 3, str.tostring(math.round(sameCnt)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+    // Down
+    table.cell(trans_table_indices, 0, 4, "Giam ve bucket thap hon", bgcolor=color.new(color.red, 20), text_color=color.white, text_size=size.small)
+    table.cell(trans_table_indices, 1, 4, na(p_down) ? "--" : str.tostring(p_down, "#.#") + "%", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(trans_table_indices, 2, 4, str.tostring(math.round(downCnt)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
