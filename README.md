@@ -2,12 +2,13 @@
 
 ## 🎯 Giới thiệu
 
-**VnBondLab** là bộ công cụ phân tích tài chính chuyên sâu cho thị trường Việt Nam, được xây dựng trên TradingView Pine Script v5. Bộ công cụ gồm **4 dự án độc lập**:
+**VnBondLab** là bộ công cụ phân tích tài chính chuyên sâu cho thị trường Việt Nam, được xây dựng trên TradingView Pine Script v5. Bộ công cụ gồm **5 dự án độc lập**:
 
 - **01_MacroAcademic_Engine**: Phân tích vĩ mô & Risk Score
 - **02_Macro_Alert_System**: Hệ thống cảnh báo vĩ mô
 - **03_Indices_Research_Map**: Mapping vĩ mô → Thị trường chứng khoán
 - **04_YieldCurveLab**: Nghiên cứu đường cong lợi suất trái phiếu
+- **05_Bond_Transmission_Monitor**: Giám sát truyền dẫn trái phiếu từ nước ngoài
 
 Mỗi dự án được thiết kế độc lập nhưng có thể sử dụng kết hợp để có góc nhìn đa chiều về thị trường.
 
@@ -125,6 +126,40 @@ Phiên bản: v1.6.9 | Tác giả: VnBondLab
 
 ---
 
+### 🔗 05_Bond_Transmission_Monitor
+**Giám sát truyền dẫn trái phiếu từ nước ngoài**
+
+Phiên bản: v5.2 | Tác giả: MacroAcademic Team
+
+**Mục đích:** Phân tích tác động từ thị trường nước ngoài sang trái phiếu VN thông qua 6 kênh truyền dẫn
+
+**6 Panel phân tích:**
+- **P1**: Nhật (BOJ) → VN (Lợi suất Nhật tác động lên VN)
+- **P2**: Trái phiếu toàn cầu → VN (US + DE + GB + AU + CA)
+- **P3**: Đường cong toàn cầu → VN (Level + Slope)
+- **P4**: Yên carry (risk-off) → VN (USDJPY + VIX + Carry trade)
+- **P5**: FX & Thanh khoản → VN (USDVND + VNINBR)
+- **P6**: Chuỗi truyền dẫn → VN (US2Y → USDVND → VNINBR → VN10Y)
+
+**Tính năng:**
+- Hồi quy OLS để đo lường độ truyền dẫn (R², Beta, Alpha)
+- Impact Score (0-100) để đánh giá áp lực
+- Decoupling Score để đo lường độ tự chủ
+- Chain Strength (P6) để đo lường độ mạnh chuỗi 3 bước
+
+**Sử dụng khi:**
+- Bạn là bond trader cần hiểu tác động nước ngoài
+- Bạn muốn dự báo SBV's policy từ FED/BOJ action
+- Bạn cần timing giao dịch TPCP/trái phiếu
+- Bạn muốn hiểu cơ chế truyền dẫn toàn cầu → VN
+
+**File chính:**
+- `Bond_Transmission_Monitor_v5.2.pine`
+
+📖 **Xem chi tiết:** [README Bond Transmission Monitor](./05_Bond_Transmission_Monitor/)
+
+---
+
 ## 🔄 Mối quan hệ giữa các dự án
 
 ```
@@ -214,17 +249,17 @@ Phiên bản: v1.6.9 | Tác giả: VnBondLab
 
 ---
 
-## 📊 So sánh nhanh 4 dự án
+## 📊 So sánh nhanh 5 dự án
 
-| Tiêu chí | 01_MacroAcademic Engine | 02_Macro Alert System | 03_Indices Research Map | 04_YieldCurveLab |
-|----------|------------------------|----------------------|------------------------|------------------|
-| **Phạm vi** | Kinh tế vĩ mô | Cảnh báo vĩ mô | Mapping vĩ mô → CK | Trái phiếu |
-| **Input chính** | CPI, GDP, Rates, FX, Oil | Macro + Indices + Sectors | Macro + 6 indices + 11 sectors | 1Y-10Y yields |
-| **Output** | Risk Score (0-100) | 4 Panel cảnh báo | AvgR, Win%, DD by bucket | Stress, Correlation |
-| **Số panel** | 7 | 4 | 1 | 3 |
-| **User case** | Asset allocation | Cảnh báo rủi ro | Chọn indices/sectors | Bond trading |
-| **Độ phức tạp** | Trung bình - Cao | Trung bình | Trung bình | Cao (Academic) |
-| **Thời gian** | Hàng tuần/tháng | Hàng ngày/tuần | Khi có Risk Score | Hàng ngày |
+| Tiêu chí | 01_MacroAcademic Engine | 02_Macro Alert System | 03_Indices Research Map | 04_YieldCurveLab | 05_Bond Transmission |
+|----------|------------------------|----------------------|------------------------|------------------|----------------------|
+| **Phạm vi** | Kinh tế vĩ mô | Cảnh báo vĩ mô | Mapping vĩ mô → CK | Trái phiếu VN | Truyền dẫn nước ngoài |
+| **Input chính** | CPI, GDP, Rates, FX, Oil | Macro + Indices + Sectors | Macro + 6 indices + 11 sectors | 1Y-10Y yields | Global bonds + FX |
+| **Output** | Risk Score (0-100) | 4 Panel cảnh báo | AvgR, Win%, DD by bucket | Stress, Correlation | Impact Score, R² |
+| **Số panel** | 7 | 4 | 1 | 3 | 6 |
+| **User case** | Asset allocation | Cảnh báo rủi ro | Chọn indices/sectors | Bond trading | Bond timing |
+| **Độ phức tạp** | Trung bình - Cao | Trung bình | Trung bình | Cao (Academic) | Cao (Academic) |
+| **Thời gian** | Hàng tuần/tháng | Hàng ngày/tuần | Khi có Risk Score | Hàng ngày | Hàng ngày |
 
 ---
 
@@ -263,6 +298,7 @@ Tất cả các dự án đều được xây dựng với các chuẩn mực h�
 - 📖 [02_Macro_Alert_System README](./02_Macro_Alert_System/)
 - 📖 [03_Indices_Research_Map README](./03_Indices_Research_Map/)
 - 📖 [04_YieldCurveLab README](./04_YieldCurveLab/)
+- 📖 [05_Bond_Transmission_Monitor README](./05_Bond_Transmission_Monitor/)
 
 ### Tài liệu tham khảo:
 - **Macro-finance linkage:** Mối quan hệ giữa biến số vĩ mô và thị trường tài sản
@@ -291,13 +327,16 @@ Tất cả các dự án đều được xây dựng với các chuẩn mực h�
 ### Main Repository:
 - **2025-01-02:** Reorganize into 4 independent projects
 - **2025-01-02:** Add comprehensive README and documentation
-- **Phiên bản hiện tại:** v2.0 (4 Projects Structure)
+- **2025-01-02:** Add donate section with QR code
+- **2025-01-02:** Add 05_Bond_Transmission_Monitor project
+- **Phiên bản hiện tại:** v3.0 (5 Projects Structure)
 
 ### Sub-projects:
 - **01_MacroAcademic_Engine:** v1.2.8 (PCTL Complete)
 - **02_Macro_Alert_System:** v4.4 (Full Edition)
 - **03_Indices_Research_Map:** v1.0 (Script B)
 - **04_YieldCurveLab:** v1.6.9 (Academic Research Mode)
+- **05_Bond_Transmission_Monitor:** v5.2 (6 Panels, MacroAcademic FULL)
 
 ---
 
