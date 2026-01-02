@@ -316,6 +316,44 @@ Tất cả các dự án đều được xây dựng với các chuẩn mực h�
 
 ---
 
+## 💖 Donate / Ủng hộ
+
+Nếu bạn tìm thấy các công cụ này hữu ích và muốn ủng hộ dự án, tôi rất trân trọng sự đóng góp của bạn!
+
+### 📱 Momo / QR Code
+
+![Donate QR Code](assets/donate_qr.jpg)
+
+**Hoặc quét mã QR:**
+
+```
+┌─────────────────────┐
+│                     │
+│   [QR CODE HERE]    │
+│                     │
+└─────────────────────┘
+```
+
+### 💳 Thông tin chuyển khoản
+
+- **Ngân hàng:** [Tên ngân hàng]
+- **Số tài khoản:** [Số tài khoản]
+- **Chủ tài khoản:** [Tên chủ tài khoản]
+
+### 🎁 Mục đích Donate
+
+Ủng hộ của bạn sẽ được sử dụng để:
+- Phí维护 và phát triển thêm tính năng mới
+- Nâng cấp server và tài nguyên
+- Cập nhật dữ liệu định kỳ
+- Phát triển thêm các công cụ phân tích khác
+
+### 🙏 Cảm ơn
+
+Cảm ơn bạn đã sử dụng và ủng hộ VnBondLab! Mọi sự đóng góp dù nhỏ đều rất quý giá! 💝
+
+---
+
 **🎯 Bắt đầu ngay:** Chọn dự án phù hợp với nhu cầu của bạn và xem README chi tiết trong từng thư mục!
 
 *Happy Trading & Research!* 📊🚀
