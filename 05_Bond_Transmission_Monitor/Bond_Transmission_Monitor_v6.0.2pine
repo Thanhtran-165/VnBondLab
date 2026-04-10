@@ -1,0 +1,893 @@
+//@version=5
+indicator("Giám sát truyền dẫn trái phiếu VN — MacroAcademic FULL v6.0.1 (Interpretation Upgrade)",
+     shorttitle="Macro TP VN v6.0.1",
+     overlay=false,
+     format=format.price,
+     precision=1,
+     max_labels_count=500,
+     max_lines_count=200,
+     max_bars_back=5000)
+
+// =====================================================================
+// 0) CẤU HÌNH CỐ ĐỊNH
+// =====================================================================
+string TF_DATA = "D"
+int    LEN_Z   = 252
+int    LEN_REG = 60
+float  CLIP_Z  = 3.0
+
+int LAG_A = 0
+int LAG_B = 1
+int LAG_C = 3
+int LAG_D = 5
+
+// =====================================================================
+// 1) INPUT
+// =====================================================================
+groupPanel = "A) Chọn bảng (mỗi bảng = 1 panel)"
+panelMode = input.string("P6 Chuỗi truyền dẫn→VN", "Bảng",
+     options=["P1 BOJ→VN", "P2 Toàn cầu→VN", "P3 Đường cong→VN", "P4 Yên carry→VN", "P5 FX & Thanh khoản→VN", "P6 Chuỗi truyền dẫn→VN"],
+     group=groupPanel)
+
+groupJP = "B) Nhật Bản (kênh BOJ)"
+jpDriverChoice = input.string("JP10Y", "Lợi suất Nhật dùng làm driver",
+     options=["JP02Y", "JP10Y"], group=groupJP)
+
+groupReg = "C) Hồi quy (học thuật)"
+useBestLag = input.bool(true, "Dùng Best-Lag Discipline", group=groupReg)
+manualLag  = input.int(1, "Lag thủ công nếu tắt Best-Lag", minval=0, maxval=20, group=groupReg)
+expectedSignP1 = input.int(1, "P1 dấu kỳ vọng (1=thuận, -1=nghịch)", minval=-1, maxval=1, group=groupReg)
+expectedSignP2 = input.int(1, "P2 dấu kỳ vọng (1=thuận, -1=nghịch)", minval=-1, maxval=1, group=groupReg)
+expectedSignP5 = input.int(1, "P5 dấu kỳ vọng (1=thuận, -1=nghịch)", minval=-1, maxval=1, group=groupReg)
+
+groupSmooth = "D) Giảm nhiễu"
+smoothN  = input.int(3, "Làm mượt thay đổi (EMA, 1 = tắt)", minval=1, maxval=20, group=groupSmooth)
+
+groupSymbolsVN = "E) Việt Nam (lợi suất)"
+symVN10 = input.symbol("TVC:VN10Y", "VN 10Y", group=groupSymbolsVN)
+symVN02 = input.symbol("TVC:VN02Y", "VN 2Y",  group=groupSymbolsVN)
+
+groupSymbolsJP = "F) Nhật Bản (lợi suất)"
+symJP10 = input.symbol("TVC:JP10Y", "JP 10Y", group=groupSymbolsJP)
+symJP02 = input.symbol("TVC:JP02Y", "JP 2Y",  group=groupSymbolsJP)
+
+groupSymbolsG = "G) Toàn cầu (lợi suất)"
+symUS10 = input.symbol("TVC:US10Y", "US 10Y", group=groupSymbolsG)
+symUS02 = input.symbol("TVC:US02Y", "US 2Y",  group=groupSymbolsG)
+symDE10 = input.symbol("TVC:DE10Y", "DE 10Y", group=groupSymbolsG)
+symDE02 = input.symbol("TVC:DE02Y", "DE 2Y (tuỳ chọn)", group=groupSymbolsG)
+symGB10 = input.symbol("TVC:GB10Y", "GB 10Y", group=groupSymbolsG)
+symGB02 = input.symbol("TVC:GB02Y", "GB 2Y",  group=groupSymbolsG)
+symAU10 = input.symbol("TVC:AU10Y", "AU 10Y", group=groupSymbolsG)
+symCA10 = input.symbol("TVC:CA10Y", "CA 10Y", group=groupSymbolsG)
+includeJPInGlobal2Y = input.bool(false, "Gộp JP02Y vào Global 2Y", group=groupSymbolsG)
+
+groupMon = "H) VN — FX & Thanh khoản"
+symUSDVND = input.symbol("FX_IDC:USDVND",    "USDVND", group=groupMon)
+symVNINBR = input.symbol("ECONOMICS:VNINBR", "VNINBR", group=groupMon)
+symDXY    = input.symbol("TVC:DXY",          "DXY", group=groupMon)
+
+groupCarry = "I) P4 — Yên carry"
+symUSDJPY = input.symbol("FX_IDC:USDJPY", "USDJPY", group=groupCarry)
+symVIX    = input.symbol("CBOE:VIX",      "VIX", group=groupCarry)
+
+groupUI = "J) Hiển thị"
+beginnerMode   = input.bool(true, "Chế độ người mới", group=groupUI)
+showComponents = input.bool(true, "Hiện đường phụ", group=groupUI)
+showBg         = input.bool(true, "Tô nền", group=groupUI)
+bgSmoothN      = input.int(10, "Làm mượt nền", minval=1, maxval=50, group=groupUI)
+tablePos       = input.string("Dưới phải", "Vị trí bảng",
+     options=["Trên phải","Trên trái","Dưới phải","Dưới trái"], group=groupUI)
+showLineLabels = input.bool(true, "Gắn nhãn cuối", group=groupUI)
+showStatsTiny  = input.bool(false, "Hiện số kỹ thuật", group=groupUI)
+show7DInfo     = input.bool(true, "Hiện phần 7 ngày gần đây", group=groupUI)
+
+showComponentsEff = showComponents and not beginnerMode
+
+// =====================================================================
+// 2) HÀM HỖ TRỢ
+// =====================================================================
+f_clamp(x, lo, hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_fmt(x, fmt) =>
+    na(x) ? "—" : str.tostring(x, fmt)
+
+f_smooth(x, n) =>
+    n <= 1 ? x : ta.ema(x, n)
+
+f_lag(x, n) =>
+    n <= 0 ? x : x[n]
+
+f_mean2(a, b) =>
+    float sum = 0.0
+    int cnt = 0
+    if not na(a)
+        sum += a
+        cnt += 1
+    if not na(b)
+        sum += b
+        cnt += 1
+    cnt > 0 ? sum / cnt : na
+
+f_mean3(a, b, c) =>
+    float sum = 0.0
+    int cnt = 0
+    if not na(a)
+        sum += a
+        cnt += 1
+    if not na(b)
+        sum += b
+        cnt += 1
+    if not na(c)
+        sum += c
+        cnt += 1
+    cnt > 0 ? sum / cnt : na
+
+f_mean4(a, b, c, d) =>
+    float sum = 0.0
+    int cnt = 0
+    if not na(a)
+        sum += a
+        cnt += 1
+    if not na(b)
+        sum += b
+        cnt += 1
+    if not na(c)
+        sum += c
+        cnt += 1
+    if not na(d)
+        sum += d
+        cnt += 1
+    cnt > 0 ? sum / cnt : na
+
+f_mean5(a, b, c, d, e) =>
+    float sum = 0.0
+    int cnt = 0
+    if not na(a)
+        sum += a
+        cnt += 1
+    if not na(b)
+        sum += b
+        cnt += 1
+    if not na(c)
+        sum += c
+        cnt += 1
+    if not na(d)
+        sum += d
+        cnt += 1
+    if not na(e)
+        sum += e
+        cnt += 1
+    cnt > 0 ? sum / cnt : na
+
+f_robust_z(src, length, clipMult) =>
+    float mu0 = ta.sma(src, length)
+    float sd0 = ta.stdev(src, length)
+    float up0 = mu0 + clipMult * sd0
+    float dn0 = mu0 - clipMult * sd0
+    float xs  = math.max(dn0, math.min(up0, src))
+    float mu1 = ta.sma(xs, length)
+    float sd1 = ta.stdev(xs, length)
+    (not na(sd1) and sd1 != 0) ? (xs - mu1) / sd1 : na
+
+f_z_to_score(z) =>
+    f_clamp(50 + 15 * z, 0, 100)
+
+f_bucketB(score) =>
+    string b = "B4"
+    if score < 35
+        b := "B0"
+    else if score < 50
+        b := "B1"
+    else if score < 65
+        b := "B2"
+    else if score < 80
+        b := "B3"
+    b
+
+f_bucketVN(score) =>
+    string t = "Sốc"
+    if score < 35
+        t := "Thuận lợi"
+    else if score < 50
+        t := "Bình thường"
+    else if score < 65
+        t := "Cảnh giác"
+    else if score < 80
+        t := "Căng thẳng"
+    t
+
+f_bucketColor(score) =>
+    color c = color.new(color.purple, 0)
+    if score < 35
+        c := color.new(color.lime, 0)
+    else if score < 50
+        c := color.new(color.yellow, 0)
+    else if score < 65
+        c := color.new(color.orange, 0)
+    else if score < 80
+        c := color.new(color.red, 0)
+    c
+
+f_bucketBg(score) =>
+    color.new(f_bucketColor(score), 88)
+
+f_ket_luan_lai_suat(score) =>
+    score < 35 ? "Dễ hạ / nới" :
+     score < 50 ? "Khả năng giữ ổn định" :
+     score < 65 ? "Khó hạ nhanh" :
+     score < 80 ? "Áp lực tăng mặt bằng" : "Rất căng"
+
+f_goi_y_hanh_dong(b) =>
+    b == "B0" ? "Có thể tăng rủi ro vừa phải" :
+     b == "B1" ? "Quan sát thêm, chưa vội" :
+     b == "B2" ? "Giữ kỷ luật, giảm rủi ro" :
+     b == "B3" ? "Ưu tiên phòng thủ" : "Ưu tiên bảo toàn"
+
+f_bi_keo_theo_giai_thich(tachBietScore) =>
+    tachBietScore >= 75 ? "Ít bị kéo theo (nội lực trội)" :
+     tachBietScore >= 60 ? "Vừa bị kéo theo (pha trộn)" :
+                           "Bị kéo theo mạnh (ngoại lực trội)"
+
+f_nhan_tin_cay(q) =>
+    q >= 80 ? "Rất cao" : q >= 65 ? "Cao" : q >= 50 ? "Trung bình" : "Thấp"
+
+f_nhan_truyen_dan(r2pct) =>
+    r2pct >= 55 ? "Mạnh" : r2pct >= 35 ? "Vừa" : r2pct >= 20 ? "Yếu-vừa" : "Yếu"
+
+f_muc_bi_keo_theo_ngan(tachBietScore) =>
+    tachBietScore >= 75 ? "Thấp" : tachBietScore >= 60 ? "Vừa" : "Cao"
+
+f_coverage(src, win) =>
+    ta.sma(na(src) ? 0.0 : 1.0, win)
+
+f_reg_ols(x, y, win) =>
+    float corr0 = ta.correlation(y, x, win)
+    float sdX   = ta.stdev(x, win)
+    float sdY   = ta.stdev(y, win)
+    float mx    = ta.sma(x, win)
+    float my    = ta.sma(y, win)
+    float beta  = (not na(corr0) and not na(sdX) and not na(sdY) and sdX != 0) ? (corr0 * sdY / sdX) : na
+    float alpha = (not na(beta) and not na(mx) and not na(my)) ? (my - beta * mx) : na
+    float expY  = (not na(alpha) and not na(beta)) ? (alpha + beta * x) : na
+    float resY  = y - expY
+    float r2    = not na(corr0) ? corr0 * corr0 : na
+    [corr0, beta, alpha, r2, expY, resY]
+
+f_sign_score(beta, expSign) =>
+    na(beta) ? 0.0 :
+     expSign == 0 ? 100.0 :
+     (beta * expSign > 0 ? 100.0 : 0.0)
+
+f_stability_score(x, y, halfWin, expSign) =>
+    float c1 = ta.correlation(y, x, halfWin)
+    float c0 = ta.correlation(y[halfWin], x[halfWin], halfWin)
+    float sx1 = ta.stdev(x, halfWin)
+    float sy1 = ta.stdev(y, halfWin)
+    float sx0 = ta.stdev(x[halfWin], halfWin)
+    float sy0 = ta.stdev(y[halfWin], halfWin)
+    float b1 = (not na(c1) and not na(sx1) and not na(sy1) and sx1 != 0) ? (c1 * sy1 / sx1) : na
+    float b0 = (not na(c0) and not na(sx0) and not na(sy0) and sx0 != 0) ? (c0 * sy0 / sx0) : na
+
+    float score = 0.0
+    score += (not na(b0) and not na(b1) and b0 * b1 > 0) ? 40.0 : 0.0
+    score += (not na(b1) and expSign != 0 and b1 * expSign > 0) ? 30.0 : (expSign == 0 ? 30.0 : 0.0)
+    score += (not na(c0) and not na(c1) and math.abs(c1 - c0) <= 0.20) ? 30.0 : (not na(c0) and not na(c1) and math.abs(c1 - c0) <= 0.35 ? 15.0 : 0.0)
+    f_clamp(score, 0, 100)
+
+f_best_single(x, y, win, expSign, useAuto, lagManual) =>
+    int   bestLag   = lagManual
+    float bestCorr  = na
+    float bestBeta  = na
+    float bestAlpha = na
+    float bestR2    = na
+    float bestExp   = na
+    float bestRes   = na
+    float bestScore = na
+
+    if useAuto
+        x0 = f_lag(x, LAG_A)
+        [c0, b0, a0, r20, e0, rs0] = f_reg_ols(x0, y, win)
+        s0_sign  = f_sign_score(b0, expSign)
+        s0_stab  = f_stability_score(x0, y, math.floor(win / 2), expSign)
+        s0_total = f_clamp(0.55 * (100 * r20) + 0.25 * s0_sign + 0.20 * s0_stab, 0, 100)
+
+        x1 = f_lag(x, LAG_B)
+        [c1, b1, a1, r21, e1, rs1] = f_reg_ols(x1, y, win)
+        s1_sign  = f_sign_score(b1, expSign)
+        s1_stab  = f_stability_score(x1, y, math.floor(win / 2), expSign)
+        s1_total = f_clamp(0.55 * (100 * r21) + 0.25 * s1_sign + 0.20 * s1_stab, 0, 100)
+
+        x2 = f_lag(x, LAG_C)
+        [c2, b2, a2, r22, e2, rs2] = f_reg_ols(x2, y, win)
+        s2_sign  = f_sign_score(b2, expSign)
+        s2_stab  = f_stability_score(x2, y, math.floor(win / 2), expSign)
+        s2_total = f_clamp(0.55 * (100 * r22) + 0.25 * s2_sign + 0.20 * s2_stab, 0, 100)
+
+        x3 = f_lag(x, LAG_D)
+        [c3, b3, a3, r23, e3, rs3] = f_reg_ols(x3, y, win)
+        s3_sign  = f_sign_score(b3, expSign)
+        s3_stab  = f_stability_score(x3, y, math.floor(win / 2), expSign)
+        s3_total = f_clamp(0.55 * (100 * r23) + 0.25 * s3_sign + 0.20 * s3_stab, 0, 100)
+
+        bestLag   := LAG_A
+        bestCorr  := c0
+        bestBeta  := b0
+        bestAlpha := a0
+        bestR2    := r20
+        bestExp   := e0
+        bestRes   := rs0
+        bestScore := s0_total
+
+        if nz(s1_total, -1) > nz(bestScore, -1)
+            bestLag   := LAG_B
+            bestCorr  := c1
+            bestBeta  := b1
+            bestAlpha := a1
+            bestR2    := r21
+            bestExp   := e1
+            bestRes   := rs1
+            bestScore := s1_total
+
+        if nz(s2_total, -1) > nz(bestScore, -1)
+            bestLag   := LAG_C
+            bestCorr  := c2
+            bestBeta  := b2
+            bestAlpha := a2
+            bestR2    := r22
+            bestExp   := e2
+            bestRes   := rs2
+            bestScore := s2_total
+
+        if nz(s3_total, -1) > nz(bestScore, -1)
+            bestLag   := LAG_D
+            bestCorr  := c3
+            bestBeta  := b3
+            bestAlpha := a3
+            bestR2    := r23
+            bestExp   := e3
+            bestRes   := rs3
+            bestScore := s3_total
+    else
+        xm = f_lag(x, lagManual)
+        [cm, bm, am, r2m, em, rsm] = f_reg_ols(xm, y, win)
+        bestLag   := lagManual
+        bestCorr  := cm
+        bestBeta  := bm
+        bestAlpha := am
+        bestR2    := r2m
+        bestExp   := em
+        bestRes   := rsm
+        bestScore := f_clamp(0.55 * (100 * r2m) + 0.25 * f_sign_score(bm, expSign) + 0.20 * f_stability_score(xm, y, math.floor(win / 2), expSign), 0, 100)
+
+    [bestLag, bestCorr, bestBeta, bestAlpha, bestR2, bestExp, bestRes, bestScore]
+
+f_quality2(scoreR2, covMin, signScore, stabilityScore) =>
+    float fitScore = f_clamp(scoreR2, 0, 100)
+    float covScore = f_clamp(100 * covMin, 0, 100)
+    f_clamp(0.35 * fitScore + 0.25 * covScore + 0.20 * signScore + 0.20 * stabilityScore, 0, 100)
+
+// Diễn giải hôm nay / 7 ngày
+f_today_status(score) =>
+    score >= 80 ? "Hôm nay rất căng" :
+     score >= 65 ? "Hôm nay căng lên rõ" :
+     score >= 50 ? "Hôm nay ở vùng cảnh giác" :
+     score >= 35 ? "Hôm nay tương đối bình thường" : "Hôm nay khá thuận lợi"
+
+f_delta_text(delta) =>
+    delta > 0 ? "Tăng áp lực" : delta < 0 ? "Giảm áp lực" : "Đi ngang"
+
+f_7d_direction(x) =>
+    float d7 = x - x[7]
+    d7 > 0 ? "Xấu đi" : d7 < 0 ? "Cải thiện" : "Đi ngang"
+
+f_7d_strength(d7abs) =>
+    d7abs >= 20 ? "mạnh" : d7abs >= 10 ? "vừa" : d7abs >= 4 ? "nhẹ" : "rất nhẹ"
+
+f_7d_summary(x) =>
+    float d7 = x - x[7]
+    string dir = d7 > 0 ? "xấu đi" : d7 < 0 ? "cải thiện" : "đi ngang"
+    string mag = f_7d_strength(math.abs(d7))
+    "7 ngày: " + dir + " " + mag
+
+f_signal_note(impact, quality, signScore, stabilityScore) =>
+    impact >= 65 and quality >= 65 ? "Áp lực cao và tín hiệu đáng tin" :
+     impact >= 65 and quality < 65 ? "Áp lực cao nhưng cần thận trọng với độ tin cậy" :
+     impact < 50 and quality >= 65 ? "Áp lực thấp và tín hiệu khá chắc" :
+     "Tín hiệu trung tính / chưa quá rõ"
+
+var label lbApLuc = na
+var label lbDuTinh = na
+var label lbTachBiet = na
+
+f_make_label(oldLb, y, txt) =>
+    if not na(oldLb)
+        label.delete(oldLb)
+    label.new(bar_index, y, txt,
+         style=label.style_label_right,
+         textcolor=color.white,
+         color=color.new(color.black, 55),
+         size=size.small)
+
+// =====================================================================
+// 3) TẢI DỮ LIỆU
+// =====================================================================
+yVN10 = request.security(symVN10, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+yVN02 = request.security(symVN02, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+yJP10 = request.security(symJP10, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+yJP02 = request.security(symJP02, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+yUS10 = request.security(symUS10, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+yUS02 = request.security(symUS02, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+yDE10 = request.security(symDE10, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+yDE02 = request.security(symDE02, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+yGB10 = request.security(symGB10, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+yGB02 = request.security(symGB02, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+yAU10 = request.security(symAU10, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+yCA10 = request.security(symCA10, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+usdVnd = request.security(symUSDVND, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+vnInbr = request.security(symVNINBR, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+dxy    = request.security(symDXY,    TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+usdJpy = request.security(symUSDJPY, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+vix    = request.security(symVIX,    TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+// =====================================================================
+// 4) BIẾN ĐỔI
+// =====================================================================
+f_bp_change(level) => ta.change(level) * 100.0
+
+dVN10 = f_smooth(f_bp_change(yVN10), smoothN)
+dVN02 = f_smooth(f_bp_change(yVN02), smoothN)
+
+dJP10 = f_smooth(f_bp_change(yJP10), smoothN)
+dJP02 = f_smooth(f_bp_change(yJP02), smoothN)
+
+dUS02 = f_smooth(f_bp_change(yUS02), smoothN)
+
+yG10  = f_mean5(yUS10, yDE10, yGB10, yAU10, yCA10)
+dG10  = f_smooth(f_bp_change(yG10), smoothN)
+
+yG02  = includeJPInGlobal2Y ? f_mean4(yUS02, yDE02, yGB02, yJP02) : f_mean3(yUS02, yDE02, yGB02)
+dG02  = f_smooth(f_bp_change(yG02), smoothN)
+
+sVN_bp = (yVN10 - yVN02) * 100.0
+sG_bp  = (yG10  - yG02 ) * 100.0
+dsVN   = f_smooth(ta.change(sVN_bp), smoothN)
+dsG    = f_smooth(ta.change(sG_bp),  smoothN)
+
+yJDrv = jpDriverChoice == "JP02Y" ? yJP02 : yJP10
+dJDrv = jpDriverChoice == "JP02Y" ? dJP02 : dJP10
+
+dUSDVND = f_smooth(ta.roc(usdVnd, 1), smoothN)
+dDXY    = f_smooth(ta.roc(dxy,    1), smoothN)
+dIB     = f_smooth(f_bp_change(vnInbr), smoothN)
+
+// =====================================================================
+// 5) GLOBAL PRESSURE SCORE CỦA VN10Y
+// =====================================================================
+scoreVN_press = f_z_to_score(f_robust_z(dVN10, LEN_Z, CLIP_Z))
+
+// =====================================================================
+// 6) P1 — JP → VN
+// =====================================================================
+[lag_JP, corr_JP, beta_JP, alpha_JP, r2_JP, exp_JP, res_JP, lagScore_JP] = f_best_single(dJDrv, dVN10, LEN_REG, expectedSignP1, useBestLag, manualLag)
+scoreR2_JP       = f_clamp(100.0 * r2_JP, 0, 100)
+scoreExp_JP      = f_z_to_score(f_robust_z(exp_JP, LEN_Z, CLIP_Z))
+scoreDrvShock_JP = f_z_to_score(f_robust_z(math.abs(f_lag(dJDrv, lag_JP)), LEN_Z, CLIP_Z))
+scoreDecouple_JP = f_z_to_score(f_robust_z(math.abs(res_JP), LEN_Z, CLIP_Z))
+sign_JP          = f_sign_score(beta_JP, expectedSignP1)
+stab_JP          = f_stability_score(f_lag(dJDrv, lag_JP), dVN10, math.floor(LEN_REG / 2), expectedSignP1)
+impact_JP        = 0.35 * scoreExp_JP + 0.20 * scoreVN_press + 0.20 * scoreR2_JP + 0.10 * scoreDrvShock_JP + 0.15 * sign_JP
+
+// =====================================================================
+// 7) P2 — Global → VN
+// =====================================================================
+[lag_G, corr_G, beta_G, alpha_G, r2_G, exp_G, res_G, lagScore_G] = f_best_single(dG10, dVN10, LEN_REG, 1, useBestLag, manualLag)
+scoreR2_G       = f_clamp(100.0 * r2_G, 0, 100)
+scoreExp_G      = f_z_to_score(f_robust_z(exp_G, LEN_Z, CLIP_Z))
+scoreDrvShock_G = f_z_to_score(f_robust_z(math.abs(f_lag(dG10, lag_G)), LEN_Z, CLIP_Z))
+scoreDecouple_G = f_z_to_score(f_robust_z(math.abs(res_G), LEN_Z, CLIP_Z))
+sign_G          = f_sign_score(beta_G, 1)
+stab_G          = f_stability_score(f_lag(dG10, lag_G), dVN10, math.floor(LEN_REG / 2), 1)
+impact_G        = 0.35 * scoreExp_G + 0.20 * scoreVN_press + 0.20 * scoreR2_G + 0.10 * scoreDrvShock_G + 0.15 * sign_G
+
+// =====================================================================
+// 8) P3 — Curve → VN
+// =====================================================================
+[lag_L, corr_L, beta_L, alpha_L, r2_L, exp_L, res_L, lagScore_L] = f_best_single(dG10, dVN10, LEN_REG, 1, useBestLag, manualLag)
+scoreR2_L   = f_clamp(100.0 * r2_L, 0, 100)
+scoreExp_L  = f_z_to_score(f_robust_z(exp_L, LEN_Z, CLIP_Z))
+sign_L      = f_sign_score(beta_L, 1)
+stab_L      = f_stability_score(f_lag(dG10, lag_L), dVN10, math.floor(LEN_REG / 2), 1)
+
+[lag_S, corr_S, beta_S, alpha_S, r2_S, exp_S, res_S, lagScore_S] = f_best_single(dsG, dsVN, LEN_REG, 1, useBestLag, manualLag)
+scoreR2_S   = f_clamp(100.0 * r2_S, 0, 100)
+scoreExp_S  = f_z_to_score(f_robust_z(exp_S, LEN_Z, CLIP_Z))
+sign_S      = f_sign_score(beta_S, 1)
+stab_S      = f_stability_score(f_lag(dsG, lag_S), dsVN, math.floor(LEN_REG / 2), 1)
+
+r2C_raw         = f_mean2(r2_L, r2_S)
+scoreR2_C       = f_clamp(100.0 * r2C_raw, 0, 100)
+scoreDrvShock_C = f_z_to_score(f_mean2(f_robust_z(math.abs(f_lag(dG10, lag_L)), LEN_Z, CLIP_Z), f_robust_z(math.abs(f_lag(dsG, lag_S)), LEN_Z, CLIP_Z)))
+scoreDecouple_C = f_z_to_score(f_robust_z(f_mean2(math.abs(res_L), math.abs(res_S)), LEN_Z, CLIP_Z))
+sign_C          = f_mean2(sign_L, sign_S)
+stab_C          = f_mean2(stab_L, stab_S)
+impact_C        = 0.30 * scoreExp_L + 0.25 * scoreExp_S + 0.20 * scoreR2_C + 0.10 * scoreDrvShock_C + 0.15 * sign_C
+
+// =====================================================================
+// 9) P4 — Yên carry → VN
+// =====================================================================
+yenManhLen_pct = f_smooth(-ta.roc(usdJpy, 1), smoothN)
+vixTang_pct    = f_smooth( ta.roc(vix,    1), smoothN)
+chenhUSJP2_bp  = (yUS02 - yJP02) * 100.0
+thuHep_bp      = f_smooth(-(ta.change(chenhUSJP2_bp)), smoothN)
+thuHep_scaled  = thuHep_bp / 10.0
+
+xCarry = 0.50 * yenManhLen_pct + 0.30 * vixTang_pct + 0.20 * thuHep_scaled
+
+[lag_CRY, corr_CRY, beta_CRY, alpha_CRY, r2_CRY, exp_CRY, res_CRY, lagScore_CRY] = f_best_single(xCarry, dVN10, LEN_REG, 1, useBestLag, manualLag)
+scoreR2_CRY       = f_clamp(100.0 * r2_CRY, 0, 100)
+scoreExp_CRY      = f_z_to_score(f_robust_z(exp_CRY, LEN_Z, CLIP_Z))
+scoreDrvShock_CRY = f_z_to_score(f_robust_z(math.abs(f_lag(xCarry, lag_CRY)), LEN_Z, CLIP_Z))
+scoreDecouple_CRY = f_z_to_score(f_robust_z(math.abs(res_CRY), LEN_Z, CLIP_Z))
+sign_CRY          = f_sign_score(beta_CRY, 1)
+stab_CRY          = f_stability_score(f_lag(xCarry, lag_CRY), dVN10, math.floor(LEN_REG / 2), 1)
+
+carryRegime = f_clamp(0.5 * f_z_to_score(f_robust_z(vixTang_pct, LEN_Z, CLIP_Z)) + 0.5 * f_z_to_score(f_robust_z(yenManhLen_pct, LEN_Z, CLIP_Z)), 0, 100)
+carryGate   = carryRegime >= 60 ? 1.00 : carryRegime >= 45 ? 0.90 : 0.80
+
+impact_CRY = (0.35 * scoreExp_CRY + 0.20 * scoreVN_press + 0.20 * scoreR2_CRY + 0.10 * scoreDrvShock_CRY + 0.15 * sign_CRY) * carryGate
+
+// =====================================================================
+// 10) P5 — FX & Thanh khoản → VN
+// =====================================================================
+zUSDVND = f_robust_z(dUSDVND, LEN_Z, CLIP_Z)
+zIB     = f_robust_z(dIB, LEN_Z, CLIP_Z)
+xMon    = f_mean2(zUSDVND, zIB)
+
+[lag_MON, corr_MON, beta_MON, alpha_MON, r2_MON, exp_MON, res_MON, lagScore_MON] = f_best_single(xMon, dVN10, LEN_REG, expectedSignP5, useBestLag, manualLag)
+scoreR2_MON       = f_clamp(100.0 * r2_MON, 0, 100)
+scoreExp_MON      = f_z_to_score(f_robust_z(exp_MON, LEN_Z, CLIP_Z))
+scoreDrvShock_MON = f_z_to_score(f_robust_z(math.abs(f_lag(xMon, lag_MON)), LEN_Z, CLIP_Z))
+scoreDecouple_MON = f_z_to_score(f_robust_z(math.abs(res_MON), LEN_Z, CLIP_Z))
+sign_MON          = f_sign_score(beta_MON, expectedSignP5)
+stab_MON          = f_stability_score(f_lag(xMon, lag_MON), dVN10, math.floor(LEN_REG / 2), expectedSignP5)
+impact_MON        = 0.35 * scoreExp_MON + 0.20 * scoreVN_press + 0.20 * scoreR2_MON + 0.10 * scoreDrvShock_MON + 0.15 * sign_MON
+
+// =====================================================================
+// 11) P6 — CHUỖI TRUYỀN DẪN
+// =====================================================================
+zUS02 = f_robust_z(dUS02, LEN_Z, CLIP_Z)
+zDXY  = f_robust_z(dDXY, LEN_Z, CLIP_Z)
+xFXG  = f_mean2(zUS02, zDXY)
+
+[lag_A1, corr_A, beta_A, alpha_A, r2_A, exp_A, res_A, lagScore_A] = f_best_single(xFXG, dUSDVND, LEN_REG, 1, useBestLag, manualLag)
+scoreR2_A = f_clamp(100 * r2_A, 0, 100)
+sign_A    = f_sign_score(beta_A, 1)
+stab_A    = f_stability_score(f_lag(xFXG, lag_A1), dUSDVND, math.floor(LEN_REG / 2), 1)
+
+[lag_B1, corr_B, beta_B, alpha_B, r2_B, exp_B, res_B, lagScore_B] = f_best_single(dUSDVND, dIB, LEN_REG, 1, useBestLag, manualLag)
+scoreR2_B = f_clamp(100 * r2_B, 0, 100)
+sign_B    = f_sign_score(beta_B, 1)
+stab_B    = f_stability_score(f_lag(dUSDVND, lag_B1), dIB, math.floor(LEN_REG / 2), 1)
+
+[lag_C1, corr_C2, beta_C2, alpha_C2, r2_C2, exp_C2, res_C2, lagScore_C2] = f_best_single(dIB, dVN10, LEN_REG, 1, useBestLag, manualLag)
+scoreR2_C2 = f_clamp(100 * r2_C2, 0, 100)
+sign_C2    = f_sign_score(beta_C2, 1)
+stab_C2    = f_stability_score(f_lag(dIB, lag_C1), dVN10, math.floor(LEN_REG / 2), 1)
+
+chainFit         = f_clamp(0.33 * scoreR2_A + 0.33 * scoreR2_B + 0.34 * scoreR2_C2, 0, 100)
+chainConsistency = f_clamp(0.33 * sign_A + 0.33 * sign_B + 0.34 * sign_C2, 0, 100)
+chainStability   = f_clamp(0.33 * stab_A + 0.33 * stab_B + 0.34 * stab_C2, 0, 100)
+
+covA = math.min(f_coverage(f_lag(xFXG, lag_A1), LEN_REG), f_coverage(dUSDVND, LEN_REG))
+covB = math.min(f_coverage(f_lag(dUSDVND, lag_B1), LEN_REG), f_coverage(dIB, LEN_REG))
+covC = math.min(f_coverage(f_lag(dIB, lag_C1), LEN_REG), f_coverage(dVN10, LEN_REG))
+chainCompletion = f_clamp(100 * f_mean3(covA, covB, covC), 0, 100)
+
+chainQuality = f_clamp(0.40 * chainFit + 0.25 * chainConsistency + 0.20 * chainStability + 0.15 * chainCompletion, 0, 100)
+chainShockRaw   = f_mean3(math.abs(f_lag(xFXG, lag_A1)), math.abs(f_lag(dUSDVND, lag_B1)), math.abs(f_lag(dIB, lag_C1)))
+scoreChainShock = f_z_to_score(f_robust_z(chainShockRaw, LEN_Z, CLIP_Z))
+scoreDecouple_CHAIN = f_z_to_score(f_robust_z(math.abs(res_C2), LEN_Z, CLIP_Z))
+
+impact_CHAIN = 0.40 * scoreVN_press + 0.30 * scoreChainShock + 0.15 * chainFit + 0.15 * chainConsistency
+
+// =====================================================================
+// 12) CHỌN PANEL
+// =====================================================================
+bool isP1 = panelMode == "P1 BOJ→VN"
+bool isP2 = panelMode == "P2 Toàn cầu→VN"
+bool isP3 = panelMode == "P3 Đường cong→VN"
+bool isP4 = panelMode == "P4 Yên carry→VN"
+bool isP5 = panelMode == "P5 FX & Thanh khoản→VN"
+bool isP6 = panelMode == "P6 Chuỗi truyền dẫn→VN"
+
+float impact   = na
+float duTinh   = na
+float tachBiet = na
+float scoreR2  = na
+float covDrv   = na
+float signNow  = na
+float stabNow  = na
+int   lagNow   = na
+float betaNow  = na
+
+if isP1
+    impact   := impact_JP
+    duTinh   := scoreExp_JP
+    tachBiet := scoreDecouple_JP
+    scoreR2  := scoreR2_JP
+    covDrv   := f_coverage(f_lag(dJDrv, lag_JP), LEN_REG)
+    signNow  := sign_JP
+    stabNow  := stab_JP
+    lagNow   := lag_JP
+    betaNow  := beta_JP
+else if isP2
+    impact   := impact_G
+    duTinh   := scoreExp_G
+    tachBiet := scoreDecouple_G
+    scoreR2  := scoreR2_G
+    covDrv   := f_coverage(f_lag(dG10, lag_G), LEN_REG)
+    signNow  := sign_G
+    stabNow  := stab_G
+    lagNow   := lag_G
+    betaNow  := beta_G
+else if isP3
+    impact   := impact_C
+    duTinh   := f_clamp(0.5 * scoreExp_L + 0.5 * scoreExp_S, 0, 100)
+    tachBiet := scoreDecouple_C
+    scoreR2  := scoreR2_C
+    covDrv   := math.min(f_coverage(f_lag(dG10, lag_L), LEN_REG), f_coverage(f_lag(dsG, lag_S), LEN_REG))
+    signNow  := sign_C
+    stabNow  := stab_C
+    lagNow   := lag_L
+    betaNow  := beta_L
+else if isP4
+    impact   := impact_CRY
+    duTinh   := scoreExp_CRY
+    tachBiet := scoreDecouple_CRY
+    scoreR2  := scoreR2_CRY
+    covDrv   := f_coverage(f_lag(xCarry, lag_CRY), LEN_REG)
+    signNow  := sign_CRY
+    stabNow  := stab_CRY
+    lagNow   := lag_CRY
+    betaNow  := beta_CRY
+else if isP5
+    impact   := impact_MON
+    duTinh   := scoreExp_MON
+    tachBiet := scoreDecouple_MON
+    scoreR2  := scoreR2_MON
+    covDrv   := f_coverage(f_lag(xMon, lag_MON), LEN_REG)
+    signNow  := sign_MON
+    stabNow  := stab_MON
+    lagNow   := lag_MON
+    betaNow  := beta_MON
+else
+    impact   := impact_CHAIN
+    duTinh   := scoreChainShock
+    tachBiet := scoreDecouple_CHAIN
+    scoreR2  := chainQuality
+    covDrv   := math.min(covA, math.min(covB, covC))
+    signNow  := chainConsistency
+    stabNow  := chainStability
+    lagNow   := lag_C1
+    betaNow  := beta_C2
+
+bucketB  = f_bucketB(impact)
+bucketVN = f_bucketVN(impact)
+
+impact_bg = bgSmoothN <= 1 ? impact : ta.ema(impact, bgSmoothN)
+bgcolor(showBg ? f_bucketBg(impact_bg) : na)
+
+covVN  = f_coverage(dVN10, LEN_REG)
+covMin = math.min(covVN, covDrv)
+
+quality   = isP6 ? f_clamp(0.55 * chainQuality + 0.45 * chainCompletion, 0, 100) : f_quality2(scoreR2, covMin, signNow, stabNow)
+tinCayTxt = f_nhan_tin_cay(quality)
+truyenDan = f_nhan_truyen_dan(scoreR2)
+
+d1 = impact - impact[1]
+xuHuongNgay = d1 > 0 ? "Hôm nay xấu hơn" : d1 < 0 ? "Hôm nay tốt hơn" : "Hôm nay đi ngang"
+
+ketLuanLaiSuat = f_ket_luan_lai_suat(impact)
+goiYHanhDong   = f_goi_y_hanh_dong(bucketB)
+biKeoTheoTxt   = f_bi_keo_theo_giai_thich(tachBiet)
+mucBiKeoTheo   = f_muc_bi_keo_theo_ngan(tachBiet)
+
+// =====================================================================
+// 13) DIỄN GIẢI HÔM NAY / 7 NGÀY
+// =====================================================================
+todayText  = f_today_status(impact)
+todayDelta = impact - impact[1]
+todayDeltaTxt = f_delta_text(todayDelta)
+
+impact7d     = impact - impact[7]
+duTinh7d     = duTinh - duTinh[7]
+tachBiet7d   = tachBiet - tachBiet[7]
+quality7d    = quality - quality[7]
+
+summary7dImpact   = f_7d_summary(impact)
+summary7dDuTinh   = "Dự tính 7 ngày: " + f_7d_direction(duTinh)
+summary7dTachBiet = "Tách biệt 7 ngày: " + f_7d_direction(tachBiet)
+signalNote        = f_signal_note(impact, quality, signNow, stabNow)
+
+todayPanelRead =
+     isP1 ? "Kênh Nhật đang " + (impact >= 65 ? "gây áp lực rõ" : impact >= 50 ? "tạo áp lực vừa" : "chưa gây áp lực lớn") :
+     isP2 ? "Kênh toàn cầu đang " + (impact >= 65 ? "đè lên VN rõ" : impact >= 50 ? "tạo sức ép vừa" : "khá trung tính") :
+     isP3 ? "Đường cong toàn cầu đang " + (impact >= 65 ? "truyền căng thẳng sang VN" : impact >= 50 ? "gây nhiễu vừa" : "chưa quá xấu") :
+     isP4 ? "Risk-off / yên carry đang " + (impact >= 65 ? "siết mạnh" : impact >= 50 ? "siết vừa" : "chưa nổi trội") :
+     isP5 ? "FX & thanh khoản nội địa đang " + (impact >= 65 ? "gây áp lực lớn" : impact >= 50 ? "gây áp lực vừa" : "khá ổn") :
+             "Chuỗi truyền dẫn đang " + (impact >= 65 ? "hoạt động mạnh" : impact >= 50 ? "hoạt động ở mức vừa" : "chưa quá mạnh")
+
+// =====================================================================
+// 14) PLOT
+// =====================================================================
+plot(impact, "Điểm áp lực (0–100)", linewidth=2)
+plot(showComponentsEff ? duTinh   : na, "Điểm dự tính", linewidth=1)
+plot(showComponentsEff ? tachBiet : na, "Điểm tách biệt", linewidth=1)
+
+hline(80, "B4", color=color.new(color.purple, 50))
+hline(65, "B3", color=color.new(color.red, 60))
+hline(50, "B2", color=color.new(color.orange, 70))
+hline(35, "B1", color=color.new(color.lime, 80))
+
+if barstate.islast
+    if showLineLabels
+        lbApLuc := f_make_label(lbApLuc, impact, "Áp lực: " + f_fmt(impact, "#.1"))
+        if beginnerMode
+            if not na(lbDuTinh)
+                label.delete(lbDuTinh)
+                lbDuTinh := na
+            if not na(lbTachBiet)
+                label.delete(lbTachBiet)
+                lbTachBiet := na
+        else
+            if showComponentsEff and not na(duTinh)
+                lbDuTinh := f_make_label(lbDuTinh, duTinh, "Dự tính: " + f_fmt(duTinh, "#.1"))
+            else if not na(lbDuTinh)
+                label.delete(lbDuTinh)
+                lbDuTinh := na
+
+            if showComponentsEff and not na(tachBiet)
+                lbTachBiet := f_make_label(lbTachBiet, tachBiet, "Tách biệt: " + f_fmt(tachBiet, "#.1"))
+            else if not na(lbTachBiet)
+                label.delete(lbTachBiet)
+                lbTachBiet := na
+    else
+        if not na(lbApLuc)
+            label.delete(lbApLuc)
+            lbApLuc := na
+        if not na(lbDuTinh)
+            label.delete(lbDuTinh)
+            lbDuTinh := na
+        if not na(lbTachBiet)
+            label.delete(lbTachBiet)
+            lbTachBiet := na
+
+// =====================================================================
+// 15) ALERT
+// =====================================================================
+alertcondition(ta.crossover(impact, 50), "Vào vùng Cảnh giác (B2)", "Điểm áp lực vượt 50.")
+alertcondition(ta.crossover(impact, 65), "Vào vùng Căng thẳng (B3)", "Điểm áp lực vượt 65.")
+alertcondition(ta.crossover(impact, 80), "Vào vùng Sốc (B4)", "Điểm áp lực vượt 80.")
+alertcondition(ta.crossunder(impact, 50), "Hạ nhiệt", "Điểm áp lực xuống dưới 50.")
+
+// =====================================================================
+// 16) TABLE
+// =====================================================================
+pos = position.bottom_right
+if tablePos == "Trên trái"
+    pos := position.top_left
+else if tablePos == "Trên phải"
+    pos := position.top_right
+else if tablePos == "Dưới trái"
+    pos := position.bottom_left
+else
+    pos := position.bottom_right
+
+int T_COLS = 3
+int T_ROWS = 14
+var table t = table.new(pos, T_COLS, T_ROWS, border_width=1)
+
+f_cell(r, c, txt, bg, tc) =>
+    table.cell(t, c, r, txt, bgcolor=bg, text_color=tc)
+
+f_section(row, title) =>
+    f_cell(row, 0, title, color.new(color.black, 0), color.white)
+    f_cell(row, 1, "", color.new(color.black, 0), color.white)
+    f_cell(row, 2, "", color.new(color.black, 0), color.white)
+
+string tieuDeBang = isP1 ? "P1 | Nhật (BOJ) → VN" :
+                   isP2 ? "P2 | Trái phiếu toàn cầu → VN" :
+                   isP3 ? "P3 | Đường cong toàn cầu → VN" :
+                   isP4 ? "P4 | Yên carry → VN" :
+                   isP5 ? "P5 | FX & Thanh khoản → VN" :
+                          "P6 | Chuỗi truyền dẫn → VN"
+
+string statsTiny = ""
+if showStatsTiny and not beginnerMode
+    if isP6
+        statsTiny := "ChainQ " + f_fmt(chainQuality, "#.0") + " | Fit " + f_fmt(chainFit, "#.0") + " | Sign " + f_fmt(chainConsistency, "#.0")
+    else
+        statsTiny := "Lag " + str.tostring(lagNow) + " | R² " + f_fmt(scoreR2, "#.0") + " | Sign " + f_fmt(signNow, "#.0") + " | Stab " + f_fmt(stabNow, "#.0")
+
+string quickL = ""
+string quickR = ""
+
+if isP4
+    quickL := "Yên mạnh: " + f_fmt(yenManhLen_pct, "#.2") + "% | VIX: " + f_fmt(vixTang_pct, "#.2") + "%"
+    quickR := "US2Y-JP2Y: " + f_fmt(chenhUSJP2_bp, "#.0") + "bp | Thu hẹp: " + f_fmt(thuHep_bp, "#.1")
+else if isP5
+    quickL := "USDVND: " + f_fmt(dUSDVND, "#.2") + "% | IB: " + f_fmt(dIB, "#.1") + "bp"
+    quickR := "DXY: " + f_fmt(dDXY, "#.2") + "% | Lag: " + str.tostring(lagNow)
+else if isP6
+    quickL := "A/B/C lag: " + str.tostring(lag_A1) + "/" + str.tostring(lag_B1) + "/" + str.tostring(lag_C1)
+    quickR := "A/B/C R²: " + f_fmt(scoreR2_A, "#.0") + "/" + f_fmt(scoreR2_B, "#.0") + "/" + f_fmt(scoreR2_C2, "#.0")
+else if isP3
+    quickL := "Level lag: " + str.tostring(lag_L) + " | Slope lag: " + str.tostring(lag_S)
+    quickR := "L/S R²: " + f_fmt(scoreR2_L, "#.0") + "/" + f_fmt(scoreR2_S, "#.0")
+else
+    quickL := "Lag tốt nhất: " + str.tostring(lagNow)
+    quickR := "Beta: " + f_fmt(betaNow, "#.3")
+
+int baseRow = 6
+
+if barstate.islast
+    table.clear(t, 0, 0, T_COLS - 1, T_ROWS - 1)
+
+    f_cell(0, 0, tieuDeBang, color.new(color.black, 0), color.white)
+    f_cell(0, 1, "Áp lực: " + f_fmt(impact, "#.1") + " | " + bucketVN, f_bucketBg(impact), color.white)
+    f_cell(0, 2, "Tin cậy: " + tinCayTxt, color.new(color.black, 0), color.white)
+
+    f_section(1, "HÔM NAY")
+    f_cell(2, 0, "Trạng thái", color.new(color.black, 85), color.white)
+    f_cell(2, 1, todayText, color.new(color.black, 85), color.white)
+    f_cell(2, 2, todayDeltaTxt + " | " + f_fmt(todayDelta, "#.1"), color.new(color.black, 85), color.white)
+
+    f_cell(3, 0, "Đọc nhanh", color.new(color.black, 85), color.white)
+    f_cell(3, 1, todayPanelRead, color.new(color.black, 85), color.white)
+    f_cell(3, 2, signalNote, color.new(color.black, 85), color.white)
+
+    f_cell(4, 0, "Kết luận", color.new(color.black, 85), color.white)
+    f_cell(4, 1, ketLuanLaiSuat, color.new(color.black, 85), color.white)
+    f_cell(4, 2, "Bị kéo theo: " + mucBiKeoTheo, color.new(color.black, 85), color.white)
+
+    f_cell(5, 0, "Bạn nên làm", color.new(color.black, 85), color.white)
+    f_cell(5, 1, goiYHanhDong, color.new(color.black, 85), color.white)
+    f_cell(5, 2, xuHuongNgay, color.new(color.black, 85), color.white)
+
+    baseRow := 6
+    if show7DInfo
+        f_section(6, "7 NGÀY GẦN ĐÂY")
+        f_cell(7, 0, "Áp lực", color.new(color.black, 85), color.white)
+        f_cell(7, 1, summary7dImpact, color.new(color.black, 85), color.white)
+        f_cell(7, 2, "Δ7d: " + f_fmt(impact7d, "#.1"), color.new(color.black, 85), color.white)
+
+        f_cell(8, 0, "Dự tính / Tách biệt", color.new(color.black, 85), color.white)
+        f_cell(8, 1, summary7dDuTinh, color.new(color.black, 85), color.white)
+        f_cell(8, 2, summary7dTachBiet + " | Δ: " + f_fmt(tachBiet7d, "#.1"), color.new(color.black, 85), color.white)
+
+        f_cell(9, 0, "Tin cậy", color.new(color.black, 85), color.white)
+        f_cell(9, 1, "Hiện tại: " + tinCayTxt, color.new(color.black, 85), color.white)
+        f_cell(9, 2, "Δ7d quality: " + f_fmt(quality7d, "#.1"), color.new(color.black, 85), color.white)
+
+        baseRow := 10
+    else
+        baseRow := 6
+
+    f_section(baseRow, "SỐ LIỆU NHANH")
+    f_cell(baseRow + 1, 0, "Quick", color.new(color.black, 85), color.white)
+    f_cell(baseRow + 1, 1, quickL, color.new(color.black, 85), color.white)
+    f_cell(baseRow + 1, 2, quickR, color.new(color.black, 85), color.white)
+
+    f_cell(baseRow + 2, 0, "Kỷ luật mô hình", color.new(color.black, 85), color.white)
+    f_cell(baseRow + 2, 1, "Lag: " + str.tostring(lagNow) + " | Sign: " + f_fmt(signNow, "#.0"), color.new(color.black, 85), color.white)
+    f_cell(baseRow + 2, 2, "Stability: " + f_fmt(stabNow, "#.0"), color.new(color.black, 85), color.white)
+
+    f_cell(baseRow + 3, 0, "Phụ trợ", color.new(color.black, 85), color.white)
+    f_cell(baseRow + 3, 1, "Dự tính: " + f_fmt(duTinh, "#.1"), color.new(color.black, 85), color.white)
+    f_cell(baseRow + 3, 2, "Tách biệt: " + f_fmt(tachBiet, "#.1"), color.new(color.black, 85), color.white)
