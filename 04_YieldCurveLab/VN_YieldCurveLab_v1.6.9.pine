@@ -1,6 +1,6 @@
 //@version=5
-indicator("VN YieldCurveLab v1.6.9 - Academic Research Mode (FULL: Regime Research + EffN + BestLag + Corr-Strength UI + Lag-Stability)",
-     shorttitle="VN YieldCurveLab",
+indicator("VN YieldCurveLab v1.7.0 — Academic Defaults (STRICT: AR-AdjN + Partial Corr + BestLag Discipline)",
+     shorttitle="VN YieldCurveLab 1.7",
      overlay=false,
      max_labels_count=500,
      max_lines_count=500,
@@ -8,74 +8,65 @@ indicator("VN YieldCurveLab v1.6.9 - Academic Research Mode (FULL: Regime Resear
      precision=4)
 
 //======================================================
-// 0) INPUTS
+// 0) INPUT (ONLY PANEL)
 //======================================================
-panel_view = input.int(1, "Panel (1=Shape, 2=Grid, 3=Stats)", minval=1, maxval=3)
+panel_view = input.int(1, "Panel (1=Shape, 2=Grid, 3=Research)", minval=1, maxval=3)
 show_p1 = panel_view == 1
 show_p2 = panel_view == 2
 show_p3 = panel_view == 3
 
-sym_1Y  = input.symbol("TVC:VN01Y", "1Y Yield")
-sym_2Y  = input.symbol("TVC:VN02Y", "2Y Yield")
-sym_3Y  = input.symbol("TVC:VN03Y", "3Y Yield")
-sym_5Y  = input.symbol("TVC:VN05Y", "5Y Yield")
-sym_7Y  = input.symbol("TVC:VN07Y", "7Y Yield")
-sym_10Y = input.symbol("TVC:VN10Y", "10Y Yield")
+//======================================================
+// 1) ACADEMIC DEFAULTS (STRICT, HARD-CODED)
+//======================================================
+string TF_DATA = "D"
 
-sym_interbank = input.symbol("VNINBR", "Interbank (VNINBR)")
-sym_policy    = input.symbol("VNINTR", "Policy Rate (VNINTR)")
+// Windows
+int   LEN_STATS    = 252
+int   LEN_RESEARCH = 252
+int   LEN_HALF     = 126
+int   LEN_STAB     = 60
 
-// ---- Research (Panel 3)
-show_research  = input.bool(true, "Panel 3: Research vs VNINDEX")
-sym_vnindex    = input.symbol("HOSE:VNINDEX", "VNINDEX (research)")
-len_research   = input.int(120, "Research window (days)", minval=30)
+// Robustness
+float CLIP_Z       = 2.5
+float RET_CLIP_SD  = 3.0
 
-use_lags       = input.bool(true, "Research: Use lag set (best-lag among 3)")
-lag1           = input.int(1,  "Lag #1 (days)", minval=1, maxval=60)
-lag2           = input.int(5,  "Lag #2 (days)", minval=1, maxval=120)
-lag3           = input.int(20, "Lag #3 (days)", minval=1, maxval=252)
+// Research gates
+float MIN_EFF_RATIO = 0.80      // strict sample adequacy
+float COV_MED       = 0.85
+float COV_HIGH      = 0.95
 
-use_ret_clip   = input.bool(true, "Research: Winsorize VNINDEX returns")
-ret_clip_mult  = input.float(3.0, "Research: Return clip (stdev)", minval=1.0, maxval=8.0)
+// BestLag discipline (k=3 fixed lags)
+int   LAG1 = 1
+int   LAG2 = 5
+int   LAG3 = 20
+float R_ACCEPT   = 0.20
+float MARGIN_MIN = 0.05
+float T_CRIT     = 2.4
+float R_HALF_MIN = 0.15
 
-// ---- Sample adequacy
-min_eff_ratio  = input.float(0.70, "Research: Min effective sample ratio", minval=0.30, maxval=1.00)
-require_daily  = input.bool(true, "Research: Require chart timeframe = 1D (recommended)")
+// Stress percentile thresholds (strict)
+float STRESS_LOW_PCTL  = 20.0
+float STRESS_HIGH_PCTL = 80.0
 
-// ---- Regime-conditioned research
-reg_filter = input.string("None", "Research: Regime filter",
-     options=["None","YC4","YC3","YC2","YC1","INVERTED","STRESS_HIGH","STRESS_LOW","OKQ_ONLY"])
+// Event tagging (moderate, strict gating)
+bool  SHOW_EVENTS    = true
+int   EVENT_MIN_GAP  = 20
+int   EVENT_XOFF     = 2
+float EVENT_YPAD_PCT = 2.0
 
-// ---- BestLag stability UI (v1.6.9)
-len_lag_stab = input.int(60, "Research: BestLag stability window (days)", minval=20, maxval=252)
-
-// ---- Stats / Robust
-len_stats   = input.int(120, "Stats window (days)", minval=30)
-clip_mult   = input.float(2.5, "Robust clip (winsor)", minval=1.0, maxval=5.0)
-use_pct     = input.bool(true, "Use percentrank")
-len_change  = input.int(60, "Change window (days)", minval=5)
-len_mom     = input.int(5, "Momentum window (days)", minval=1, maxval=60)
-
-low_th_pct  = input.float(20, "Pctl LOW",  minval=0,  maxval=50)
-high_th_pct = input.float(80, "Pctl HIGH", minval=50, maxval=100)
-
-show_yields_p23   = input.bool(true, "Panel 2/3: show yield time-series")
-show_line_labels  = input.bool(true, "Show line labels (ticker only)")
-label_all_tenors  = input.bool(false, "Also label 1Y/3Y/7Y")
-label_offset_bars = input.int(6, "Label offset (bars)", minval=1, maxval=50)
-
-show_stress_overlay = input.bool(true, "Show Stress overlay (mapped)")
-show_stress_adj     = input.bool(true, "Show Stress_ADJ overlay (quality adjusted)")
-
-// Event tags
-show_events     = input.bool(true, "Event Tags")
-event_density   = input.string("Medium", "Event density", options=["Low","Medium","High"])
-event_only_D    = input.bool(true, "Only tag on confirmed bar")
-event_x_offset  = input.int(2, "Tag X offset (bars)", minval=0, maxval=30)
-event_y_pad_pct = input.float(2.0, "Tag Y padding (%)", minval=0, maxval=20)
+// Symbols (hard defaults)
+string SYM_1Y  = "TVC:VN01Y"
+string SYM_2Y  = "TVC:VN02Y"
+string SYM_3Y  = "TVC:VN03Y"
+string SYM_5Y  = "TVC:VN05Y"
+string SYM_7Y  = "TVC:VN07Y"
+string SYM_10Y = "TVC:VN10Y"
+string SYM_IB  = "VNINBR"
+string SYM_PR  = "VNINTR"
+string SYM_VNX = "HOSE:VNINDEX"
 
 //======================================================
-// 1) HELPERS
+// 2) HELPERS
 //======================================================
 f_robust_z(src, length, clip) =>
     m  = ta.sma(src, length)
@@ -85,10 +76,7 @@ f_robust_z(src, length, clip) =>
     clipped = math.max(dn, math.min(up, src))
     cm  = ta.sma(clipped, length)
     csd = ta.stdev(clipped, length)
-    float z = 0.0
-    if csd > 0
-        z := (src - cm) / csd
-    z
+    csd > 0 ? (src - cm) / csd : 0.0
 
 f_num(v, fmt) =>
     string s = "NA"
@@ -96,52 +84,44 @@ f_num(v, fmt) =>
         s := str.tostring(v, fmt)
     s
 
-f_bucket_pct(p) =>
-    string b = "NA"
-    if not na(p)
-        if p <= low_th_pct
-            b := "LOW"
-        else if p >= high_th_pct
-            b := "HIGH"
-        else
-            b := "MID"
-    b
+// Rolling count without ta.sum
+f_count(cond, length) =>
+    float v = cond ? 1.0 : 0.0
+    float cs = ta.cum(v)
+    cs - nz(cs[length])
 
-f_bucket_z(z) =>
-    string b = "NA"
-    if not na(z)
-        if z <= -1
-            b := "CHEAP"
-        else if z >= 1
-            b := "RICH"
-        else
-            b := "FAIR"
-    b
+f_cov(x, y, length) =>
+    mx = ta.sma(x, length)
+    my = ta.sma(y, length)
+    ta.sma((x - mx) * (y - my), length)
 
-f_arrow(d) =>
-    string a = "-"
-    if not na(d)
-        if d > 0.01
-            a := "UP"
-        else if d < -0.01
-            a := "DN"
-        else
-            a := "-"
-    a
+f_var(x, length) =>
+    mx = ta.sma(x, length)
+    ta.sma((x - mx) * (x - mx), length)
 
-f_bg(tag) =>
+f_t_from_df(r, df) =>
+    float t = na
+    if not na(r) and not na(df) and df > 0 and math.abs(r) < 1
+        t := r * math.sqrt(df / (1 - r*r))
+    t
+
+f_partial_corr(r_xy, r_xz, r_yz) =>
+    float out = na
+    if not na(r_xy) and not na(r_xz) and not na(r_yz)
+        float den = math.sqrt((1 - r_xz*r_xz) * (1 - r_yz*r_yz))
+        out := den > 0 ? (r_xy - r_xz*r_yz) / den : na
+    out
+
+f_bg_tag(tag) =>
     color out = color.new(color.gray, 85)
-    if tag == "YC4" or tag == "INVERTED" or tag == "STRESS CAO" or tag == "DISTORTED" or tag == "LOWQ" or tag == "RICH" or tag == "HIGH"
+    if tag == "HIGH" or tag == "RICH" or tag == "YC4" or tag == "INVERTED" or tag == "STRESS HIGH" or tag == "LOWQ" or tag == "DATAQ LOW"
         out := color.new(color.red, 12)
-    else if tag == "YC3"
-        out := color.new(color.fuchsia, 16)
-    else if tag == "YC2" or tag == "YC1" or tag == "PURE MOVE" or tag == "HIGHQ" or tag == "STRESS THAP" or tag == "LOW" or tag == "CHEAP"
+    else if tag == "LOW" or tag == "CHEAP" or tag == "YC1" or tag == "STRESS LOW" or tag == "HIGHQ" or tag == "DATAQ HIGH"
         out := color.new(color.lime, 14)
-    else if tag == "MIXED" or tag == "MEDQ" or tag == "MID" or tag == "FAIR" or tag == "TRUNG TINH" or tag == "YC0"
+    else
         out := color.new(color.orange, 16)
     out
 
-// Corr strength background (v1.6.9)
 f_corrBg(float r) =>
     color bg = color.new(color.black, 80)
     if not na(r)
@@ -155,131 +135,137 @@ f_corrBg(float r) =>
         bg := color.new(base, tr)
     bg
 
-// Safe label updater (typified _y so can pass na)
-f_setLabel(label _lbl, int _x, float _y, string _txt, color _col) =>
-    label L = _lbl
-    if na(_y)
-        if not na(L)
-            label.delete(L)
-            L := na
-    else
-        if na(L)
-            L := label.new(_x, _y, _txt)
-            label.set_style(L, label.style_label_left)
-            label.set_textcolor(L, color.white)
-            label.set_color(L, color.new(_col, 0))
-            label.set_size(L, size.tiny)
-        else
-            label.set_xy(L, _x, _y)
-            label.set_text(L, _txt)
-            label.set_style(L, label.style_label_left)
-            label.set_textcolor(L, color.white)
-            label.set_color(L, color.new(_col, 0))
-            label.set_size(L, size.tiny)
-    L
+//======================================================
+// 3) DATA (STRICT: forward-fill for continuity + raw coverage for DATAQ)
+//======================================================
+// Raw (gaps_on) to measure coverage honestly
+y1_raw  = request.security(SYM_1Y,  TF_DATA, close, barmerge.gaps_on,  barmerge.lookahead_off)
+y2_raw  = request.security(SYM_2Y,  TF_DATA, close, barmerge.gaps_on,  barmerge.lookahead_off)
+y3_raw  = request.security(SYM_3Y,  TF_DATA, close, barmerge.gaps_on,  barmerge.lookahead_off)
+y5_raw  = request.security(SYM_5Y,  TF_DATA, close, barmerge.gaps_on,  barmerge.lookahead_off)
+y7_raw  = request.security(SYM_7Y,  TF_DATA, close, barmerge.gaps_on,  barmerge.lookahead_off)
+y10_raw = request.security(SYM_10Y, TF_DATA, close, barmerge.gaps_on,  barmerge.lookahead_off)
+ib_raw  = request.security(SYM_IB,  TF_DATA, close, barmerge.gaps_on,  barmerge.lookahead_off)
+pr_raw  = request.security(SYM_PR,  TF_DATA, close, barmerge.gaps_on,  barmerge.lookahead_off)
 
-// TV-safe covariance/variance
-f_cov(x, y, length) =>
-    mx = ta.sma(x, length)
-    my = ta.sma(y, length)
-    ta.sma((x - mx) * (y - my), length)
+// VNINDEX (gaps_off)
+vnx = request.security(SYM_VNX, TF_DATA, close, barmerge.gaps_off, barmerge.lookahead_off)
 
-f_var(x, length) =>
-    mx = ta.sma(x, length)
-    ta.sma((x - mx) * (x - mx), length)
+// Forward-fill for continuous curve analytics
+var float y1  = na
+var float y2  = na
+var float y3  = na
+var float y5  = na
+var float y7  = na
+var float y10 = na
+var float ib  = na
+var float pr  = na
 
-// Rolling count without ta.sum
-f_count(cond, length) =>
-    float v = cond ? 1.0 : 0.0
-    float cs = ta.cum(v)
-    cs - nz(cs[length])
+y1  := na(y1_raw)  ? nz(y1[1])  : y1_raw
+y2  := na(y2_raw)  ? nz(y2[1])  : y2_raw
+y3  := na(y3_raw)  ? nz(y3[1])  : y3_raw
+y5  := na(y5_raw)  ? nz(y5[1])  : y5_raw
+y7  := na(y7_raw)  ? nz(y7[1])  : y7_raw
+y10 := na(y10_raw) ? nz(y10[1]) : y10_raw
+ib  := na(ib_raw)  ? nz(ib[1])  : ib_raw
+pr  := na(pr_raw)  ? nz(pr[1])  : pr_raw
+
+// VNINDEX log return
+vnx_ret = (not na(vnx) and not na(vnx[1]) and vnx[1] > 0) ? math.log(vnx / vnx[1]) : na
+
+// Winsorize returns
+ret_mean = ta.sma(vnx_ret, LEN_RESEARCH)
+ret_sd   = ta.stdev(vnx_ret, LEN_RESEARCH)
+ret_up   = ret_mean + RET_CLIP_SD * ret_sd
+ret_dn   = ret_mean - RET_CLIP_SD * ret_sd
+vnx_ret_clip = (not na(vnx_ret) and not na(ret_sd) and ret_sd > 0) ? math.max(ret_dn, math.min(ret_up, vnx_ret)) : vnx_ret
 
 //======================================================
-// 2) DATA (Daily)
-//======================================================
-tf_req = "D"
-
-y1  = request.security(sym_1Y,  tf_req, close, barmerge.gaps_off, barmerge.lookahead_off)
-y2  = request.security(sym_2Y,  tf_req, close, barmerge.gaps_off, barmerge.lookahead_off)
-y3  = request.security(sym_3Y,  tf_req, close, barmerge.gaps_off, barmerge.lookahead_off)
-y5  = request.security(sym_5Y,  tf_req, close, barmerge.gaps_off, barmerge.lookahead_off)
-y7  = request.security(sym_7Y,  tf_req, close, barmerge.gaps_off, barmerge.lookahead_off)
-y10 = request.security(sym_10Y, tf_req, close, barmerge.gaps_off, barmerge.lookahead_off)
-
-interbank = request.security(sym_interbank, tf_req, close, barmerge.gaps_off, barmerge.lookahead_off)
-policy    = request.security(sym_policy,    tf_req, close, barmerge.gaps_off, barmerge.lookahead_off)
-
-// VNINDEX
-vnx       = request.security(sym_vnindex, tf_req, close, barmerge.gaps_off, barmerge.lookahead_off)
-vnx_ret_d = request.security(sym_vnindex, tf_req, math.log(close / close[1]), barmerge.gaps_off, barmerge.lookahead_off)
-vnx_ok    = not na(vnx) and not na(vnx_ret_d)
-
-// VNINDEX warning label
-var label lb_vnx_warn = na
-if barstate.islast
-    if show_research and not vnx_ok
-        float y_warn = na(y10) ? ((y2 + y5 + y10) / 3.0) : y10
-        if na(lb_vnx_warn)
-            lb_vnx_warn := label.new(bar_index, y_warn, "VNINDEX ticker invalid/NA.\nTry: HOSE:VNINDEX")
-            label.set_style(lb_vnx_warn, label.style_label_down)
-            label.set_textcolor(lb_vnx_warn, color.white)
-            label.set_color(lb_vnx_warn, color.new(color.red, 0))
-            label.set_size(lb_vnx_warn, size.small)
-        else
-            label.set_xy(lb_vnx_warn, bar_index, y_warn)
-            label.set_text(lb_vnx_warn, "VNINDEX ticker invalid/NA.\nTry: HOSE:VNINDEX")
-            label.set_color(lb_vnx_warn, color.new(color.red, 0))
-    else
-        if not na(lb_vnx_warn)
-            label.delete(lb_vnx_warn)
-            lb_vnx_warn := na
-
-//======================================================
-// 3) FACTORS
+// 4) FACTORS (stationary via percentiles)
 //======================================================
 level = (y2 + y5 + y10) / 3.0
 slope = y10 - y2
 curve = 2.0 * y5 - y2 - y10
 
-level_z = f_robust_z(level, len_stats, clip_mult)
-slope_z = f_robust_z(slope, len_stats, clip_mult)
-curve_z = f_robust_z(curve, len_stats, clip_mult)
+// Percentiles (0..100)
+level_pct = ta.percentrank(level, LEN_STATS)
+slope_pct = ta.percentrank(slope, LEN_STATS)
+curve_pct = ta.percentrank(curve, LEN_STATS)
 
-float level_pct = na
-float slope_pct = na
-float curve_pct = na
-if use_pct
-    level_pct := ta.percentrank(level, len_stats)
-    slope_pct := ta.percentrank(slope, len_stats)
-    curve_pct := ta.percentrank(curve, len_stats)
+// Stress components (percentile-based)
+level_comp = level_pct
+slope_risk = slope <= 0 ? 100.0 : (100.0 - slope_pct)
+// Curve risk: distance from median (0..100)
+curve_risk = not na(curve_pct) ? (math.abs(curve_pct - 50.0) / 50.0) * 100.0 : na
 
-float level_m = na
-float slope_m = na
-if not na(level[len_mom])
-    level_m := level - level[len_mom]
-if not na(slope[len_mom])
-    slope_m := slope - slope[len_mom]
+// Raw stress (0..100), strict weights
+macro_stress = (0.45 * level_comp) + (0.45 * slope_risk) + (0.10 * curve_risk)
 
 //======================================================
-// 4) REGIME + STRESS
+// 5) QUALITY (structure + DATAQ coverage)
 //======================================================
-level_reg = f_bucket_pct(level_pct)
+y1_z  = f_robust_z(y1,  LEN_STATS, CLIP_Z)
+y2_z  = f_robust_z(y2,  LEN_STATS, CLIP_Z)
+y3_z  = f_robust_z(y3,  LEN_STATS, CLIP_Z)
+y5_z  = f_robust_z(y5,  LEN_STATS, CLIP_Z)
+y7_z  = f_robust_z(y7,  LEN_STATS, CLIP_Z)
+y10_z = f_robust_z(y10, LEN_STATS, CLIP_Z)
 
-string slope_reg = "FLAT"
-if slope <= 0
-    slope_reg := "INVERTED"
-else
-    if use_pct and not na(slope_pct)
-        if slope_pct >= high_th_pct
-            slope_reg := "STEEP_HIGH"
-        else if slope_pct <= low_th_pct
-            slope_reg := "STEEP_LOW"
-        else
-            slope_reg := "FLAT"
+mean_z = (y1_z + y2_z + y3_z + y5_z + y7_z + y10_z) / 6.0
+dz1  = y1_z  - mean_z
+dz2  = y2_z  - mean_z
+dz3  = y3_z  - mean_z
+dz5  = y5_z  - mean_z
+dz7  = y7_z  - mean_z
+dz10 = y10_z - mean_z
+
+var_z = (dz1*dz1 + dz2*dz2 + dz3*dz3 + dz5*dz5 + dz7*dz7 + dz10*dz10) / 6.0
+dist  = math.sqrt(var_z)
+
+dist_label = dist < 0.30 ? "PURE" : dist > 0.70 ? "DISTORTED" : "MIXED"
+
+// Structural quality (0..100)
+dist_clamp  = math.min(1.2, math.max(0.0, dist))
+qual_struct = 100.0 - (dist_clamp / 1.2) * 100.0
+
+// DATAQ coverage (use RAW availability for core curve)
+core_raw_ok = (not na(y2_raw)) and (not na(y5_raw)) and (not na(y10_raw))
+cov_core = f_count(core_raw_ok, LEN_RESEARCH) / LEN_RESEARCH
+qual_data = cov_core * 100.0
+
+// Total quality = min(struct, data) (strict)
+qual_total = math.min(qual_struct, qual_data)
+quality_label =
+     qual_total >= 75 ? "HIGHQ" :
+     qual_total >= 50 ? "MEDQ"  : "LOWQ"
+
+dataq_label =
+     cov_core >= COV_HIGH ? "DATAQ HIGH" :
+     cov_core >= COV_MED  ? "DATAQ MED"  : "DATAQ LOW"
+
+// Stress adjusted by quality
+stress_adj = macro_stress * (qual_total / 100.0)
+
+// Percentile stress for stationarity
+stress_pct  = ta.percentrank(macro_stress, LEN_STATS)
+stressA_pct = ta.percentrank(stress_adj,   LEN_STATS)
+
+// Stress regime (by percentile, strict)
+stress_reg =
+     stressA_pct >= STRESS_HIGH_PCTL ? "STRESS HIGH" :
+     stressA_pct <= STRESS_LOW_PCTL  ? "STRESS LOW"  : "MID"
+
+//======================================================
+// 6) YC REGIME (strict, percentile-based)
+//======================================================
+level_reg = level_pct >= 80 ? "HIGH" : level_pct <= 20 ? "LOW" : "MID"
+slope_reg =
+     slope <= 0 ? "INVERTED" :
+     slope_pct >= 80 ? "STEEP_HIGH" :
+     slope_pct <= 20 ? "STEEP_LOW"  : "FLAT"
 
 string yc_code  = "YC0"
 string yc_label = "Neutral/Mixed."
-
 if level_reg == "HIGH" and (slope_reg == "FLAT" or slope_reg == "INVERTED")
     yc_code  := "YC4"
     yc_label := "Tight: high level + flat/inverted."
@@ -293,93 +279,19 @@ else if level_reg == "LOW"
     yc_code  := "YC1"
     yc_label := "Easing mature: low level."
 
-level_comp   = not na(level_pct) ? level_pct : 50.0
-slope_risk   = slope <= 0 ? 100.0 : (not na(slope_pct) ? (100.0 - slope_pct) : 50.0)
-macro_stress = (level_comp + slope_risk) / 2.0
-
-string stress_reg = "TRUNG TINH"
-if macro_stress >= 70
-    stress_reg := "STRESS CAO"
-else if macro_stress <= 40
-    stress_reg := "STRESS THAP"
-
 //======================================================
-// 5) DISTORTION + QUALITY + GRID METRICS
+// 7) PLOTS (kept simple; tables are primary UI)
 //======================================================
-y1_z  = f_robust_z(y1,  len_stats, clip_mult)
-y2_z  = f_robust_z(y2,  len_stats, clip_mult)
-y3_z  = f_robust_z(y3,  len_stats, clip_mult)
-y5_z  = f_robust_z(y5,  len_stats, clip_mult)
-y7_z  = f_robust_z(y7,  len_stats, clip_mult)
-y10_z = f_robust_z(y10, len_stats, clip_mult)
+plot(y2,  "VN02Y",  color.new(color.blue, 0),  2)
+plot(y5,  "VN05Y",  color.new(color.green, 0), 2)
+plot(y10, "VN10Y",  color.new(color.red, 0),   2)
+plot(y1,  "VN01Y",  color.new(color.gray, 60), 1)
+plot(y3,  "VN03Y",  color.new(color.orange,60),1)
+plot(y7,  "VN07Y",  color.new(color.purple,60),1)
+plot(ib,  "VNINBR", color.new(color.yellow,0), 1)
+plot(pr,  "VNINTR", color.new(color.teal, 0),  1)
 
-mean_z = (y1_z + y2_z + y3_z + y5_z + y7_z + y10_z) / 6.0
-dz1  = y1_z  - mean_z
-dz2  = y2_z  - mean_z
-dz3  = y3_z  - mean_z
-dz5  = y5_z  - mean_z
-dz7  = y7_z  - mean_z
-dz10 = y10_z - mean_z
-var_z = (dz1*dz1 + dz2*dz2 + dz3*dz3 + dz5*dz5 + dz7*dz7 + dz10*dz10) / 6.0
-dist = math.sqrt(var_z)
-
-dist_label = dist < 0.30 ? "PURE MOVE" : dist > 0.70 ? "DISTORTED" : "MIXED"
-dist_clamp = math.min(1.2, math.max(0.0, dist))
-quality = 100.0 - (dist_clamp / 1.2) * 100.0
-quality_label = quality >= 75 ? "HIGHQ" : quality >= 50 ? "MEDQ" : "LOWQ"
-
-// Stress adjusted by quality
-stress_adj = macro_stress * (quality / 100.0)
-
-string stress_adj_reg = "TRUNG TINH"
-if stress_adj >= 55
-    stress_adj_reg := "STRESS CAO"
-else if stress_adj <= 30
-    stress_adj_reg := "STRESS THAP"
-
-chg1  = not na(y1[len_change])  ? (y1  - y1[len_change])  : na
-chg2  = not na(y2[len_change])  ? (y2  - y2[len_change])  : na
-chg3  = not na(y3[len_change])  ? (y3  - y3[len_change])  : na
-chg5  = not na(y5[len_change])  ? (y5  - y5[len_change])  : na
-chg7  = not na(y7[len_change])  ? (y7  - y7[len_change])  : na
-chg10 = not na(y10[len_change]) ? (y10 - y10[len_change]) : na
-
-short_move = (not na(chg1) and not na(chg2)) ? (math.abs(chg1) + math.abs(chg2)) / 2.0 : na
-belly_move = (not na(chg3) and not na(chg5)) ? (math.abs(chg3) + math.abs(chg5)) / 2.0 : na
-long_move  = (not na(chg7) and not na(chg10)) ? (math.abs(chg7) + math.abs(chg10)) / 2.0 : na
-
-move_focus = "NA"
-if not na(short_move) and not na(belly_move) and not na(long_move)
-    move_focus := "SHORT"
-    if belly_move > short_move and belly_move >= long_move
-        move_focus := "BELLY"
-    else if long_move > short_move and long_move > belly_move
-        move_focus := "LONG"
-
-//======================================================
-// 6) PLOTS
-//======================================================
-show_yields = show_p1 or ((show_p2 or show_p3) and show_yields_p23)
-
-col2  = color.new(color.blue, 0)
-col5  = color.new(color.green, 0)
-col10 = color.new(color.red, 0)
-col1  = color.new(color.gray, 60)
-col3  = color.new(color.orange, 60)
-col7  = color.new(color.purple, 60)
-colIB = color.new(color.yellow, 0)
-colPR = color.new(color.teal, 0)
-
-plot(show_yields ? y2  : na, "VN02Y", col2, 2)
-plot(show_yields ? y5  : na, "VN05Y", col5, 2)
-plot(show_yields ? y10 : na, "VN10Y", col10, 2)
-plot(show_yields ? y1 : na, "VN01Y", col1, 1)
-plot(show_yields ? y3 : na, "VN03Y", col3, 1)
-plot(show_yields ? y7 : na, "VN07Y", col7, 1)
-plot(show_yields ? interbank : na, "VNINBR", colIB, 1)
-plot(show_yields ? policy    : na, "VNINTR", colPR, 1)
-
-// Yield min/max chain safe
+// Map stress percentile to yield axis
 min12   = math.min(y1, y2)
 min35   = math.min(y3, y5)
 min710  = math.min(y7, y10)
@@ -390,258 +302,107 @@ max35   = math.max(y3, y5)
 max710  = math.max(y7, y10)
 yc_max6 = math.max(math.max(max12, max35), max710)
 
-y_min = ta.lowest(yc_min6, len_stats)
-y_max = ta.highest(yc_max6, len_stats)
+y_min = ta.lowest(yc_min6, LEN_STATS)
+y_max = ta.highest(yc_max6, LEN_STATS)
 y_rng = y_max - y_min
 
-stress_y     = y_min + (macro_stress / 100.0) * (y_rng > 0 ? y_rng : 1.0)
-stress_adj_y = y_min + (stress_adj   / 100.0) * (y_rng > 0 ? y_rng : 1.0)
-
-plot((show_yields and show_stress_overlay) ? stress_y : na, "Stress(mapped)", color.new(color.white, 30), 2)
-plot((show_yields and show_stress_adj)     ? stress_adj_y : na, "Stress_ADJ(mapped)", color.new(color.aqua, 35), 2)
+stress_map = y_min + (stressA_pct / 100.0) * (y_rng > 0 ? y_rng : 1.0)
+plot(stress_map, "StressPCTL(mapped)", color.new(color.white, 35), 2)
 
 //======================================================
-// 7) LINE LABELS
+// 8) RESEARCH CORE (STRICT: AR-AdjN + Partial Corr + BestLag Discipline)
 //======================================================
-var label lb2  = na
-var label lb5  = na
-var label lb10 = na
-var label lb1  = na
-var label lb3  = na
-var label lb7  = na
-var label lbIB = na
-var label lbPR = na
+bool tf_ok = timeframe.isdaily
+int  needBars = LEN_STATS + LEN_RESEARCH + LAG3 + 20
+bool enoughBars = bar_index >= needBars
 
-if barstate.islast and show_yields and show_line_labels
-    int xL = bar_index + label_offset_bars
+// Valid sample (strict: require core_raw_ok to avoid inferring over forward-fill holes)
+bool valid_all = tf_ok and enoughBars and core_raw_ok and (not na(stressA_pct)) and (not na(vnx_ret_clip))
 
-    lb2  := f_setLabel(lb2,  xL, y2,  "VN02Y", col2)
-    lb5  := f_setLabel(lb5,  xL, y5,  "VN05Y", col5)
-    lb10 := f_setLabel(lb10, xL, y10, "VN10Y", col10)
+float n_eff = f_count(valid_all, LEN_RESEARCH)
+float ratio = n_eff / LEN_RESEARCH
+bool  ready = (ratio >= MIN_EFF_RATIO) and (cov_core >= COV_MED) and tf_ok and enoughBars
 
-    if label_all_tenors
-        lb1 := f_setLabel(lb1, xL, y1, "VN01Y", color.new(color.gray, 20))
-        lb3 := f_setLabel(lb3, xL, y3, "VN03Y", color.new(color.orange, 20))
-        lb7 := f_setLabel(lb7, xL, y7, "VN07Y", color.new(color.purple, 20))
-    else
-        lb1 := f_setLabel(lb1, xL, na, "", col1)
-        lb3 := f_setLabel(lb3, xL, na, "", col3)
-        lb7 := f_setLabel(lb7, xL, na, "", col7)
+// Persistence adjustment
+float rhoS = ta.correlation(stressA_pct, stressA_pct[1], LEN_RESEARCH)
+float rhoR = ta.correlation(vnx_ret_clip, vnx_ret_clip[1], LEN_RESEARCH)
+float cdi  = rhoS * rhoR
 
-    lbIB := f_setLabel(lbIB, xL, interbank, "VNINBR", colIB)
-    lbPR := f_setLabel(lbPR, xL, policy,    "VNINTR", colPR)
+float n_eff_ar = na
+bool  persist_on = false
+if ready and not na(cdi) and math.abs(cdi) < 0.98 and (1 + cdi) != 0
+    n_eff_ar := n_eff * (1 - cdi) / (1 + cdi)
+    n_eff_ar := math.max(5.0, math.min(n_eff, n_eff_ar))
+    persist_on := true
+
+// Degrees of freedom for (adj) correlation inference
+float df_corr  = (persist_on and not na(n_eff_ar)) ? (n_eff_ar - 2.0) : na
+float df_pcorr = (persist_on and not na(n_eff_ar)) ? (n_eff_ar - 3.0) : na
+
+// Base correlations (exploratory)
+float corr_raw = ta.correlation(stress_pct,  vnx_ret_clip, LEN_RESEARCH)
+float corr_adj = ta.correlation(stressA_pct, vnx_ret_clip, LEN_RESEARCH)
+float r2_adj   = not na(corr_adj) ? corr_adj * corr_adj : na
+float t_adj_ar = f_t_from_df(corr_adj, df_corr)
+
+// Partial corr controlling avg(IB,PR)
+float ctrl = (ib + pr) / 2.0
+float ctrl_pct = ta.percentrank(ctrl, LEN_STATS)
+float r_xz = ta.correlation(stressA_pct,  ctrl_pct,    LEN_RESEARCH)
+float r_yz = ta.correlation(vnx_ret_clip, ctrl_pct,    LEN_RESEARCH)
+float pcorr = f_partial_corr(corr_adj, r_xz, r_yz)
+float t_pcorr_ar = f_t_from_df(pcorr, df_pcorr)
+
+// Lags (Adj stress percentile)
+float rL1  = ta.correlation(stressA_pct[LAG1], vnx_ret_clip, LEN_RESEARCH)
+float rL5  = ta.correlation(stressA_pct[LAG2], vnx_ret_clip, LEN_RESEARCH)
+float rL20 = ta.correlation(stressA_pct[LAG3], vnx_ret_clip, LEN_RESEARCH)
+
+// BestLag disciplined (mask when not ready)
+int   bestLag = na
+float bestCorr = na
+float secondAbs = na
+float margin = na
+float bestCorr_half = na
+bool  half_ok = false
+
+if ready
+    float a1 = math.abs(rL1)
+    float a2 = math.abs(rL5)
+    float a3 = math.abs(rL20)
+
+    bestLag := a1 >= a2 and a1 >= a3 ? LAG1 : (a2 >= a3 ? LAG2 : LAG3)
+    bestCorr := a1 >= a2 and a1 >= a3 ? rL1 : (a2 >= a3 ? rL5 : rL20)
+
+    // second best abs for margin
+    secondAbs := bestLag == LAG1 ? math.max(a2, a3) : bestLag == LAG2 ? math.max(a1, a3) : math.max(a1, a2)
+    margin := (not na(bestCorr) and not na(secondAbs)) ? (math.abs(bestCorr) - secondAbs) : na
+
+    // Half-window consistency
+    bestCorr_half :=
+         bestLag == LAG1 ? ta.correlation(stressA_pct[LAG1], vnx_ret_clip, LEN_HALF) :
+         bestLag == LAG2 ? ta.correlation(stressA_pct[LAG2], vnx_ret_clip, LEN_HALF) :
+                           ta.correlation(stressA_pct[LAG3], vnx_ret_clip, LEN_HALF)
+
+    half_ok := not na(bestCorr) and not na(bestCorr_half) and (math.sign(bestCorr) == math.sign(bestCorr_half)) and (math.abs(bestCorr_half) >= R_HALF_MIN)
 else
-    if not show_line_labels or not show_yields
-        lb2  := f_setLabel(lb2,  bar_index, na, "", col2)
-        lb5  := f_setLabel(lb5,  bar_index, na, "", col5)
-        lb10 := f_setLabel(lb10, bar_index, na, "", col10)
-        lb1  := f_setLabel(lb1,  bar_index, na, "", col1)
-        lb3  := f_setLabel(lb3,  bar_index, na, "", col3)
-        lb7  := f_setLabel(lb7,  bar_index, na, "", col7)
-        lbIB := f_setLabel(lbIB, bar_index, na, "", colIB)
-        lbPR := f_setLabel(lbPR, bar_index, na, "", colPR)
+    half_ok := false
+
+float t_best = f_t_from_df(bestCorr, df_corr)
+
+// BestLag accept/reject (strict)
+bool best_accept = ready and persist_on and half_ok and
+     (not na(margin) and margin >= MARGIN_MIN) and
+     (not na(bestCorr) and math.abs(bestCorr) >= R_ACCEPT) and
+     (not na(t_best) and math.abs(t_best) >= T_CRIT)
+
+// BestLag stability (% unchanged) over LEN_STAB (use masked bestLag)
+float eff_stab = f_count(not na(bestLag), LEN_STAB)
+float chg_stab = f_count(not na(bestLag) and (bestLag != bestLag[1]), LEN_STAB)
+float stab_pct = eff_stab > 0 ? 100.0 * (1.0 - chg_stab / eff_stab) : na
 
 //======================================================
-// 8) RESEARCH CORE (EffN + Regime Filter + BestLag + Stability)
-//======================================================
-
-// Robust returns (winsorized)
-ret_mean = ta.sma(vnx_ret_d, len_research)
-ret_sd   = ta.stdev(vnx_ret_d, len_research)
-ret_up   = ret_mean + ret_clip_mult * ret_sd
-ret_dn   = ret_mean - ret_clip_mult * ret_sd
-
-vnx_ret_clip = vnx_ret_d
-if not na(vnx_ret_d) and not na(ret_sd) and ret_sd > 0
-    vnx_ret_clip := math.max(ret_dn, math.min(ret_up, vnx_ret_d))
-
-vnx_ret_used = use_ret_clip ? vnx_ret_clip : vnx_ret_d
-
-// Lags
-maxLag = math.max(lag1, math.max(lag2, lag3))
-stress_l1  = macro_stress[lag1]
-stress_l2  = macro_stress[lag2]
-stress_l3  = macro_stress[lag3]
-stressA_l1 = stress_adj[lag1]
-stressA_l2 = stress_adj[lag2]
-stressA_l3 = stress_adj[lag3]
-
-// Base gates
-tf_ok = not require_daily or timeframe.isdaily
-needBars = len_research + maxLag + 10
-enoughBars = bar_index >= needBars
-okR_base = show_research and vnx_ok and tf_ok and enoughBars
-
-// Effective sample size (ALL + OKQ)
-valid_all = okR_base and not na(macro_stress) and not na(vnx_ret_used)
-n_eff_all = f_count(valid_all, len_research)
-ratio_all = n_eff_all / len_research
-ready_all = okR_base and (ratio_all >= min_eff_ratio)
-
-// OKQ gating
-okq = quality_label != "LOWQ"
-valid_okq = okR_base and okq and not na(macro_stress) and not na(vnx_ret_used)
-n_eff_okq = f_count(valid_okq, len_research)
-ratio_okq = n_eff_okq / len_research
-ready_okq = okR_base and (ratio_okq >= min_eff_ratio)
-
-// Regime-conditioned filter
-cond_reg =
-     reg_filter == "None"        ? true :
-     reg_filter == "YC4"         ? (yc_code == "YC4") :
-     reg_filter == "YC3"         ? (yc_code == "YC3") :
-     reg_filter == "YC2"         ? (yc_code == "YC2") :
-     reg_filter == "YC1"         ? (yc_code == "YC1") :
-     reg_filter == "INVERTED"    ? (slope <= 0) :
-     reg_filter == "STRESS_HIGH" ? (macro_stress >= 70) :
-     reg_filter == "STRESS_LOW"  ? (macro_stress <= 40) :
-     reg_filter == "OKQ_ONLY"    ? okq : true
-
-stress_regf  = (cond_reg ? macro_stress : na)
-stressA_regf = (cond_reg ? stress_adj   : na)
-ret_regf     = (cond_reg ? vnx_ret_used : na)
-
-valid_reg = okR_base and cond_reg and not na(macro_stress) and not na(vnx_ret_used)
-n_eff_reg = f_count(valid_reg, len_research)
-ratio_reg = n_eff_reg / len_research
-ready_reg = okR_base and (ratio_reg >= min_eff_ratio)
-
-// ---- ALL: Pearson t0
-corr_raw_all = ta.correlation(macro_stress, vnx_ret_used, len_research)
-var_raw_all  = f_var(macro_stress, len_research)
-cov_raw_all  = f_cov(macro_stress, vnx_ret_used, len_research)
-beta_raw_all = (not na(var_raw_all) and var_raw_all > 0) ? (cov_raw_all / var_raw_all) : na
-r2_raw_all   = not na(corr_raw_all) ? (corr_raw_all * corr_raw_all) : na
-
-corr_adj_all = ta.correlation(stress_adj, vnx_ret_used, len_research)
-var_adj_all  = f_var(stress_adj, len_research)
-cov_adj_all  = f_cov(stress_adj, vnx_ret_used, len_research)
-beta_adj_all = (not na(var_adj_all) and var_adj_all > 0) ? (cov_adj_all / var_adj_all) : na
-r2_adj_all   = not na(corr_adj_all) ? (corr_adj_all * corr_adj_all) : na
-
-// ---- ALL: lagged correlations (called every bar for consistency)
-corr_raw_l1_all = ta.correlation(stress_l1, vnx_ret_used, len_research)
-corr_raw_l2_all = ta.correlation(stress_l2, vnx_ret_used, len_research)
-corr_raw_l3_all = ta.correlation(stress_l3, vnx_ret_used, len_research)
-
-corr_adj_l1_all = ta.correlation(stressA_l1, vnx_ret_used, len_research)
-corr_adj_l2_all = ta.correlation(stressA_l2, vnx_ret_used, len_research)
-corr_adj_l3_all = ta.correlation(stressA_l3, vnx_ret_used, len_research)
-
-// ---- BestLag among {lag1,lag2,lag3}
-absr1 = math.abs(corr_raw_l1_all)
-absr2 = math.abs(corr_raw_l2_all)
-absr3 = math.abs(corr_raw_l3_all)
-bestLag_raw_all = absr1 >= absr2 and absr1 >= absr3 ? lag1 : (absr2 >= absr3 ? lag2 : lag3)
-bestCorr_raw_all = absr1 >= absr2 and absr1 >= absr3 ? corr_raw_l1_all : (absr2 >= absr3 ? corr_raw_l2_all : corr_raw_l3_all)
-
-absa1 = math.abs(corr_adj_l1_all)
-absa2 = math.abs(corr_adj_l2_all)
-absa3 = math.abs(corr_adj_l3_all)
-bestLag_adj_all = absa1 >= absa2 and absa1 >= absa3 ? lag1 : (absa2 >= absa3 ? lag2 : lag3)
-bestCorr_adj_all = absa1 >= absa2 and absa1 >= absa3 ? corr_adj_l1_all : (absa2 >= absa3 ? corr_adj_l2_all : corr_adj_l3_all)
-
-// ---- OKQ: masked series
-stress_okq  = okq ? macro_stress : na
-stressA_okq = okq ? stress_adj   : na
-ret_okq     = okq ? vnx_ret_used : na
-
-corr_okq_raw_all = ta.correlation(stress_okq,  ret_okq, len_research)
-var_okq_raw_all  = f_var(stress_okq, len_research)
-cov_okq_raw_all  = f_cov(stress_okq,  ret_okq, len_research)
-beta_okq_raw_all = (not na(var_okq_raw_all) and var_okq_raw_all > 0) ? (cov_okq_raw_all / var_okq_raw_all) : na
-r2_okq_raw_all   = not na(corr_okq_raw_all) ? (corr_okq_raw_all * corr_okq_raw_all) : na
-
-corr_okq_adj_all = ta.correlation(stressA_okq, ret_okq, len_research)
-var_okq_adj_all  = f_var(stressA_okq, len_research)
-cov_okq_adj_all  = f_cov(stressA_okq, ret_okq, len_research)
-beta_okq_adj_all = (not na(var_okq_adj_all) and var_okq_adj_all > 0) ? (cov_okq_adj_all / var_okq_adj_all) : na
-r2_okq_adj_all   = not na(corr_okq_adj_all) ? (corr_okq_adj_all * corr_okq_adj_all) : na
-
-// OKQ best-lag (masked lag series)
-stressA_okq_l1 = okq ? stressA_l1 : na
-stressA_okq_l2 = okq ? stressA_l2 : na
-stressA_okq_l3 = okq ? stressA_l3 : na
-corr_okq_adj_l1 = ta.correlation(stressA_okq_l1, ret_okq, len_research)
-corr_okq_adj_l2 = ta.correlation(stressA_okq_l2, ret_okq, len_research)
-corr_okq_adj_l3 = ta.correlation(stressA_okq_l3, ret_okq, len_research)
-
-abok1 = math.abs(corr_okq_adj_l1)
-abok2 = math.abs(corr_okq_adj_l2)
-abok3 = math.abs(corr_okq_adj_l3)
-bestLag_okq_adj = abok1 >= abok2 and abok1 >= abok3 ? lag1 : (abok2 >= abok3 ? lag2 : lag3)
-bestCorr_okq_adj_all = abok1 >= abok2 and abok1 >= abok3 ? corr_okq_adj_l1 : (abok2 >= abok3 ? corr_okq_adj_l2 : corr_okq_adj_l3)
-
-// ---- REGIME FILTER: masked
-corr_reg_raw_all = ta.correlation(stress_regf,  ret_regf, len_research)
-var_reg_raw_all  = f_var(stress_regf, len_research)
-cov_reg_raw_all  = f_cov(stress_regf,  ret_regf, len_research)
-beta_reg_raw_all = (not na(var_reg_raw_all) and var_reg_raw_all > 0) ? (cov_reg_raw_all / var_reg_raw_all) : na
-r2_reg_raw_all   = not na(corr_reg_raw_all) ? (corr_reg_raw_all * corr_reg_raw_all) : na
-
-corr_reg_adj_all = ta.correlation(stressA_regf, ret_regf, len_research)
-var_reg_adj_all  = f_var(stressA_regf, len_research)
-cov_reg_adj_all  = f_cov(stressA_regf, ret_regf, len_research)
-beta_reg_adj_all = (not na(var_reg_adj_all) and var_reg_adj_all > 0) ? (cov_reg_adj_all / var_reg_adj_all) : na
-r2_reg_adj_all   = not na(corr_reg_adj_all) ? (corr_reg_adj_all * corr_reg_adj_all) : na
-
-// REG best-lag (masked)
-stressA_reg_l1 = cond_reg ? stressA_l1 : na
-stressA_reg_l2 = cond_reg ? stressA_l2 : na
-stressA_reg_l3 = cond_reg ? stressA_l3 : na
-corr_reg_adj_l1 = ta.correlation(stressA_reg_l1, ret_regf, len_research)
-corr_reg_adj_l2 = ta.correlation(stressA_reg_l2, ret_regf, len_research)
-corr_reg_adj_l3 = ta.correlation(stressA_reg_l3, ret_regf, len_research)
-
-abr1 = math.abs(corr_reg_adj_l1)
-abr2 = math.abs(corr_reg_adj_l2)
-abr3 = math.abs(corr_reg_adj_l3)
-bestLag_reg_adj = abr1 >= abr2 and abr1 >= abr3 ? lag1 : (abr2 >= abr3 ? lag2 : lag3)
-bestCorr_reg_adj_all = abr1 >= abr2 and abr1 >= abr3 ? corr_reg_adj_l1 : (abr2 >= abr3 ? corr_reg_adj_l2 : corr_reg_adj_l3)
-
-// ---- BestLag stability (% of bars WITHOUT change) in last window (v1.6.9)
-eff_stab_all = f_count(ready_all, len_lag_stab)
-chg_raw_all  = f_count(ready_all and (bestLag_raw_all != bestLag_raw_all[1]), len_lag_stab)
-chg_adj_all  = f_count(ready_all and (bestLag_adj_all != bestLag_adj_all[1]), len_lag_stab)
-stab_raw_all = eff_stab_all > 0 ? 100.0 * (1.0 - chg_raw_all / eff_stab_all) : na
-stab_adj_all = eff_stab_all > 0 ? 100.0 * (1.0 - chg_adj_all / eff_stab_all) : na
-
-eff_stab_okq = f_count(ready_okq, len_lag_stab)
-chg_okq_adj  = f_count(ready_okq and (bestLag_okq_adj != bestLag_okq_adj[1]), len_lag_stab)
-stab_okq_adj = eff_stab_okq > 0 ? 100.0 * (1.0 - chg_okq_adj / eff_stab_okq) : na
-
-eff_stab_reg = f_count(ready_reg, len_lag_stab)
-chg_reg_adj  = f_count(ready_reg and (bestLag_reg_adj != bestLag_reg_adj[1]), len_lag_stab)
-stab_reg_adj = eff_stab_reg > 0 ? 100.0 * (1.0 - chg_reg_adj / eff_stab_reg) : na
-
-// ---- Display masks (avoid ternary around correlation calls)
-corr_raw  = ready_all ? corr_raw_all : na
-beta_raw  = ready_all ? beta_raw_all : na
-r2_raw    = ready_all ? r2_raw_all   : na
-corr_adj  = ready_all ? corr_adj_all : na
-beta_adj  = ready_all ? beta_adj_all : na
-r2_adj    = ready_all ? r2_adj_all   : na
-bestCorr_raw = (ready_all and use_lags) ? bestCorr_raw_all : na
-bestCorr_adj = (ready_all and use_lags) ? bestCorr_adj_all : na
-
-corr_okq_raw = ready_okq ? corr_okq_raw_all : na
-beta_okq_raw = ready_okq ? beta_okq_raw_all : na
-r2_okq_raw   = ready_okq ? r2_okq_raw_all   : na
-corr_okq_adj = ready_okq ? corr_okq_adj_all : na
-beta_okq_adj = ready_okq ? beta_okq_adj_all : na
-r2_okq_adj   = ready_okq ? r2_okq_adj_all   : na
-bestCorr_okq = (ready_okq and use_lags) ? bestCorr_okq_adj_all : na
-
-corr_reg_raw = ready_reg ? corr_reg_raw_all : na
-beta_reg_raw = ready_reg ? beta_reg_raw_all : na
-r2_reg_raw   = ready_reg ? r2_reg_raw_all   : na
-corr_reg_adj = ready_reg ? corr_reg_adj_all : na
-beta_reg_adj = ready_reg ? beta_reg_adj_all : na
-r2_reg_adj   = ready_reg ? r2_reg_adj_all   : na
-bestCorr_reg = (ready_reg and use_lags) ? bestCorr_reg_adj_all : na
-
-//======================================================
-// 9) TABLES
+// 9) TABLES (ONLY UPDATE ON LAST BAR)
 //======================================================
 var table t1 = na
 var table t2 = na
@@ -663,7 +424,7 @@ if barstate.islast
         if na(t1)
             t1 := table.new(position.top_left, 4, 9, frame_width=2, frame_color=frame_col)
 
-        f_cell(t1, 0, 0, "P1 | SHAPE DASHBOARD", bg_title, text.align_left, size.small)
+        f_cell(t1, 0, 0, "P1 | SHAPE (STRICT DEFAULTS)", bg_title, text.align_left, size.small)
         f_cell(t1, 1, 0, "", bg_title, text.align_left, size.small)
         f_cell(t1, 2, 0, "", bg_title, text.align_left, size.small)
         f_cell(t1, 3, 0, "", bg_title, text.align_left, size.small)
@@ -675,35 +436,35 @@ if barstate.islast
 
         f_cell(t1, 0, 2, "LEVEL", bg_a, text.align_left, size.tiny)
         f_cell(t1, 1, 2, f_num(level, "#.2"), bg_a, text.align_right, size.tiny)
-        f_cell(t1, 2, 2, f_num(level_pct, "#.0") + "%", bg_a, text.align_right, size.tiny)
-        f_cell(t1, 3, 2, level_reg, f_bg(level_reg), text.align_left, size.tiny)
+        f_cell(t1, 2, 2, f_num(level_pct, "#.1") + "%", bg_a, text.align_right, size.tiny)
+        f_cell(t1, 3, 2, level_reg, f_bg_tag(level_reg), text.align_left, size.tiny)
 
         f_cell(t1, 0, 3, "SLOPE(10-2)", bg_b, text.align_left, size.tiny)
         f_cell(t1, 1, 3, f_num(slope, "#.2"), bg_b, text.align_right, size.tiny)
-        f_cell(t1, 2, 3, f_num(slope_pct, "#.0") + "%", bg_b, text.align_right, size.tiny)
-        f_cell(t1, 3, 3, slope_reg, f_bg(slope_reg), text.align_left, size.tiny)
+        f_cell(t1, 2, 3, f_num(slope_pct, "#.1") + "%", bg_b, text.align_right, size.tiny)
+        f_cell(t1, 3, 3, slope_reg, f_bg_tag(slope_reg), text.align_left, size.tiny)
 
-        f_cell(t1, 0, 4, "CURVE(2-5-10)", bg_a, text.align_left, size.tiny)
-        f_cell(t1, 1, 4, f_num(curve, "#.2"), bg_a, text.align_right, size.tiny)
-        f_cell(t1, 2, 4, f_num(curve_pct, "#.0") + "%", bg_a, text.align_right, size.tiny)
-        f_cell(t1, 3, 4, "BELLY", bg_a, text.align_left, size.tiny)
+        f_cell(t1, 0, 4, "YC REGIME", bg_a, text.align_left, size.tiny)
+        f_cell(t1, 1, 4, yc_code, f_bg_tag(yc_code), text.align_right, size.tiny)
+        f_cell(t1, 2, 4, "", bg_a, text.align_right, size.tiny)
+        f_cell(t1, 3, 4, yc_label, bg_a, text.align_left, size.tiny)
 
-        f_cell(t1, 0, 5, "YC REGIME", bg_b, text.align_left, size.tiny)
-        f_cell(t1, 1, 5, yc_code, f_bg(yc_code), text.align_right, size.tiny)
-        f_cell(t1, 2, 5, "", bg_b, text.align_right, size.tiny)
-        f_cell(t1, 3, 5, yc_label, bg_b, text.align_left, size.tiny)
+        f_cell(t1, 0, 5, "STRESS PCTL (raw/adj)", bg_b, text.align_left, size.tiny)
+        f_cell(t1, 1, 5, f_num(stress_pct, "#.1"), f_bg_tag(stress_reg), text.align_right, size.tiny)
+        f_cell(t1, 2, 5, f_num(stressA_pct,"#.1"), f_bg_tag(stress_reg), text.align_right, size.tiny)
+        f_cell(t1, 3, 5, stress_reg, f_bg_tag(stress_reg), text.align_left, size.tiny)
 
-        f_cell(t1, 0, 6, "STRESS (raw/adj)", bg_a, text.align_left, size.tiny)
-        f_cell(t1, 1, 6, f_num(macro_stress, "#.0"), f_bg(stress_reg), text.align_right, size.tiny)
-        f_cell(t1, 2, 6, f_num(stress_adj, "#.0"), f_bg(stress_adj_reg), text.align_right, size.tiny)
-        f_cell(t1, 3, 6, "QUAL " + quality_label, f_bg(quality_label), text.align_left, size.tiny)
+        f_cell(t1, 0, 6, "QUALITY / DATAQ", bg_a, text.align_left, size.tiny)
+        f_cell(t1, 1, 6, quality_label, f_bg_tag(quality_label), text.align_right, size.tiny)
+        f_cell(t1, 2, 6, dataq_label, f_bg_tag(dataq_label), text.align_right, size.tiny)
+        f_cell(t1, 3, 6, "cov " + f_num(cov_core * 100.0, "#.1") + "%", bg_a, text.align_left, size.tiny)
 
         f_cell(t1, 0, 7, "RATES", bg_b, text.align_left, size.tiny)
-        f_cell(t1, 1, 7, "VNINBR " + f_num(interbank, "#.2"), bg_b, text.align_left, size.tiny)
-        f_cell(t1, 2, 7, "VNINTR " + f_num(policy, "#.2"), bg_b, text.align_left, size.tiny)
-        f_cell(t1, 3, 7, "FOCUS " + move_focus, bg_b, text.align_left, size.tiny)
+        f_cell(t1, 1, 7, "IB " + f_num(ib, "#.2"), bg_b, text.align_left, size.tiny)
+        f_cell(t1, 2, 7, "PR " + f_num(pr, "#.2"), bg_b, text.align_left, size.tiny)
+        f_cell(t1, 3, 7, dist_label, f_bg_tag(dist_label), text.align_left, size.tiny)
 
-        msg = quality_label == "LOWQ" ? "MESSAGE: LOWQ -> avoid strong conclusion." : "MESSAGE: " + yc_code + " | " + stress_reg
+        msg = (quality_label == "LOWQ" or dataq_label == "DATAQ LOW") ? "MESSAGE: LOW QUALITY -> avoid strong inference." : "MESSAGE: STRICT defaults; use P3 for research."
         f_cell(t1, 0, 8, msg, bg_title, text.align_left, size.small)
         f_cell(t1, 1, 8, "", bg_title, text.align_left, size.small)
         f_cell(t1, 2, 8, "", bg_title, text.align_left, size.small)
@@ -718,11 +479,11 @@ if barstate.islast
         if na(t2)
             t2 := table.new(position.top_left, 7, 7, frame_width=2, frame_color=frame_col)
 
-        f_cell(t2, 0, 0, "P2 | GRID (state + z + move)", bg_title, text.align_left, size.small)
+        f_cell(t2, 0, 0, "P2 | GRID (Z-state + structure)", bg_title, text.align_left, size.small)
         for i = 1 to 6
             f_cell(t2, i, 0, "", bg_title, text.align_left, size.small)
 
-        f_cell(t2, 0, 1, "METRIC", bg_head, text.align_left, size.tiny)
+        f_cell(t2, 0, 1, "TENOR", bg_head, text.align_left, size.tiny)
         f_cell(t2, 1, 1, "1Y", bg_head, text.align_right, size.tiny)
         f_cell(t2, 2, 1, "2Y", bg_head, text.align_right, size.tiny)
         f_cell(t2, 3, 1, "3Y", bg_head, text.align_right, size.tiny)
@@ -730,31 +491,23 @@ if barstate.islast
         f_cell(t2, 5, 1, "7Y", bg_head, text.align_right, size.tiny)
         f_cell(t2, 6, 1, "10Y", bg_head, text.align_right, size.tiny)
 
-        f_cell(t2, 0, 2, "Z STATE", bg_a, text.align_left, size.tiny)
-        f_cell(t2, 1, 2, f_bucket_z(y1_z),  f_bg(f_bucket_z(y1_z)),  text.align_right, size.tiny)
-        f_cell(t2, 2, 2, f_bucket_z(y2_z),  f_bg(f_bucket_z(y2_z)),  text.align_right, size.tiny)
-        f_cell(t2, 3, 2, f_bucket_z(y3_z),  f_bg(f_bucket_z(y3_z)),  text.align_right, size.tiny)
-        f_cell(t2, 4, 2, f_bucket_z(y5_z),  f_bg(f_bucket_z(y5_z)),  text.align_right, size.tiny)
-        f_cell(t2, 5, 2, f_bucket_z(y7_z),  f_bg(f_bucket_z(y7_z)),  text.align_right, size.tiny)
-        f_cell(t2, 6, 2, f_bucket_z(y10_z), f_bg(f_bucket_z(y10_z)), text.align_right, size.tiny)
+        f_cell(t2, 0, 2, "Z", bg_a, text.align_left, size.tiny)
+        f_cell(t2, 1, 2, f_num(y1_z, "#.2"), bg_a, text.align_right, size.tiny)
+        f_cell(t2, 2, 2, f_num(y2_z, "#.2"), bg_a, text.align_right, size.tiny)
+        f_cell(t2, 3, 2, f_num(y3_z, "#.2"), bg_a, text.align_right, size.tiny)
+        f_cell(t2, 4, 2, f_num(y5_z, "#.2"), bg_a, text.align_right, size.tiny)
+        f_cell(t2, 5, 2, f_num(y7_z, "#.2"), bg_a, text.align_right, size.tiny)
+        f_cell(t2, 6, 2, f_num(y10_z,"#.2"), bg_a, text.align_right, size.tiny)
 
-        f_cell(t2, 0, 3, "MOVE", bg_b, text.align_left, size.tiny)
-        f_cell(t2, 1, 3, f_arrow(chg1),  bg_b, text.align_right, size.tiny)
-        f_cell(t2, 2, 3, f_arrow(chg2),  bg_b, text.align_right, size.tiny)
-        f_cell(t2, 3, 3, f_arrow(chg3),  bg_b, text.align_right, size.tiny)
-        f_cell(t2, 4, 3, f_arrow(chg5),  bg_b, text.align_right, size.tiny)
-        f_cell(t2, 5, 3, f_arrow(chg7),  bg_b, text.align_right, size.tiny)
-        f_cell(t2, 6, 3, f_arrow(chg10), bg_b, text.align_right, size.tiny)
+        f_cell(t2, 0, 3, "STRUCT", bg_b, text.align_left, size.tiny)
+        f_cell(t2, 1, 3, dist_label, f_bg_tag(dist_label), text.align_right, size.tiny)
+        f_cell(t2, 2, 3, "QUAL", bg_b, text.align_right, size.tiny)
+        f_cell(t2, 3, 3, quality_label, f_bg_tag(quality_label), text.align_right, size.tiny)
+        f_cell(t2, 4, 3, "DATAQ", bg_b, text.align_right, size.tiny)
+        f_cell(t2, 5, 3, dataq_label, f_bg_tag(dataq_label), text.align_right, size.tiny)
+        f_cell(t2, 6, 3, "", bg_b, text.align_right, size.tiny)
 
-        f_cell(t2, 0, 4, "STRUCT", bg_a, text.align_left, size.tiny)
-        f_cell(t2, 1, 4, dist_label, f_bg(dist_label), text.align_right, size.tiny)
-        f_cell(t2, 2, 4, "QUAL", bg_a, text.align_right, size.tiny)
-        f_cell(t2, 3, 4, quality_label, f_bg(quality_label), text.align_right, size.tiny)
-        f_cell(t2, 4, 4, "FOCUS", bg_a, text.align_right, size.tiny)
-        f_cell(t2, 5, 4, move_focus, bg_a, text.align_right, size.tiny)
-        f_cell(t2, 6, 4, "", bg_a, text.align_right, size.tiny)
-
-        take = "TAKEAWAY: " + yc_code + " | " + stress_reg + " | " + dist_label + " | " + move_focus
+        take = "TAKEAWAY: " + yc_code + " | " + stress_reg + " | " + quality_label + " | " + dataq_label
         f_cell(t2, 0, 6, take, bg_title, text.align_left, size.small)
         for i = 1 to 6
             f_cell(t2, i, 6, "", bg_title, text.align_left, size.small)
@@ -763,146 +516,99 @@ if barstate.islast
             table.delete(t2)
             t2 := na
 
-    // -------- Panel 3: Diagnostics + Research (v1.6.9)
+    // -------- Panel 3: Research (STRICT)
     if show_p3
         if na(t3)
-            t3 := table.new(position.top_right, 4, 24, frame_width=2, frame_color=frame_col)
+            t3 := table.new(position.top_right, 4, 22, frame_width=2, frame_color=frame_col)
 
-        f_cell(t3, 0, 0, "P3 | DIAGNOSTICS + RESEARCH (v1.6.9)", bg_title, text.align_left, size.small)
+        f_cell(t3, 0, 0, "P3 | RESEARCH (STRICT: AR-AdjN + Partial Corr + BestLag discipline)", bg_title, text.align_left, size.small)
         f_cell(t3, 1, 0, "", bg_title, text.align_left, size.small)
         f_cell(t3, 2, 0, "", bg_title, text.align_left, size.small)
         f_cell(t3, 3, 0, "", bg_title, text.align_left, size.small)
 
-        f_cell(t3, 0, 1, "STRESS (raw/adj)", bg_a, text.align_left, size.tiny)
-        f_cell(t3, 1, 1, f_num(macro_stress, "#.0"), f_bg(stress_reg), text.align_right, size.tiny)
-        f_cell(t3, 2, 1, f_num(stress_adj, "#.0"), f_bg(stress_adj_reg), text.align_right, size.tiny)
-        f_cell(t3, 3, 1, yc_code, f_bg(yc_code), text.align_right, size.tiny)
+        f_cell(t3, 0, 1, "STRESS PCTL (raw/adj)", bg_a, text.align_left, size.tiny)
+        f_cell(t3, 1, 1, f_num(stress_pct, "#.1"), f_bg_tag(stress_reg), text.align_right, size.tiny)
+        f_cell(t3, 2, 1, f_num(stressA_pct,"#.1"), f_bg_tag(stress_reg), text.align_right, size.tiny)
+        f_cell(t3, 3, 1, yc_code + " | " + quality_label, f_bg_tag(yc_code), text.align_right, size.tiny)
 
-        f_cell(t3, 0, 2, "MOM (L/S)", bg_b, text.align_left, size.tiny)
-        f_cell(t3, 1, 2, f_arrow(level_m), bg_b, text.align_right, size.tiny)
-        f_cell(t3, 2, 2, f_arrow(slope_m), bg_b, text.align_right, size.tiny)
-        f_cell(t3, 3, 2, quality_label, f_bg(quality_label), text.align_right, size.tiny)
+        ready_txt = ready ? "READY" : (tf_ok ? "WAIT" : "USE 1D")
+        f_cell(t3, 0, 2, "SAMPLE", bg_b, text.align_left, size.tiny)
+        f_cell(t3, 1, 2, "N " + f_num(n_eff, "#.0"), bg_b, text.align_right, size.tiny)
+        f_cell(t3, 2, 2, "R " + f_num(ratio*100.0, "#.1") + "%", bg_b, text.align_right, size.tiny)
+        f_cell(t3, 3, 2, ready_txt, ready ? color.new(color.lime, 75) : color.new(color.orange, 70), text.align_right, size.tiny)
 
-        f_cell(t3, 0, 3, "Z (L/S/C)", bg_a, text.align_left, size.tiny)
-        f_cell(t3, 1, 3, f_num(level_z, "#.2"), bg_a, text.align_right, size.tiny)
-        f_cell(t3, 2, 3, f_num(slope_z, "#.2"), bg_a, text.align_right, size.tiny)
-        f_cell(t3, 3, 3, f_num(curve_z, "#.2"), bg_a, text.align_right, size.tiny)
+        f_cell(t3, 0, 3, "PERSISTENCE (AR)", bg_a, text.align_left, size.tiny)
+        f_cell(t3, 1, 3, "AdjN " + f_num(n_eff_ar, "#.0"), bg_a, text.align_right, size.tiny)
+        f_cell(t3, 2, 3, "rhoS " + f_num(rhoS, "#.2"), bg_a, text.align_right, size.tiny)
+        f_cell(t3, 3, 3, (persist_on ? "ON" : "OFF") + " | cdi " + f_num(cdi, "#.2"), persist_on ? color.new(color.lime, 80) : color.new(color.red, 75), text.align_right, size.tiny)
 
-        // Sample adequacy row (EffN)
-        ready_txt = ready_all ? "READY" : (okR_base ? "WAIT" : "OFF")
-        f_cell(t3, 0, 4, "VNINDEX | SAMPLE", bg_b, text.align_left, size.tiny)
-        f_cell(t3, 1, 4, "N " + f_num(n_eff_all, "#.0"), bg_b, text.align_right, size.tiny)
-        f_cell(t3, 2, 4, "R " + f_num(ratio_all * 100.0, "#.0") + "%", bg_b, text.align_right, size.tiny)
-        f_cell(t3, 3, 4, ready_txt, ready_all ? color.new(color.lime, 75) : color.new(color.orange, 70), text.align_right, size.tiny)
-
-        // Header ALL
-        f_cell(t3, 0, 5, "RESEARCH (ALL)", bg_head, text.align_left, size.tiny)
+        f_cell(t3, 0, 5, "ALL (Exploratory; not causal)", bg_head, text.align_left, size.tiny)
         f_cell(t3, 1, 5, "Corr", bg_head, text.align_right, size.tiny)
-        f_cell(t3, 2, 5, "Beta", bg_head, text.align_right, size.tiny)
+        f_cell(t3, 2, 5, "t(AR)", bg_head, text.align_right, size.tiny)
         f_cell(t3, 3, 5, "R2",   bg_head, text.align_right, size.tiny)
 
         f_cell(t3, 0, 6, "RAW t0", bg_a, text.align_left, size.tiny)
-        f_cell(t3, 1, 6, f_num(corr_raw, "#.3"), f_corrBg(corr_raw), text.align_right, size.tiny)
-        f_cell(t3, 2, 6, f_num(beta_raw, "#.5"), bg_a, text.align_right, size.tiny)
-        f_cell(t3, 3, 6, f_num(r2_raw, "#.2"),   bg_a, text.align_right, size.tiny)
+        f_cell(t3, 1, 6, ready ? f_num(corr_raw, "#.3") : "NA", f_corrBg(corr_raw), text.align_right, size.tiny)
+        f_cell(t3, 2, 6, "", bg_a, text.align_right, size.tiny)
+        f_cell(t3, 3, 6, "", bg_a, text.align_right, size.tiny)
 
-        f_cell(t3, 0, 7, "ADJ t0", bg_b, text.align_left, size.tiny)
-        f_cell(t3, 1, 7, f_num(corr_adj, "#.3"), f_corrBg(corr_adj), text.align_right, size.tiny)
-        f_cell(t3, 2, 7, f_num(beta_adj, "#.5"), bg_b, text.align_right, size.tiny)
-        f_cell(t3, 3, 7, f_num(r2_adj, "#.2"),   bg_b, text.align_right, size.tiny)
+        f_cell(t3, 0, 7, "ADJ t0 (STRICT)", bg_b, text.align_left, size.tiny)
+        f_cell(t3, 1, 7, ready ? f_num(corr_adj, "#.3") : "NA", f_corrBg(corr_adj), text.align_right, size.tiny)
+        f_cell(t3, 2, 7, ready ? f_num(t_adj_ar, "#.2") : "NA", bg_b, text.align_right, size.tiny)
+        f_cell(t3, 3, 7, ready ? f_num(r2_adj, "#.2")   : "NA", bg_b, text.align_right, size.tiny)
 
-        f_cell(t3, 0, 8, "BESTLAG (RAW/ADJ)", bg_a, text.align_left, size.tiny)
-        best_txt = "L" + str.tostring(bestLag_raw_all) + ":" + f_num(bestCorr_raw, "#.3") + " | L" + str.tostring(bestLag_adj_all) + ":" + f_num(bestCorr_adj, "#.3")
-        f_cell(t3, 1, 8, best_txt, bg_a, text.align_right, size.tiny)
-        f_cell(t3, 2, 8, "", bg_a, text.align_right, size.tiny)
+        f_cell(t3, 0, 8, "PARTIAL (ctr=avg IB/PR)", bg_a, text.align_left, size.tiny)
+        f_cell(t3, 1, 8, ready ? f_num(pcorr, "#.3") : "NA", f_corrBg(pcorr), text.align_right, size.tiny)
+        f_cell(t3, 2, 8, ready ? f_num(t_pcorr_ar, "#.2") : "NA", bg_a, text.align_right, size.tiny)
         f_cell(t3, 3, 8, "", bg_a, text.align_right, size.tiny)
 
-        f_cell(t3, 0, 9, "LAG STABILITY (" + str.tostring(len_lag_stab) + "d)", bg_b, text.align_left, size.tiny)
-        stab_txt = "RAW " + f_num(stab_raw_all, "#.0") + "% | ADJ " + f_num(stab_adj_all, "#.0") + "%"
-        f_cell(t3, 1, 9, stab_txt, bg_b, text.align_right, size.tiny)
-        f_cell(t3, 2, 9, "", bg_b, text.align_right, size.tiny)
-        f_cell(t3, 3, 9, "", bg_b, text.align_right, size.tiny)
+        f_cell(t3, 0, 10, "LAGS (AdjPCTL stress)", bg_head, text.align_left, size.tiny)
+        f_cell(t3, 1, 10, "L1", bg_head, text.align_right, size.tiny)
+        f_cell(t3, 2, 10, "L5", bg_head, text.align_right, size.tiny)
+        f_cell(t3, 3, 10, "L20", bg_head, text.align_right, size.tiny)
 
-        // Header OKQ
-        f_cell(t3, 0, 10, "RESEARCH (OKQ)", bg_head, text.align_left, size.tiny)
-        f_cell(t3, 1, 10, "Corr", bg_head, text.align_right, size.tiny)
-        f_cell(t3, 2, 10, "Beta", bg_head, text.align_right, size.tiny)
-        f_cell(t3, 3, 10, "R2",   bg_head, text.align_right, size.tiny)
+        f_cell(t3, 0, 11, "Corr", bg_a, text.align_left, size.tiny)
+        f_cell(t3, 1, 11, ready ? f_num(rL1,  "#.3") : "NA", f_corrBg(rL1),  text.align_right, size.tiny)
+        f_cell(t3, 2, 11, ready ? f_num(rL5,  "#.3") : "NA", f_corrBg(rL5),  text.align_right, size.tiny)
+        f_cell(t3, 3, 11, ready ? f_num(rL20, "#.3") : "NA", f_corrBg(rL20), text.align_right, size.tiny)
 
-        f_cell(t3, 0, 11, "RAW t0", bg_b, text.align_left, size.tiny)
-        f_cell(t3, 1, 11, f_num(corr_okq_raw, "#.3"), f_corrBg(corr_okq_raw), text.align_right, size.tiny)
-        f_cell(t3, 2, 11, f_num(beta_okq_raw, "#.5"), bg_b, text.align_right, size.tiny)
-        f_cell(t3, 3, 11, f_num(r2_okq_raw, "#.2"),   bg_b, text.align_right, size.tiny)
+        f_cell(t3, 0, 13, "BESTLAG (k=3 disciplined)", bg_head, text.align_left, size.tiny)
+        f_cell(t3, 1, 13, "Pick", bg_head, text.align_right, size.tiny)
+        f_cell(t3, 2, 13, "t", bg_head, text.align_right, size.tiny)
+        f_cell(t3, 3, 13, "Stab", bg_head, text.align_right, size.tiny)
 
-        f_cell(t3, 0, 12, "ADJ t0", bg_a, text.align_left, size.tiny)
-        f_cell(t3, 1, 12, f_num(corr_okq_adj, "#.3"), f_corrBg(corr_okq_adj), text.align_right, size.tiny)
-        f_cell(t3, 2, 12, f_num(beta_okq_adj, "#.5"), bg_a, text.align_right, size.tiny)
-        f_cell(t3, 3, 12, f_num(r2_okq_adj, "#.2"),   bg_a, text.align_right, size.tiny)
+        pick_txt = "L" + str.tostring(bestLag) + ":" + f_num(bestCorr, "#.3") + " m=" + f_num(margin, "#.2")
+        f_cell(t3, 0, 14, "Pick", bg_a, text.align_left, size.tiny)
+        f_cell(t3, 1, 14, ready ? pick_txt : "NA", bg_a, text.align_right, size.tiny)
+        f_cell(t3, 2, 14, ready ? f_num(t_best, "#.2") : "NA", bg_a, text.align_right, size.tiny)
+        f_cell(t3, 3, 14, ready ? f_num(stab_pct, "#.1") + "%" : "NA", bg_a, text.align_right, size.tiny)
 
-        f_cell(t3, 0, 13, "OKQ BESTLAG (ADJ)", bg_b, text.align_left, size.tiny)
-        f_cell(t3, 1, 13, "L" + str.tostring(bestLag_okq_adj) + ": " + f_num(bestCorr_okq, "#.3"), bg_b, text.align_right, size.tiny)
-        f_cell(t3, 2, 13, "N " + f_num(n_eff_okq, "#.0"), bg_b, text.align_right, size.tiny)
-        f_cell(t3, 3, 13, "R " + f_num(ratio_okq*100.0, "#.0") + "%", bg_b, text.align_right, size.tiny)
+        acc_txt = best_accept ? "ACCEPT" : "REJECT"
+        half_txt = half_ok ? "HalfOK Y" : "HalfOK N"
+        f_cell(t3, 0, 15, "Accept?", bg_b, text.align_left, size.tiny)
+        f_cell(t3, 1, 15, ready ? (acc_txt + " | " + half_txt) : "NA", best_accept ? color.new(color.lime, 80) : color.new(color.orange, 70), text.align_right, size.tiny)
+        f_cell(t3, 2, 15, "req |t|>=2.4", bg_b, text.align_right, size.tiny)
+        f_cell(t3, 3, 15, "req m>=0.05", bg_b, text.align_right, size.tiny)
 
-        f_cell(t3, 0, 14, "OKQ LAG STABILITY", bg_a, text.align_left, size.tiny)
-        f_cell(t3, 1, 14, f_num(stab_okq_adj, "#.0") + "%", bg_a, text.align_right, size.tiny)
-        f_cell(t3, 2, 14, "", bg_a, text.align_right, size.tiny)
-        f_cell(t3, 3, 14, "", bg_a, text.align_right, size.tiny)
+        note1 = "STRICT: percentiles; inference uses AR-AdjN; partial corr controls avg(IB,PR)."
+        note2 = "BestLag ACCEPT: margin>=0.05, |r|>=0.20, |t|>=2.4, consistent on half-window."
+        f_cell(t3, 0, 20, note1, bg_title, text.align_left, size.small)
+        f_cell(t3, 1, 20, "", bg_title, text.align_left, size.small)
+        f_cell(t3, 2, 20, "", bg_title, text.align_left, size.small)
+        f_cell(t3, 3, 20, "", bg_title, text.align_left, size.small)
 
-        // Header FILTER
-        f_cell(t3, 0, 15, "RESEARCH (FILTER)", bg_head, text.align_left, size.tiny)
-        f_cell(t3, 1, 15, reg_filter, bg_head, text.align_right, size.tiny)
-        f_cell(t3, 2, 15, "N " + f_num(n_eff_reg, "#.0"), bg_head, text.align_right, size.tiny)
-        f_cell(t3, 3, 15, "R " + f_num(ratio_reg*100.0, "#.0") + "%", bg_head, text.align_right, size.tiny)
-
-        f_cell(t3, 0, 16, "RAW t0", bg_a, text.align_left, size.tiny)
-        f_cell(t3, 1, 16, f_num(corr_reg_raw, "#.3"), f_corrBg(corr_reg_raw), text.align_right, size.tiny)
-        f_cell(t3, 2, 16, f_num(beta_reg_raw, "#.5"), bg_a, text.align_right, size.tiny)
-        f_cell(t3, 3, 16, f_num(r2_reg_raw, "#.2"),   bg_a, text.align_right, size.tiny)
-
-        f_cell(t3, 0, 17, "ADJ t0", bg_b, text.align_left, size.tiny)
-        f_cell(t3, 1, 17, f_num(corr_reg_adj, "#.3"), f_corrBg(corr_reg_adj), text.align_right, size.tiny)
-        f_cell(t3, 2, 17, f_num(beta_reg_adj, "#.5"), bg_b, text.align_right, size.tiny)
-        f_cell(t3, 3, 17, f_num(r2_reg_adj, "#.2"),   bg_b, text.align_right, size.tiny)
-
-        f_cell(t3, 0, 18, "REG BESTLAG (ADJ)", bg_a, text.align_left, size.tiny)
-        f_cell(t3, 1, 18, "L" + str.tostring(bestLag_reg_adj) + ": " + f_num(bestCorr_reg, "#.3"), bg_a, text.align_right, size.tiny)
-        f_cell(t3, 2, 18, ready_reg ? "READY" : "LOW N", ready_reg ? color.new(color.lime, 75) : color.new(color.orange, 70), text.align_right, size.tiny)
-        f_cell(t3, 3, 18, "", bg_a, text.align_right, size.tiny)
-
-        f_cell(t3, 0, 19, "REG LAG STABILITY", bg_b, text.align_left, size.tiny)
-        f_cell(t3, 1, 19, f_num(stab_reg_adj, "#.0") + "%", bg_b, text.align_right, size.tiny)
-        f_cell(t3, 2, 19, "", bg_b, text.align_right, size.tiny)
-        f_cell(t3, 3, 19, "", bg_b, text.align_right, size.tiny)
-
-        // Notes
-        note1 = use_lags ? "NOTE: BestLag among 3 fixed lags -> exploratory (multiple-testing risk)." : "NOTE: Lag search off."
-        f_cell(t3, 0, 22, note1, bg_title, text.align_left, size.small)
-        f_cell(t3, 1, 22, "", bg_title, text.align_left, size.small)
-        f_cell(t3, 2, 22, "", bg_title, text.align_left, size.small)
-        f_cell(t3, 3, 22, "", bg_title, text.align_left, size.small)
-
-        note2 = require_daily ? "TIP: Use 1D chart for clean interpretation." : "TIP: 1D chart recommended (you disabled require_daily)."
-        f_cell(t3, 0, 23, note2, bg_title, text.align_left, size.small)
-        f_cell(t3, 1, 23, "", bg_title, text.align_left, size.small)
-        f_cell(t3, 2, 23, "", bg_title, text.align_left, size.small)
-        f_cell(t3, 3, 23, "", bg_title, text.align_left, size.small)
+        f_cell(t3, 0, 21, note2, bg_title, text.align_left, size.small)
+        f_cell(t3, 1, 21, "", bg_title, text.align_left, size.small)
+        f_cell(t3, 2, 21, "", bg_title, text.align_left, size.small)
+        f_cell(t3, 3, 21, "", bg_title, text.align_left, size.small)
     else
         if not na(t3)
             table.delete(t3)
             t3 := na
 
 //======================================================
-// 10) EVENT TAGS
+// 10) EVENT TAGS (STRICT: percentile-based, throttled)
 //======================================================
-min_gap = event_density == "Low" ? 40 : event_density == "High" ? 8 : 20
-ok_confirm = event_only_D ? barstate.isconfirmed : true
-
-y_min_ev = ta.lowest(yc_min6, len_stats)
-y_max_ev = ta.highest(yc_max6, len_stats)
-y_rng_ev = y_max_ev - y_min_ev
-y_pad = (y_rng_ev > 0 ? y_rng_ev : 1.0) * (event_y_pad_pct / 100.0)
-
 f_evCol(t) =>
     color c = color.new(color.gray, 0)
     if t == "REG"
@@ -917,55 +623,61 @@ f_evCol(t) =>
         c := color.new(color.orange, 0)
     c
 
+y_min_ev = ta.lowest(yc_min6, LEN_STATS)
+y_max_ev = ta.highest(yc_max6, LEN_STATS)
+y_rng_ev = y_max_ev - y_min_ev
+y_pad = (y_rng_ev > 0 ? y_rng_ev : 1.0) * (EVENT_YPAD_PCT / 100.0)
+
 f_tag(string t, string txt, float y, bool up) =>
-    float yy = up ? (y + y_pad) : (y - y_pad)
-    label lb = label.new(bar_index + event_x_offset, yy, txt)
-    label.set_textcolor(lb, color.white)
-    label.set_color(lb, f_evCol(t))
-    label.set_size(lb, size.tiny)
-    label.set_style(lb, up ? label.style_label_down : label.style_label_up)
+    label lb = na
+    if not na(y)
+        float yy = up ? (y + y_pad) : (y - y_pad)
+        lb := label.new(bar_index + EVENT_XOFF, yy, txt)
+        label.set_textcolor(lb, color.white)
+        label.set_color(lb, f_evCol(t))
+        label.set_size(lb, size.tiny)
+        label.set_style(lb, up ? label.style_label_down : label.style_label_up)
     lb
 
 var int last_ev_bar = na
-can_tag = na(last_ev_bar) ? true : (bar_index - last_ev_bar >= min_gap)
+can_tag = na(last_ev_bar) ? true : (bar_index - last_ev_bar >= EVENT_MIN_GAP)
 
 yc_prev = yc_code[1]
 regime_change = (not na(yc_prev)) and (yc_code != yc_prev)
 
-stress_up = ta.crossover(macro_stress, 70)
-stress_dn = ta.crossunder(macro_stress, 40)
+stress_up = ta.crossover(stressA_pct, STRESS_HIGH_PCTL)
+stress_dn = ta.crossunder(stressA_pct, STRESS_LOW_PCTL)
 
 inv_now = slope <= 0
 inv_prev = slope[1] <= 0
 inv_start = inv_now and not inv_prev
 
-lq_now = quality_label == "LOWQ"
-lq_prev = quality_label[1] == "LOWQ"
+lq_now  = (quality_label == "LOWQ") or (dataq_label == "DATAQ LOW")
+lq_prev = (quality_label[1] == "LOWQ") or (dataq_label[1] == "DATAQ LOW")
 lq_start = lq_now and not lq_prev
 
-y_anchor = na(y10) ? level : y10
+float y_anchor = na(y10) ? level : y10
 
-if show_events and ok_confirm and can_tag
+if SHOW_EVENTS and tf_ok and can_tag and barstate.isconfirmed and not na(y_anchor)
     if regime_change
         f_tag("REG", "REG: " + yc_prev + " -> " + yc_code, y_anchor, true)
         last_ev_bar := bar_index
     else if stress_up
-        f_tag("SU", "STRESS UP: " + f_num(macro_stress, "#.0"), y_anchor, true)
+        f_tag("SU", "STRESS UP (PCTL): " + f_num(stressA_pct, "#.1"), y_anchor, true)
         last_ev_bar := bar_index
     else if stress_dn
-        f_tag("SD", "STRESS DN: " + f_num(macro_stress, "#.0"), y_anchor, false)
+        f_tag("SD", "STRESS DN (PCTL): " + f_num(stressA_pct, "#.1"), y_anchor, false)
         last_ev_bar := bar_index
     else if inv_start
-        f_tag("INV", "INVERT: Slope<=0", y_anchor, true)
+        f_tag("INV", "INVERT: slope<=0", y_anchor, true)
         last_ev_bar := bar_index
     else if lq_start
-        f_tag("LQ", "LOWQ: Noisy curve", y_anchor, false)
+        f_tag("LQ", "LOW QUALITY: " + quality_label + " / " + dataq_label, y_anchor, false)
         last_ev_bar := bar_index
 
 //======================================================
-// 11) ALERTS
+// 11) ALERTS (STRICT)
 //======================================================
-alertcondition(yc_code == "YC4" and quality_label != "LOWQ", "YC4 Tight (OK quality)", "YC4 tight regime with usable quality.")
+alertcondition(yc_code == "YC4" and quality_label != "LOWQ" and dataq_label != "DATAQ LOW", "YC4 Tight (STRICT OK)", "YC4 tight regime with acceptable quality/data.")
 alertcondition(slope <= 0, "Yield curve inverted", "Slope 10-2 <= 0.")
-alertcondition(macro_stress >= 70 and quality_label != "LOWQ", "Stress High (OK quality)", "Macro stress high with usable quality.")
-alertcondition(stress_adj >= 55 and quality_label != "LOWQ", "Stress_ADJ High (OK quality)", "Stress adjusted by quality is high with usable quality.")
+alertcondition(stressA_pct >= STRESS_HIGH_PCTL and quality_label != "LOWQ" and dataq_label != "DATAQ LOW", "Stress High (PCTL, STRICT OK)", "Stress percentile high with acceptable quality/data.")
