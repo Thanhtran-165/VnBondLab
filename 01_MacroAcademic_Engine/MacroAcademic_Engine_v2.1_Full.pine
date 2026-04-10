@@ -1,0 +1,943 @@
+//@version=5
+indicator("MacroAcademic - VN Economy Engine v2.1.0 (Interpretation Upgrade)",
+     shorttitle="MacroAcademic VN v2.1",
+     overlay=false,
+     max_labels_count=300,
+     max_lines_count=300,
+     max_bars_back=5000,
+     precision=4)
+
+// =====================================================================
+// A) USER CONTROLS
+// =====================================================================
+panel       = input.int(1, "Panel dang xem (1..8)", minval=1, maxval=8)
+displayMode = input.string("Compact", "Che do hien thi", options=["Full","Compact","Chi Bang"])
+tblPosOpt   = input.string("Top Right", "Vi tri bang", options=["Top Right","Top Left","Bottom Right","Bottom Left"])
+fontOpt     = input.string("Small", "Co chu bang", options=["Tiny","Small","Normal"])
+
+// =====================================================================
+// B) SYMBOLS
+// =====================================================================
+sym_infl  = input.symbol("ECONOMICS:VNIRYY",  "Lam phat YoY (Thang)", display=display.none)
+sym_pol   = input.symbol("ECONOMICS:VNINTR",  "Lai suat dieu hanh (Ngay)", display=display.none)
+sym_ib    = input.symbol("ECONOMICS:VNINBR",  "Lai suat lien ngan hang (Ngay)", display=display.none)
+sym_gdp   = input.symbol("ECONOMICS:VNGDPYY", "GDP YoY (Quy)", display=display.none)
+sym_ppi   = input.symbol("ECONOMICS:VNPPI",   "PPI (Quy)", display=display.none)
+sym_fx    = input.symbol("FX_IDC:USDVND",     "USDVND (Ngay)", display=display.none)
+sym_oil   = input.symbol("TVC:UKOIL",         "Brent proxy (Ngay)", display=display.none)
+sym_vn10y = input.symbol("TVC:VN10Y",         "VN 10Y", display=display.none)
+sym_vn02y = input.symbol("TVC:VN02Y",         "VN 2Y", display=display.none)
+
+// =====================================================================
+// C) LOCKED DEFAULTS
+// =====================================================================
+const string TF_M = "M"
+const string TF_Q = "3M"
+
+const bool  USE_DRIVERS     = true
+const bool  USE_YIELDCURVE  = true
+const bool  USE_EVALUATION  = true
+
+const int   INFL_TREND_LEN_M = 24
+const int   INFL_Z_LEN_M     = 60
+const float INFL_CLIP        = 2.5
+
+const float EWMA_LAMBDA      = 0.30
+const int   AR1_LEN_M        = 60
+const float W_TREND          = 0.40
+const float W_EWMA           = 0.30
+const float W_AR1            = 0.30
+
+const int   RREAL_EMA_LEN_M  = 12
+const int   RATE_Z_LEN_M     = 60
+const float RATE_CLIP        = 2.5
+
+const int   GDP_TREND_LEN_Q  = 12
+const int   GDP_Z_LEN_Q      = 40
+const float GDP_CLIP         = 2.5
+
+const int   DRV_Z_LEN_M      = 60
+const float DRV_CLIP         = 2.5
+const int   PPI_TREND_LEN_Q  = 12
+const int   PPI_Z_LEN_Q      = 40
+
+const float PI_TARGET        = 4.0
+const float R_STAR           = 1.0
+const float PHI_PI           = 0.5
+const float PHI_Y            = 0.5
+const int   POLICY_Z_LEN_M   = 60
+
+const float RW_INFL = 0.40
+const float RW_POL  = 0.30
+const float RW_GROW = 0.20
+const float RW_DRV  = 0.10
+
+const int   ARR_CAP   = 120
+const int   MIN_N_M   = 60
+const int   MIN_N_Q   = 16
+const int   MIN_N_EVL = 24
+
+// =====================================================================
+// D) TEXT
+// =====================================================================
+const string WD_PCTL_NAME   = "PCTL"
+const string WD_PCTL_LEGEND = "50=binh thuong | 80+=rat cao"
+const string WD_RISK_LEGEND = "B0 rat thap | B1 thap | B2 vua | B3 cao | B4 rat cao"
+
+const string WD_HDR_SUMMARY = "TOM TAT"
+const string WD_HDR_MAIN    = "CHI SO CHINH"
+const string WD_HDR_DO      = "NEN LAM"
+const string WD_HDR_WATCH   = "KHI NAO CHU Y"
+const string WD_HDR_DEBUG   = "DEBUG"
+const string WD_HDR_CONTRIB = "CONTRIBUTION"
+
+const string WD_COL_METRIC  = "Chi tieu"
+const string WD_COL_VALUE   = "Gia tri"
+const string WD_COL_PCTL    = "PCTL"
+const string WD_COL_MEANING = "Y nghia"
+
+const string WD_KXH         = "KHONG XEP HANG"
+const string WD_HINT_PCTL   = "Neu PCTL '-' thi can them lich su."
+const string WD_HINT_MULTI  = "1 instance = 1 panel."
+
+// =====================================================================
+// E) HELPERS
+// =====================================================================
+f_round(float x, int d) =>
+    float m = math.pow(10.0, d)
+    math.round(x * m) / m
+
+f_fmt(float x, int d) =>
+    string s = "-"
+    if not na(x)
+        s := str.tostring(f_round(x, d))
+    s
+
+f_fmt_pctl(float x) =>
+    na(x) ? "-" : str.tostring(int(math.round(x)))
+
+f_cov(float x, float y, int length) =>
+    float mx = ta.sma(x, length)
+    float my = ta.sma(y, length)
+    ta.sma((x - mx) * (y - my), length)
+
+f_var(float x, int length) =>
+    float mx = ta.sma(x, length)
+    ta.sma((x - mx) * (x - mx), length)
+
+f_mad_z(float src, int length) =>
+    float med   = ta.percentile_nearest_rank(src, length, 50)
+    float mad   = ta.percentile_nearest_rank(math.abs(src - med), length, 50)
+    float denom = 1.4826 * mad
+    float z = 0.0
+    if denom > 0
+        z := (src - med) / denom
+    z
+
+f_z(float src, int length, float clip_mult) =>
+    f_mad_z(src, length)
+
+f_arr_push_float(float[] arr, float val, int maxlen) =>
+    if not na(val)
+        array.push(arr, val)
+        if array.size(arr) > maxlen
+            array.shift(arr)
+
+f_arr_pctl(float[] arr, float val) =>
+    float p = na
+    int n = array.size(arr)
+    if n > 0 and not na(val)
+        int cnt = 0
+        for i = 0 to n - 1
+            float x = array.get(arr, i)
+            if not na(x) and x <= val
+                cnt += 1
+        p := 100.0 * cnt / n
+    p
+
+f_pctl_bg_dir(float p, bool highIsBad) =>
+    color bg = color.new(color.gray, 85)
+    if na(p)
+        bg := color.new(color.gray, 85)
+    else
+        bool hi    = p >= 80
+        bool midhi = p >= 60 and p < 80
+        bool midlo = p >= 40 and p < 60
+        bool lo    = p >= 20 and p < 40
+        if highIsBad
+            bg := hi ? color.new(color.red, 65) :
+                  midhi ? color.new(color.orange, 70) :
+                  midlo ? color.new(color.gray, 85) :
+                  lo ? color.new(color.green, 82) :
+                  color.new(color.green, 68)
+        else
+            bg := hi ? color.new(color.green, 68) :
+                  midhi ? color.new(color.green, 82) :
+                  midlo ? color.new(color.gray, 85) :
+                  lo ? color.new(color.orange, 70) :
+                  color.new(color.red, 65)
+    bg
+
+f_bucket(float p) =>
+    string b = "B2"
+    if not na(p)
+        if p < 20
+            b := "B0"
+        else if p < 40
+            b := "B1"
+        else if p < 60
+            b := "B2"
+        else if p < 80
+            b := "B3"
+        else
+            b := "B4"
+    b
+
+f_risk_bg(string bucket) =>
+    bucket == "B4" ? color.new(color.red, 60) :
+     bucket == "B3" ? color.new(color.orange, 65) :
+     bucket == "B2" ? color.new(color.gray, 85) :
+     bucket == "B1" ? color.new(color.green, 82) :
+     bucket == "B0" ? color.new(color.green, 68) :
+     color.new(color.gray, 85)
+
+f_risk_text(string bucket) =>
+    bucket == "B4" ? "Rui ro rat cao" :
+     bucket == "B3" ? "Rui ro cao" :
+     bucket == "B2" ? "Rui ro vua" :
+     bucket == "B1" ? "Rui ro thap" :
+     bucket == "B0" ? "Rui ro rat thap" :
+     WD_KXH
+
+f_pctl_text(float p, bool ranked) =>
+    ranked ? f_fmt_pctl(p) : WD_KXH
+
+f_pctl_tag(float p, bool ranked) =>
+    ranked ? ("P" + f_fmt_pctl(p)) : WD_KXH
+
+f_delta1(float x) =>
+    x - x[1]
+
+f_delta3(float x) =>
+    x - x[3]
+
+f_sign3(float x, float th) =>
+    x > th ? 1 : x < -th ? -1 : 0
+
+f_state5(float x, float mild, float strong) =>
+    x >= strong ? "Rat manh" :
+     x >= mild  ? "Manh" :
+     x <= -strong ? "Rat yeu" :
+     x <= -mild ? "Yeu" :
+     "Trung tinh"
+
+f_abs(float x) =>
+    math.abs(x)
+
+f_direction_text(float x, float mild, float strong) =>
+    x >= strong ? "Tang manh" :
+     x >= mild  ? "Tang" :
+     x <= -strong ? "Giam manh" :
+     x <= -mild ? "Giam" :
+     "On dinh"
+
+f_impact_text(float x) =>
+    x > 0.25 ? "Day len" :
+     x < -0.25 ? "Keo xuong" :
+     "Trung tinh"
+
+f_rank3(float a, float b, float c, string na_, string nb_, string nc_) =>
+    string res = na_
+    float ax = math.abs(a)
+    float bx = math.abs(b)
+    float cx = math.abs(c)
+    if ax >= bx and ax >= cx
+        res := na_
+    else if bx >= ax and bx >= cx
+        res := nb_
+    else
+        res := nc_
+    res
+
+f_rank4(float a, float b, float c, float d, string na_, string nb_, string nc_, string nd_) =>
+    string res = na_
+    float ax = math.abs(a)
+    float bx = math.abs(b)
+    float cx = math.abs(c)
+    float dx = math.abs(d)
+    if ax >= bx and ax >= cx and ax >= dx
+        res := na_
+    else if bx >= ax and bx >= cx and bx >= dx
+        res := nb_
+    else if cx >= ax and cx >= bx and cx >= dx
+        res := nc_
+    else
+        res := nd_
+    res
+
+// =====================================================================
+// F) PACKS
+// =====================================================================
+f_cpi_pack() =>
+    float pi = close
+    float tr = ta.ema(pi, INFL_TREND_LEN_M)
+    float gap = pi - tr
+    float dpi = pi - pi[1]
+
+    var float ew = na
+    ew := na(ew) ? pi : (EWMA_LAMBDA * pi + (1.0 - EWMA_LAMBDA) * ew)
+
+    float y    = pi[1]
+    float x    = pi[2]
+    float cov_ = f_cov(y, x, AR1_LEN_M)
+    float varx = f_var(x, AR1_LEN_M)
+    float beta = varx > 0 ? cov_ / varx : na
+    float my   = ta.sma(y, AR1_LEN_M)
+    float mx   = ta.sma(x, AR1_LEN_M)
+    float a    = (not na(beta) and not na(my) and not na(mx)) ? (my - beta * mx) : na
+    float ar   = (not na(a) and not na(beta) and not na(y)) ? (a + beta * y) : na
+
+    float wsum = W_TREND + W_EWMA + W_AR1
+    float wt = wsum > 0 ? W_TREND / wsum : 1.0
+    float we = wsum > 0 ? W_EWMA  / wsum : 0.0
+    float wa = wsum > 0 ? W_AR1   / wsum : 0.0
+
+    float fcst = (not na(tr[1]) and not na(ew[1]) and not na(ar)) ? (wt * tr[1] + we * ew[1] + wa * ar) : na
+    [pi, tr, gap, dpi, fcst]
+
+f_ppi_pack() =>
+    float p  = close
+    float tr = ta.ema(p, PPI_TREND_LEN_Q)
+    float gap = p - tr
+    float z = f_z(gap, PPI_Z_LEN_Q, DRV_CLIP)
+    [p, tr, gap, z]
+
+f_fx_pack() =>
+    float mom = math.log(close / close[1])
+    float z = f_z(mom, DRV_Z_LEN_M, DRV_CLIP)
+    [mom, z]
+
+f_oil_pack() =>
+    float mom = math.log(close / close[1])
+    float z = f_z(mom, DRV_Z_LEN_M, DRV_CLIP)
+    [mom, z]
+
+f_gdp_pack() =>
+    float g  = close
+    float tr = ta.ema(g, GDP_TREND_LEN_Q)
+    float gap = g - tr
+    float z = f_z(gap, GDP_Z_LEN_Q, GDP_CLIP)
+    [g, tr, gap, z]
+
+// =====================================================================
+// G) CORE SERIES
+// =====================================================================
+[cpi_m, cpi_trend_m, cpi_gap_m, dcpi_m, cpi_fcst_m] = request.security(sym_infl, TF_M, f_cpi_pack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+float cpi_err_m = (not na(cpi_m) and not na(cpi_fcst_m)) ? (cpi_m - cpi_fcst_m) : na
+float err_abs_m = not na(cpi_err_m) ? math.abs(cpi_err_m) : na
+float err_sq_m  = not na(cpi_err_m) ? (cpi_err_m * cpi_err_m) : na
+
+bool hasDataP1 = not na(cpi_m) and not na(cpi_trend_m) and not na(cpi_fcst_m) and not na(cpi_gap_m) and not na(dcpi_m) and not na(cpi_err_m)
+bool cond_hot  = hasDataP1 and (dcpi_m > 0) and ((cpi_gap_m > 0) or (cpi_err_m > 0))
+bool cond_cool = hasDataP1 and (cpi_gap_m < 0) and (dcpi_m < 0)
+int  stateId   = hasDataP1 ? (cond_hot ? 1 : (cond_cool ? -1 : 0)) : 0
+
+[ppi_q_raw, ppi_trend_q_raw, ppi_gap_q_raw, z_ppi_gap_raw] = request.security(sym_ppi, TF_Q, f_ppi_pack(), barmerge.gaps_off, barmerge.lookahead_off)
+[fx_mom_m_raw, z_fx_mom_raw] = request.security(sym_fx, TF_M, f_fx_pack(), barmerge.gaps_off, barmerge.lookahead_off)
+[oil_mom_m_raw, z_oil_mom_raw] = request.security(sym_oil, TF_M, f_oil_pack(), barmerge.gaps_off, barmerge.lookahead_off)
+[gdp_q, gdp_trend_q, gdp_gap_q, grow_idx] = request.security(sym_gdp, TF_Q, f_gdp_pack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+float ppi_q       = USE_DRIVERS ? ppi_q_raw       : na
+float ppi_trend_q = USE_DRIVERS ? ppi_trend_q_raw : na
+float ppi_gap_q   = USE_DRIVERS ? ppi_gap_q_raw   : na
+float z_ppi_gap   = USE_DRIVERS ? z_ppi_gap_raw   : na
+
+float fx_mom_m    = USE_DRIVERS ? fx_mom_m_raw    : na
+float z_fx_mom    = USE_DRIVERS ? z_fx_mom_raw    : na
+float oil_mom_m   = USE_DRIVERS ? oil_mom_m_raw   : na
+float z_oil_mom   = USE_DRIVERS ? z_oil_mom_raw   : na
+
+float IDI = (na(z_ppi_gap) or na(z_fx_mom) or na(z_oil_mom)) ? na : (0.5 * z_ppi_gap + 0.3 * z_fx_mom + 0.2 * z_oil_mom)
+
+float i_policy_m = request.security(sym_pol, TF_M, close, barmerge.gaps_off, barmerge.lookahead_off)
+float i_ib_m     = request.security(sym_ib,  TF_M, close, barmerge.gaps_off, barmerge.lookahead_off)
+float di_ib_m    = request.security(sym_ib,  TF_M, close - close[1], barmerge.gaps_off, barmerge.lookahead_off)
+
+float r_real_m = (not na(i_policy_m) and not na(cpi_fcst_m)) ? (i_policy_m - cpi_fcst_m) : na
+
+bool isNewMonth   = timeframe.change(TF_M)
+bool isNewQuarter = timeframe.change(TF_Q)
+
+float alpha_m = 2.0 / (RREAL_EMA_LEN_M + 1.0)
+var float rreal_ema_m = na
+if isNewMonth
+    rreal_ema_m := na(rreal_ema_m) ? r_real_m : (alpha_m * r_real_m + (1.0 - alpha_m) * rreal_ema_m)
+
+float r_real_gap_m = (not na(r_real_m) and not na(rreal_ema_m)) ? (r_real_m - rreal_ema_m) : na
+float tight_idx    = f_z(r_real_gap_m, RATE_Z_LEN_M, RATE_CLIP) + 0.5 * f_z(di_ib_m, RATE_Z_LEN_M, RATE_CLIP)
+
+float i_implied  = (not na(cpi_m) and not na(gdp_gap_q)) ? (R_STAR + cpi_m + PHI_PI * (cpi_m - PI_TARGET) + PHI_Y * gdp_gap_q) : na
+float policy_gap = (not na(i_policy_m) and not na(i_implied)) ? (i_policy_m - i_implied) : na
+float polgap_z   = f_z(policy_gap, POLICY_Z_LEN_M, 2.5)
+
+float vn10y_m_raw = request.security(sym_vn10y, TF_M, close, barmerge.gaps_off, barmerge.lookahead_off)
+float vn02y_m_raw = request.security(sym_vn02y, TF_M, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+float vn10y_m    = USE_YIELDCURVE ? vn10y_m_raw : na
+float vn02y_m    = USE_YIELDCURVE ? vn02y_m_raw : na
+float yc_slope_m = (not na(vn10y_m) and not na(vn02y_m)) ? (vn10y_m - vn02y_m) : na
+float yc_idx     = USE_YIELDCURVE ? f_z(yc_slope_m, 60, 2.5) : na
+
+// =====================================================================
+// H) RISK BLOCKS
+// =====================================================================
+float infl_gap_idx = f_z(cpi_gap_m, INFL_Z_LEN_M, INFL_CLIP)
+float mom_idx      = f_z(dcpi_m,    INFL_Z_LEN_M, INFL_CLIP)
+float sur_idx      = f_z(cpi_err_m, INFL_Z_LEN_M, INFL_CLIP)
+
+float S_infl = infl_gap_idx + 0.5 * mom_idx + 0.5 * sur_idx
+float S_pol  = tight_idx + 0.5 * polgap_z
+float S_grow = -grow_idx
+float S_drv  = USE_DRIVERS ? 0.5 * IDI : na
+
+float C_infl = RW_INFL * S_infl
+float C_pol  = RW_POL  * S_pol
+float C_grow = RW_GROW * S_grow
+float C_drv  = RW_DRV  * nz(S_drv)
+
+float RiskLevel   = C_infl + C_pol + C_grow + C_drv
+float RiskImpulse = f_delta1(RiskLevel) + 0.5 * f_delta3(RiskLevel)
+
+float delta_risk_1m = f_delta1(RiskLevel)
+float delta_risk_3m = f_delta3(RiskLevel)
+
+float delta_infl_1m = f_delta1(C_infl)
+float delta_pol_1m  = f_delta1(C_pol)
+float delta_grow_1m = f_delta1(C_grow)
+float delta_drv_1m  = f_delta1(C_drv)
+
+// =====================================================================
+// I) TRANSMISSION / CONSENSUS
+// =====================================================================
+int s_ppi = na(z_ppi_gap) ? 0 : f_sign3(z_ppi_gap, 0.35)
+int s_fx  = na(z_fx_mom)  ? 0 : f_sign3(z_fx_mom, 0.35)
+int s_oil = na(z_oil_mom) ? 0 : f_sign3(z_oil_mom, 0.35)
+
+int posCnt = (s_ppi == 1 ? 1 : 0) + (s_fx == 1 ? 1 : 0) + (s_oil == 1 ? 1 : 0)
+int negCnt = (s_ppi == -1 ? 1 : 0) + (s_fx == -1 ? 1 : 0) + (s_oil == -1 ? 1 : 0)
+
+float drvConsensus = na(IDI) ? na : math.max(posCnt, negCnt) / 3.0
+string drvConsensusTxt = na(drvConsensus) ? "NA" : drvConsensus >= 1.0 ? "Dong thuan manh" : drvConsensus >= 0.67 ? "Dong thuan vua" : "Phan tan"
+
+float trans_rates  = nz(tight_idx)
+float trans_growth = nz(-grow_idx)
+float trans_cost   = nz(IDI)
+float trans_curve  = USE_YIELDCURVE ? nz(-yc_slope_m) : 0.0
+
+float TransmissionScore   = 0.35 * trans_rates + 0.25 * trans_growth + 0.25 * trans_cost + 0.15 * trans_curve
+float TransmissionImpulse = f_delta1(TransmissionScore) + 0.5 * f_delta3(TransmissionScore)
+
+// =====================================================================
+// J) EVALUATION / CONFIDENCE
+// =====================================================================
+var float[] ev_abs24  = array.new_float()
+var float[] ev_sq24   = array.new_float()
+var float[] ev_flip12 = array.new_float()
+
+float mae24_m   = na
+float rmse24_m  = na
+float churn12_m = na
+
+if USE_EVALUATION and isNewMonth
+    float flip = (stateId != nz(stateId[1])) ? 1.0 : 0.0
+
+    if not na(err_abs_m)
+        array.push(ev_abs24, err_abs_m)
+        if array.size(ev_abs24) > 24
+            array.shift(ev_abs24)
+
+    if not na(err_sq_m)
+        array.push(ev_sq24, err_sq_m)
+        if array.size(ev_sq24) > 24
+            array.shift(ev_sq24)
+
+    array.push(ev_flip12, flip)
+    if array.size(ev_flip12) > 12
+        array.shift(ev_flip12)
+
+    if array.size(ev_abs24) > 0
+        float s_abs = 0.0
+        for i = 0 to array.size(ev_abs24) - 1
+            s_abs += array.get(ev_abs24, i)
+        mae24_m := s_abs / array.size(ev_abs24)
+
+    if array.size(ev_sq24) > 0
+        float s_sq = 0.0
+        for i = 0 to array.size(ev_sq24) - 1
+            s_sq += array.get(ev_sq24, i)
+        rmse24_m := math.sqrt(s_sq / array.size(ev_sq24))
+
+    if array.size(ev_flip12) > 0
+        float s_flip = 0.0
+        for i = 0 to array.size(ev_flip12) - 1
+            s_flip += array.get(ev_flip12, i)
+        churn12_m := s_flip
+else
+    mae24_m   := nz(mae24_m[1])
+    rmse24_m  := nz(rmse24_m[1])
+    churn12_m := nz(churn12_m[1])
+
+float dataAvailScore =
+     (not na(cpi_m) ? 1.0 : 0.0) +
+     (not na(cpi_fcst_m) ? 1.0 : 0.0) +
+     (not na(i_policy_m) ? 1.0 : 0.0) +
+     (not na(i_ib_m) ? 1.0 : 0.0) +
+     (not na(gdp_q) ? 1.0 : 0.0) +
+     (not na(IDI) ? 1.0 : 0.0) +
+     (not na(yc_slope_m) ? 1.0 : 0.0)
+
+dataAvailScore := 100.0 * dataAvailScore / 7.0
+
+float evalScore = na(mae24_m) or na(rmse24_m) or na(churn12_m) ? na :
+     100.0
+     - math.min(40.0, 20.0 * mae24_m)
+     - math.min(35.0, 12.0 * rmse24_m)
+     - math.min(25.0, 5.0 * churn12_m)
+
+float stabilityScore = na(RiskImpulse) ? na : 100.0 - math.min(100.0, 22.0 * math.abs(RiskImpulse))
+float agreementScore = na(drvConsensus) ? na : 40.0 + 60.0 * drvConsensus
+
+float ConfidenceScore = na(evalScore) or na(stabilityScore) or na(agreementScore) ? na :
+     0.35 * dataAvailScore + 0.30 * evalScore + 0.20 * stabilityScore + 0.15 * agreementScore
+
+string confidenceTxt = na(ConfidenceScore) ? "NA" :
+     ConfidenceScore >= 80 ? "HIGH" :
+     ConfidenceScore >= 65 ? "MED" :
+     "LOW"
+
+bool transitionFlag = not na(churn12_m) and not na(RiskImpulse) and (churn12_m >= 3) and (math.abs(RiskImpulse) >= 0.35)
+string transitionTxt = transitionFlag ? "Dang chuyen pha" : "Tuong doi on dinh"
+
+// =====================================================================
+// K) INTERPRETATION
+// =====================================================================
+string infl_state = not hasDataP1 ? "Chua du du lieu" : (cond_cool ? "Dang ha nhiet" : (cond_hot ? "Co dau hieu nong lai" : "Di ngang"))
+
+string stance_vi = "Lai suat: trung tinh"
+if not hasDataP1 or na(r_real_gap_m) or na(tight_idx)
+    stance_vi := "Lai suat: chua ro"
+else if (r_real_gap_m > 0) or (tight_idx > 0.5)
+    stance_vi := "Lai suat: dang that"
+else if (r_real_gap_m < 0) or (tight_idx < -0.5)
+    stance_vi := "Lai suat: dang de"
+
+string phase_vi = "Pha: on dinh"
+if not na(grow_idx)
+    phase_vi := grow_idx < -0.5 ? "Pha: cham lai" : (grow_idx > 0.5 ? "Pha: mo rong" : "Pha: on dinh")
+
+string drv_vi = na(IDI) ? "Chi phi: OFF" : IDI > 0.5 ? "Chi phi: dang tang" : IDI < -0.5 ? "Chi phi: dang giam" : "Chi phi: trung tinh"
+string yc_vi  = na(yc_slope_m) ? "YC: OFF" : yc_slope_m < 0 ? "YC: dao nguoc" : "YC: binh thuong"
+
+string nowState   = f_state5(RiskLevel, 0.35, 0.90)
+string dirState   = f_state5(RiskImpulse, 0.20, 0.50)
+string transState = f_state5(TransmissionScore, 0.35, 0.90)
+
+string topRiskBlock = f_rank4(C_infl, C_pol, C_grow, C_drv, "Lam phat", "Lai suat", "Tang truong", "Drivers")
+string topImpulseBlock = f_rank4(delta_infl_1m, delta_pol_1m, delta_grow_1m, delta_drv_1m, "Lam phat", "Lai suat", "Tang truong", "Drivers")
+string topTransmissionBlock = f_rank4(trans_rates, trans_growth, trans_cost, trans_curve, "Rates", "Growth", "Cost", "Curve")
+
+string takeaway =
+     RiskLevel >= 1.0 ? "TAKEAWAY: Risk cao" :
+     RiskLevel <= -0.5 ? "TAKEAWAY: Dieu kien dang de" :
+     "TAKEAWAY: Risk trung tinh"
+
+takeaway := takeaway +
+     (RiskImpulse >= 0.35 ? " | dang xau len" :
+      RiskImpulse <= -0.35 ? " | dang ha nhiet" :
+      " | huong di on dinh")
+
+takeaway := takeaway +
+     (confidenceTxt == "LOW" ? " | do tin cay thap" :
+      confidenceTxt == "HIGH" ? " | do tin cay cao" :
+      " | do tin cay vua")
+
+string takeaway2 = "Dong gop chinh: " + topRiskBlock + " | Xung luc chinh: " + topImpulseBlock + " | Truyen dan: " + topTransmissionBlock
+
+// =====================================================================
+// L) ARRAYS FOR PCTL
+// =====================================================================
+var float[] arr_risk      = array.new_float()
+var float[] arr_impulse   = array.new_float()
+var float[] arr_conf      = array.new_float()
+var float[] arr_trans     = array.new_float()
+var float[] arr_pi        = array.new_float()
+var float[] arr_gap       = array.new_float()
+var float[] arr_sur       = array.new_float()
+var float[] arr_ipol      = array.new_float()
+var float[] arr_tight     = array.new_float()
+var float[] arr_polgap    = array.new_float()
+var float[] arr_gdp       = array.new_float()
+var float[] arr_gdpgap    = array.new_float()
+var float[] arr_grow      = array.new_float()
+var float[] arr_idi       = array.new_float()
+var float[] arr_zppi      = array.new_float()
+var float[] arr_zfx       = array.new_float()
+var float[] arr_zoil      = array.new_float()
+var float[] arr_yc        = array.new_float()
+var float[] arr_ycidx     = array.new_float()
+var float[] arr_mae       = array.new_float()
+var float[] arr_rmse      = array.new_float()
+var float[] arr_churn     = array.new_float()
+
+if isNewMonth
+    f_arr_push_float(arr_pi,      cpi_m,             ARR_CAP)
+    f_arr_push_float(arr_gap,     cpi_gap_m,         ARR_CAP)
+    f_arr_push_float(arr_sur,     cpi_err_m,         ARR_CAP)
+    f_arr_push_float(arr_ipol,    i_policy_m,        ARR_CAP)
+    f_arr_push_float(arr_tight,   tight_idx,         ARR_CAP)
+    f_arr_push_float(arr_polgap,  policy_gap,        ARR_CAP)
+    f_arr_push_float(arr_idi,     IDI,               ARR_CAP)
+    f_arr_push_float(arr_zfx,     z_fx_mom,          ARR_CAP)
+    f_arr_push_float(arr_zoil,    z_oil_mom,         ARR_CAP)
+    f_arr_push_float(arr_yc,      yc_slope_m,        ARR_CAP)
+    f_arr_push_float(arr_ycidx,   yc_idx,            ARR_CAP)
+    f_arr_push_float(arr_risk,    RiskLevel,         ARR_CAP)
+    f_arr_push_float(arr_impulse, RiskImpulse,       ARR_CAP)
+    f_arr_push_float(arr_conf,    ConfidenceScore,   ARR_CAP)
+    f_arr_push_float(arr_trans,   TransmissionScore, ARR_CAP)
+    f_arr_push_float(arr_mae,     mae24_m,           ARR_CAP)
+    f_arr_push_float(arr_rmse,    rmse24_m,          ARR_CAP)
+    f_arr_push_float(arr_churn,   churn12_m,         ARR_CAP)
+
+if isNewQuarter
+    f_arr_push_float(arr_gdp,     gdp_q,             ARR_CAP)
+    f_arr_push_float(arr_gdpgap,  gdp_gap_q,         ARR_CAP)
+    f_arr_push_float(arr_grow,    grow_idx,          ARR_CAP)
+    f_arr_push_float(arr_zppi,    z_ppi_gap,         ARR_CAP)
+
+// =====================================================================
+// M) PLOTS
+// =====================================================================
+bool showPlots = displayMode != "Chi Bang"
+
+plot(showPlots and panel == 1 ? RiskLevel : na, "P1 RiskLevel", linewidth=2)
+plot(showPlots and panel == 1 ? TransmissionScore : na, "P1 Transmission", linewidth=2)
+plot(showPlots and panel == 1 ? ConfidenceScore : na, "P1 Confidence", linewidth=2)
+
+plot(showPlots and panel == 2 ? RiskImpulse : na, "P2 RiskImpulse", style=plot.style_histogram)
+plot(showPlots and panel == 2 ? TransmissionImpulse : na, "P2 TransmissionImpulse", style=plot.style_histogram)
+
+plot(showPlots and panel == 3 ? ConfidenceScore : na, "P3 Confidence", linewidth=2)
+plot(showPlots and panel == 3 ? mae24_m : na, "P3 MAE24", linewidth=2)
+plot(showPlots and panel == 3 ? churn12_m : na, "P3 Churn12", style=plot.style_histogram)
+
+plot(showPlots and panel == 4 ? TransmissionScore : na, "P4 Transmission", linewidth=2)
+plot(showPlots and panel == 4 ? IDI : na, "P4 IDI", linewidth=2)
+plot(showPlots and panel == 4 ? tight_idx : na, "P4 Tight", linewidth=2)
+
+plot(showPlots and panel == 5 ? cpi_m : na, "P5 CPI", linewidth=2)
+plot(showPlots and panel == 5 ? cpi_trend_m : na, "P5 CPI Trend", linewidth=2)
+plot(showPlots and panel == 5 ? cpi_gap_m : na, "P5 CPI Gap", style=plot.style_histogram)
+
+plot(showPlots and panel == 6 ? i_policy_m : na, "P6 Policy", linewidth=2)
+plot(showPlots and panel == 6 ? i_ib_m : na, "P6 IB", linewidth=2)
+plot(showPlots and panel == 6 ? tight_idx : na, "P6 TightIdx", style=plot.style_histogram)
+
+plot(showPlots and panel == 7 ? yc_slope_m : na, "P7 YC Slope", linewidth=2)
+plot(showPlots and panel == 7 ? yc_idx : na, "P7 YC Idx", style=plot.style_histogram)
+
+plot(showPlots and panel == 8 ? gdp_q : na, "P8 GDP", linewidth=2)
+plot(showPlots and panel == 8 ? gdp_trend_q : na, "P8 GDP Trend", linewidth=2)
+plot(showPlots and panel == 8 ? gdp_gap_q : na, "P8 GDP Gap", style=plot.style_histogram)
+
+// =====================================================================
+// N) TABLE HELPERS
+// =====================================================================
+f_tbl_pos() =>
+    tblPosOpt == "Top Left" ? position.top_left :
+     tblPosOpt == "Bottom Right" ? position.bottom_right :
+     tblPosOpt == "Bottom Left" ? position.bottom_left :
+     position.top_right
+
+f_tbl_size() =>
+    fontOpt == "Tiny" ? size.tiny :
+     fontOpt == "Normal" ? size.normal :
+     size.small
+
+var table t = table.new(position.top_right, 4, 32, border_width=1)
+
+f_cell(int r, int c, string txt, color bg, color tc, halign) =>
+    table.cell(t, c, r, txt, bgcolor=bg, text_color=tc, text_size=f_tbl_size(), text_halign=halign)
+
+f_hdr(int r, string txt) =>
+    f_cell(r, 0, txt, color.new(color.gray, 75), color.new(color.white, 0), text.align_left)
+    f_cell(r, 1, "",  color.new(color.gray, 75), color.new(color.white, 0), text.align_left)
+    f_cell(r, 2, "",  color.new(color.gray, 75), color.new(color.white, 0), text.align_left)
+    f_cell(r, 3, "",  color.new(color.gray, 75), color.new(color.white, 0), text.align_left)
+
+f_row(int r, string k, string v, string ptxt, float pvalForColor, bool pHighIsBad, string note) =>
+    f_cell(r, 0, k,    color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(r, 1, v,    color.new(color.black, 0), color.new(color.white, 0), text.align_right)
+    f_cell(r, 2, ptxt, f_pctl_bg_dir(pvalForColor, pHighIsBad), color.new(color.white, 0), text.align_center)
+    f_cell(r, 3, note, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+
+f_clear_table() =>
+    for rr = 0 to 31
+        for cc = 0 to 3
+            table.cell(t, cc, rr, "", bgcolor=color.new(color.black, 0), text_color=color.new(color.white, 0), text_size=f_tbl_size())
+
+// =====================================================================
+// O) DASHBOARD
+// =====================================================================
+if barstate.islast
+    table.set_position(t, f_tbl_pos())
+    f_clear_table()
+
+    bool rk_m_risk   = array.size(arr_risk)   >= MIN_N_M
+    bool rk_m_imp    = array.size(arr_impulse) >= MIN_N_M
+    bool rk_m_conf   = array.size(arr_conf)   >= MIN_N_M
+    bool rk_m_trans  = array.size(arr_trans)  >= MIN_N_M
+
+    bool rk_m_pi     = array.size(arr_pi)     >= MIN_N_M
+    bool rk_m_gap    = array.size(arr_gap)    >= MIN_N_M
+    bool rk_m_sur    = array.size(arr_sur)    >= MIN_N_M
+    bool rk_m_ipol   = array.size(arr_ipol)   >= MIN_N_M
+    bool rk_m_tight  = array.size(arr_tight)  >= MIN_N_M
+    bool rk_m_polgap = array.size(arr_polgap) >= MIN_N_M
+    bool rk_m_yc     = array.size(arr_yc)     >= MIN_N_M
+    bool rk_m_ycidx  = array.size(arr_ycidx)  >= MIN_N_M
+
+    bool rk_q_gdp    = array.size(arr_gdp)    >= MIN_N_Q
+    bool rk_q_gdpgap = array.size(arr_gdpgap) >= MIN_N_Q
+    bool rk_q_grow   = array.size(arr_grow)   >= MIN_N_Q
+    bool rk_q_zppi   = array.size(arr_zppi)   >= MIN_N_Q
+
+    bool rk_e_mae    = array.size(arr_mae)    >= MIN_N_EVL
+    bool rk_e_rmse   = array.size(arr_rmse)   >= MIN_N_EVL
+    bool rk_e_churn  = array.size(arr_churn)  >= MIN_N_EVL
+
+    float p_risk   = rk_m_risk   ? f_arr_pctl(arr_risk, RiskLevel) : na
+    float p_imp    = rk_m_imp    ? f_arr_pctl(arr_impulse, RiskImpulse) : na
+    float p_conf   = rk_m_conf   ? f_arr_pctl(arr_conf, ConfidenceScore) : na
+    float p_trans  = rk_m_trans  ? f_arr_pctl(arr_trans, TransmissionScore) : na
+
+    float p_pi     = rk_m_pi     ? f_arr_pctl(arr_pi, cpi_m) : na
+    float p_gap    = rk_m_gap    ? f_arr_pctl(arr_gap, cpi_gap_m) : na
+    float p_sur    = rk_m_sur    ? f_arr_pctl(arr_sur, cpi_err_m) : na
+    float p_ipol   = rk_m_ipol   ? f_arr_pctl(arr_ipol, i_policy_m) : na
+    float p_tight  = rk_m_tight  ? f_arr_pctl(arr_tight, tight_idx) : na
+    float p_polgap = rk_m_polgap ? f_arr_pctl(arr_polgap, policy_gap) : na
+    float p_yc     = rk_m_yc     ? f_arr_pctl(arr_yc, yc_slope_m) : na
+    float p_ycidx  = rk_m_ycidx  ? f_arr_pctl(arr_ycidx, yc_idx) : na
+    float p_gdp    = rk_q_gdp    ? f_arr_pctl(arr_gdp, gdp_q) : na
+    float p_gdpgap = rk_q_gdpgap ? f_arr_pctl(arr_gdpgap, gdp_gap_q) : na
+    float p_grow   = rk_q_grow   ? f_arr_pctl(arr_grow, grow_idx) : na
+    float p_zppi   = rk_q_zppi   ? f_arr_pctl(arr_zppi, z_ppi_gap) : na
+    float p_mae    = rk_e_mae    ? f_arr_pctl(arr_mae, mae24_m) : na
+    float p_rmse   = rk_e_rmse   ? f_arr_pctl(arr_rmse, rmse24_m) : na
+    float p_churn  = rk_e_churn  ? f_arr_pctl(arr_churn, churn12_m) : na
+
+    string riskBucket = rk_m_risk ? f_bucket(p_risk) : "NA"
+
+    string pName = panel == 1 ? "P1 NOW" :
+                   panel == 2 ? "P2 DIRECTION" :
+                   panel == 3 ? "P3 CONFIDENCE" :
+                   panel == 4 ? "P4 TRANSMISSION" :
+                   panel == 5 ? "P5 INFLATION" :
+                   panel == 6 ? "P6 RATES" :
+                   panel == 7 ? "P7 YIELD CURVE" :
+                   "P8 GROWTH"
+
+    f_cell(0, 0, pName, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(0, 1, nowState, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(0, 2, dirState, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(0, 3, f_risk_text(riskBucket), f_risk_bg(riskBucket), color.new(color.white, 0), text.align_left)
+
+    f_cell(1, 0, takeaway, color.new(color.gray, 82), color.new(color.white, 0), text.align_left)
+    f_cell(1, 1, "", color.new(color.gray, 82), color.new(color.white, 0), text.align_left)
+    f_cell(1, 2, "", color.new(color.gray, 82), color.new(color.white, 0), text.align_left)
+    f_cell(1, 3, "", color.new(color.gray, 82), color.new(color.white, 0), text.align_left)
+
+    f_cell(2, 0, takeaway2, color.new(color.gray, 88), color.new(color.white, 0), text.align_left)
+    f_cell(2, 1, "", color.new(color.gray, 88), color.new(color.white, 0), text.align_left)
+    f_cell(2, 2, "", color.new(color.gray, 88), color.new(color.white, 0), text.align_left)
+    f_cell(2, 3, "", color.new(color.gray, 88), color.new(color.white, 0), text.align_left)
+
+    f_hdr(3, WD_HDR_SUMMARY)
+
+    if panel == 1
+        f_row(4, "RiskLevel", f_fmt(RiskLevel, 2), f_pctl_tag(p_risk, rk_m_risk), rk_m_risk ? p_risk : na, true, "Muc do hien tai")
+        f_row(5, "Confidence", f_fmt(ConfidenceScore, 1), f_pctl_tag(p_conf, rk_m_conf), rk_m_conf ? p_conf : na, false, "Do tin cay")
+    else if panel == 2
+        f_row(4, "RiskImpulse", f_fmt(RiskImpulse, 2), f_pctl_tag(p_imp, rk_m_imp), rk_m_imp ? p_imp : na, true, "Huong di")
+        f_row(5, "dRisk 1M", f_fmt(delta_risk_1m, 2), WD_KXH, na, true, "Thay doi 1 thang")
+    else if panel == 3
+        f_row(4, "Confidence", f_fmt(ConfidenceScore, 1), f_pctl_tag(p_conf, rk_m_conf), rk_m_conf ? p_conf : na, false, "HIGH/MED/LOW")
+        f_row(5, "EvalScore", f_fmt(evalScore, 1), WD_KXH, na, false, "Du bao + on dinh")
+    else if panel == 4
+        f_row(4, "Transmission", f_fmt(TransmissionScore, 2), f_pctl_tag(p_trans, rk_m_trans), rk_m_trans ? p_trans : na, true, "Muc truyen dan")
+        f_row(5, "Consensus", f_fmt(drvConsensus * 100.0, 0), WD_KXH, na, false, drvConsensusTxt)
+    else if panel == 5
+        f_row(4, "CPI", f_fmt(cpi_m, 2), f_pctl_tag(p_pi, rk_m_pi), rk_m_pi ? p_pi : na, true, "Lam phat YoY")
+        f_row(5, "Gap", f_fmt(cpi_gap_m, 2), f_pctl_tag(p_gap, rk_m_gap), rk_m_gap ? p_gap : na, true, "So voi trend")
+    else if panel == 6
+        f_row(4, "Policy", f_fmt(i_policy_m, 2), f_pctl_tag(p_ipol, rk_m_ipol), rk_m_ipol ? p_ipol : na, true, "Lai suat dieu hanh")
+        f_row(5, "TightIdx", f_fmt(tight_idx, 2), f_pctl_tag(p_tight, rk_m_tight), rk_m_tight ? p_tight : na, true, "Tong hop do that")
+    else if panel == 7
+        f_row(4, "YC Slope", f_fmt(yc_slope_m, 2), f_pctl_tag(p_yc, rk_m_yc), rk_m_yc ? p_yc : na, false, "10Y - 2Y")
+        f_row(5, "YC Idx", f_fmt(yc_idx, 2), f_pctl_tag(p_ycidx, rk_m_ycidx), rk_m_ycidx ? p_ycidx : na, true, "Bat thuong")
+    else
+        f_row(4, "GDP", f_fmt(gdp_q, 2), f_pctl_tag(p_gdp, rk_q_gdp), rk_q_gdp ? p_gdp : na, false, "GDP YoY")
+        f_row(5, "GDP Gap", f_fmt(gdp_gap_q, 2), f_pctl_tag(p_gdpgap, rk_q_gdpgap), rk_q_gdpgap ? p_gdpgap : na, false, "So voi trend")
+
+    f_hdr(7, WD_HDR_MAIN)
+    f_cell(8, 0, WD_COL_METRIC, color.new(color.gray, 80), color.new(color.white, 0), text.align_left)
+    f_cell(8, 1, WD_COL_VALUE, color.new(color.gray, 80), color.new(color.white, 0), text.align_right)
+    f_cell(8, 2, WD_COL_PCTL, color.new(color.gray, 80), color.new(color.white, 0), text.align_center)
+    f_cell(8, 3, WD_COL_MEANING, color.new(color.gray, 80), color.new(color.white, 0), text.align_left)
+
+    bool full = displayMode == "Full"
+
+    if panel == 1
+        f_row(9,  "RiskLevel",     f_fmt(RiskLevel, 2),       f_pctl_text(p_risk, rk_m_risk), rk_m_risk ? p_risk : na, true,  "Muc do tong hop")
+        f_row(10, "RiskImpulse",   f_fmt(RiskImpulse, 2),     f_pctl_text(p_imp, rk_m_imp), rk_m_imp ? p_imp : na, true, "Huong di")
+        f_row(11, "Direction",     f_direction_text(RiskImpulse, 0.20, 0.50), WD_KXH, na, false, "Doc nhu dong luc")
+        f_row(12, "Confidence",    f_fmt(ConfidenceScore, 1), f_pctl_text(p_conf, rk_m_conf), rk_m_conf ? p_conf : na, false, "Do tin cay")
+        if full
+            f_row(13, "Transmission", f_fmt(TransmissionScore, 2), f_pctl_text(p_trans, rk_m_trans), rk_m_trans ? p_trans : na, true, "Do truyen dan")
+            f_row(14, "Shift", transitionTxt, WD_KXH, na, false, "Do pha")
+    else if panel == 2
+        f_row(9,  "RiskImpulse", f_fmt(RiskImpulse, 2), f_pctl_text(p_imp, rk_m_imp), rk_m_imp ? p_imp : na, true, "Tong gia toc")
+        f_row(10, "dRisk 1M", f_fmt(delta_risk_1m, 2), WD_KXH, na, true, "1 thang")
+        f_row(11, "dRisk 3M", f_fmt(delta_risk_3m, 2), WD_KXH, na, true, "3 thang")
+        if full
+            f_row(12, "dInfl 1M", f_fmt(delta_infl_1m, 2), WD_KXH, na, true, "Dong gop inflation")
+            f_row(13, "dRate 1M", f_fmt(delta_pol_1m, 2), WD_KXH, na, true, "Dong gop rates")
+            f_row(14, "dGrow 1M", f_fmt(delta_grow_1m, 2), WD_KXH, na, true, "Dong gop growth")
+    else if panel == 3
+        f_row(9,  "Confidence", f_fmt(ConfidenceScore, 1), f_pctl_text(p_conf, rk_m_conf), rk_m_conf ? p_conf : na, false, "Tong hop")
+        f_row(10, "DataScore", f_fmt(dataAvailScore, 1), WD_KXH, na, false, "Du du lieu")
+        f_row(11, "EvalScore", f_fmt(evalScore, 1), WD_KXH, na, false, "Forecast + churn")
+        if full
+            f_row(12, "MAE24", f_fmt(mae24_m, 2), f_pctl_text(p_mae, rk_e_mae), rk_e_mae ? p_mae : na, true, "Sai so TB")
+            f_row(13, "RMSE24", f_fmt(rmse24_m, 2), f_pctl_text(p_rmse, rk_e_rmse), rk_e_rmse ? p_rmse : na, true, "Phat sai so lon")
+            f_row(14, "Churn12", f_fmt(churn12_m, 0), f_pctl_text(p_churn, rk_e_churn), rk_e_churn ? p_churn : na, true, "Do hay doi pha")
+    else if panel == 4
+        f_row(9,  "Transmission", f_fmt(TransmissionScore, 2), f_pctl_text(p_trans, rk_m_trans), rk_m_trans ? p_trans : na, true, "Tong hop")
+        f_row(10, "Rates", f_fmt(trans_rates, 2), WD_KXH, na, true, "Kenh lai suat")
+        f_row(11, "Growth", f_fmt(trans_growth, 2), WD_KXH, na, true, "Kenh tang truong")
+        if full
+            f_row(12, "Cost", f_fmt(trans_cost, 2), WD_KXH, na, true, "Kenh chi phi")
+            f_row(13, "Curve", f_fmt(trans_curve, 2), WD_KXH, na, true, "Kenh YC")
+            f_row(14, "Consensus", drvConsensusTxt, WD_KXH, na, false, "Do dong thuan")
+    else if panel == 5
+        f_row(9,  "CPI", f_fmt(cpi_m, 2), f_pctl_text(p_pi, rk_m_pi), rk_m_pi ? p_pi : na, true, "Muc lam phat")
+        f_row(10, "Gap", f_fmt(cpi_gap_m, 2), f_pctl_text(p_gap, rk_m_gap), rk_m_gap ? p_gap : na, true, "So voi trend")
+        f_row(11, "Surprise", f_fmt(cpi_err_m, 2), f_pctl_text(p_sur, rk_m_sur), rk_m_sur ? p_sur : na, true, "Lech forecast")
+        if full
+            f_row(12, "Momentum", f_fmt(dcpi_m, 2), WD_KXH, na, true, "Dong luc")
+            f_row(13, "Forecast", f_fmt(cpi_fcst_m, 2), WD_KXH, na, true, "OOS")
+            f_row(14, "State", infl_state, WD_KXH, na, false, "Trang thai")
+    else if panel == 6
+        f_row(9,  "Policy", f_fmt(i_policy_m, 2), f_pctl_text(p_ipol, rk_m_ipol), rk_m_ipol ? p_ipol : na, true, "Lai suat dieu hanh")
+        f_row(10, "IB", f_fmt(i_ib_m, 2), WD_KXH, na, true, "Lien NH")
+        f_row(11, "TightIdx", f_fmt(tight_idx, 2), f_pctl_text(p_tight, rk_m_tight), rk_m_tight ? p_tight : na, true, "Tong hop")
+        if full
+            f_row(12, "RealGap", f_fmt(r_real_gap_m, 2), WD_KXH, na, true, "Lai thuc gap")
+            f_row(13, "PolicyGap", f_fmt(policy_gap, 2), f_pctl_text(p_polgap, rk_m_polgap), rk_m_polgap ? p_polgap : na, true, "So voi implied")
+            f_row(14, "State", stance_vi, WD_KXH, na, false, "Trang thai")
+    else if panel == 7
+        f_row(9,  "Slope", f_fmt(yc_slope_m, 2), f_pctl_text(p_yc, rk_m_yc), rk_m_yc ? p_yc : na, false, "10Y-2Y")
+        f_row(10, "YC Idx", f_fmt(yc_idx, 2), f_pctl_text(p_ycidx, rk_m_ycidx), rk_m_ycidx ? p_ycidx : na, true, "Bat thuong")
+        if full
+            f_row(11, "State", yc_vi, WD_KXH, na, false, "Trang thai")
+            f_row(12, "Signal", yc_slope_m < 0 ? "Phong thu hon" : "Trung tinh", WD_KXH, na, false, "Dung kem growth")
+            f_row(13, "Note", "Khong dung YC 1 minh", WD_KXH, na, false, "Can context")
+            f_row(14, "Link", "YC + Growth + Rates", WD_KXH, na, false, "Tang do tin")
+    else
+        f_row(9,  "GDP", f_fmt(gdp_q, 2), f_pctl_text(p_gdp, rk_q_gdp), rk_q_gdp ? p_gdp : na, false, "GDP YoY")
+        f_row(10, "GDP Gap", f_fmt(gdp_gap_q, 2), f_pctl_text(p_gdpgap, rk_q_gdpgap), rk_q_gdpgap ? p_gdpgap : na, false, "So voi trend")
+        f_row(11, "GrowIdx", f_fmt(grow_idx, 2), f_pctl_text(p_grow, rk_q_grow), rk_q_grow ? p_grow : na, false, "Cao=tot")
+        if full
+            f_row(12, "Phase", phase_vi, WD_KXH, na, false, "Mo rong / cham")
+            f_row(13, "PPI", f_fmt(z_ppi_gap, 2), f_pctl_text(p_zppi, rk_q_zppi), rk_q_zppi ? p_zppi : na, true, "Gia san xuat")
+            f_row(14, "Link", "Doc kem P5/P6", WD_KXH, na, false, "Khong doc mot minh")
+
+    f_hdr(16, WD_HDR_CONTRIB)
+    f_row(17, "Inflation", f_fmt(C_infl, 2), WD_KXH, na, true, f_impact_text(C_infl))
+    f_row(18, "Rates",     f_fmt(C_pol, 2),  WD_KXH, na, true, f_impact_text(C_pol))
+    f_row(19, "Growth",    f_fmt(C_grow, 2), WD_KXH, na, true, f_impact_text(C_grow))
+    f_row(20, "Drivers",   f_fmt(C_drv, 2),  WD_KXH, na, true, f_impact_text(C_drv))
+
+    f_hdr(21, WD_HDR_DO)
+
+    string act1 = (riskBucket == "B4" or riskBucket == "B3") ? "Phong thu hon" :
+                  (riskBucket == "B1" or riskBucket == "B0") ? "Co the linh hoat" :
+                  "Giu can bang"
+
+    string act2 = transitionFlag ? "Giam tu tin mo hinh" :
+                  (confidenceTxt == "LOW" ? "Giam ky vong" : "Quan ly rui ro")
+
+    string act3 = topRiskBlock == "Lai suat" ? "De y tai san nhay cam lai suat" :
+                  topRiskBlock == "Lam phat" ? "Canh giac cost-push" :
+                  topRiskBlock == "Tang truong" ? "Theo doi cyclical" :
+                  "Kiem tra FX/Oil/PPI"
+
+    f_cell(22, 0, "Hanh dong", color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(22, 1, act1, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(22, 2, act2, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(22, 3, act3, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+
+    f_hdr(23, WD_HDR_WATCH)
+
+    string trg1 = panel == 1 ? "RiskLevel cao + Confidence giam" :
+                  panel == 2 ? "Impulse doi chieu nhanh" :
+                  panel == 3 ? "MAE/RMSE/Churn xau len" :
+                  panel == 4 ? "Rates + Cost cung xau" :
+                  panel == 5 ? "Gap duong + surprise duong" :
+                  panel == 6 ? "TightIdx tang lien tuc" :
+                  panel == 7 ? "YC am keo dai" :
+                  "GDP gap xau"
+
+    string trg2 = panel == 1 ? "Transition flag bat" :
+                  panel == 2 ? "dRisk 1M va 3M cung chieu" :
+                  panel == 3 ? "Confidence < 65" :
+                  panel == 4 ? "Consensus tang" :
+                  panel == 5 ? "dcpi > 0" :
+                  panel == 6 ? "Policy gap xau them" :
+                  panel == 7 ? "YC idx cao" :
+                  "GrowIdx giam"
+
+    string trg3 = "Block chinh: " + topRiskBlock
+
+    f_cell(24, 0, "Canh bao", color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(24, 1, trg1, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(24, 2, trg2, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(24, 3, trg3, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+
+    f_hdr(25, WD_HDR_DEBUG)
+    f_cell(26, 0, "Now", color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(26, 1, nowState, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(26, 2, "Direction", color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(26, 3, dirState, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+
+    f_cell(27, 0, "Confidence", color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(27, 1, confidenceTxt, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(27, 2, "Transmission", color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(27, 3, transState, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+
+    f_cell(28, 0, "Transition", color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(28, 1, transitionTxt, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(28, 2, "Consensus", color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(28, 3, drvConsensusTxt, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+
+    f_cell(29, 0, "Main driver", color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(29, 1, topRiskBlock, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(29, 2, "Main impulse", color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(29, 3, topImpulseBlock, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+
+    f_cell(30, 0, "Goi y", color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(30, 1, WD_HINT_PCTL, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(30, 2, "Note", color.new(color.black, 0), color.new(color.white, 0), text.align_left)
+    f_cell(30, 3, WD_HINT_MULTI, color.new(color.black, 0), color.new(color.white, 0), text.align_left)
