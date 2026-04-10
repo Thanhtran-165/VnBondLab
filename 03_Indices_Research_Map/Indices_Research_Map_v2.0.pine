@@ -1,0 +1,845 @@
+//@version=5
+indicator("Macro → VN Indices Research v2.0.1 (Clean Fixed Build)",
+     shorttitle="MacroIndices Map v2.0.1",
+     overlay=false,
+     max_labels_count=500,
+     max_lines_count=500,
+     max_bars_back=5000)
+
+//======================================================
+// 0) HELPERS
+//======================================================
+
+f_clamp(x, lo, hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_avg(sum, cnt) =>
+    cnt > 0 ? sum / cnt : na
+
+f_winrate(win, cnt) =>
+    cnt > 0 ? win / cnt * 100.0 : na
+
+f_sd(sum, sumSq, cnt) =>
+    cnt > 1 ? math.sqrt(math.max(sumSq / cnt - math.pow(sum / cnt, 2), 0.0)) : na
+
+f_se(sum, sumSq, cnt) =>
+    _sd = f_sd(sum, sumSq, cnt)
+    cnt > 1 and not na(_sd) ? _sd / math.sqrt(cnt) : na
+
+f_tlike(sum, sumSq, cnt) =>
+    _avg = f_avg(sum, cnt)
+    _se  = f_se(sum, sumSq, cnt)
+    cnt > 1 and not na(_avg) and not na(_se) and _se > 0 ? _avg / _se : na
+
+f_bucket_from_risk(risk) =>
+    int b = na
+    if not na(risk)
+        b := risk < 20 ? 0 :
+             risk < 40 ? 1 :
+             risk < 60 ? 2 :
+             risk < 80 ? 3 : 4
+    b
+
+f_bucket_label(b) =>
+    b == 0 ? "B0 (0-20)" :
+     b == 1 ? "B1 (20-40)" :
+     b == 2 ? "B2 (40-60)" :
+     b == 3 ? "B3 (60-80)" :
+     b == 4 ? "B4 (80-100)" : "NA"
+
+f_bucket_text(b) =>
+    b == 0 ? "Very supportive" :
+     b == 1 ? "Supportive" :
+     b == 2 ? "Neutral" :
+     b == 3 ? "Risky" :
+     b == 4 ? "High stress" : "NA"
+
+f_reset_float_array(float[] arr) =>
+    for i = 0 to array.size(arr) - 1
+        array.set(arr, i, 0.0)
+
+f_score_high_bad(src, length) =>
+    ta.percentrank(src, length)
+
+f_score_low_bad(src, length) =>
+    100.0 - ta.percentrank(src, length)
+
+f_clip_ret(r, lo, hi) =>
+    na(r) ? na : math.max(lo, math.min(hi, r))
+
+f_compute_return(c, cL, use_log_return, clip_lo, clip_hi) =>
+    _r = not na(c) and not na(cL) and cL != 0 ?
+         (use_log_return ? math.log(c / cL) : c / cL - 1.0) : na
+    f_clip_ret(_r, clip_lo, clip_hi)
+
+f_conf_label(tlike_val, cnt, min_n) =>
+    cnt < min_n or na(tlike_val) ? "LOW" :
+     math.abs(tlike_val) >= 2.0 ? "HIGH" :
+     math.abs(tlike_val) >= 1.0 ? "MED" : "LOW"
+
+f_regime_arrow(curBucket, prevBucket) =>
+    na(curBucket) or na(prevBucket) ? "→" :
+     curBucket > prevBucket ? "↑" :
+     curBucket < prevBucket ? "↓" : "→"
+
+//======================================================
+// 1) INPUTS
+//======================================================
+
+group_macro = "Macro Engine"
+tf_macro    = input.timeframe("D", "Macro timeframe", group=group_macro)
+score_lb    = input.int(252, "Score lookback", minval=100, maxval=2000, group=group_macro)
+
+w_stress = input.float(0.35, "Weight: Liquidity stress", minval=0.0, maxval=1.0, step=0.05, group=group_macro)
+w_curve  = input.float(0.30, "Weight: Curve shape", minval=0.0, maxval=1.0, step=0.05, group=group_macro)
+w_intl   = input.float(0.20, "Weight: Intl spread", minval=0.0, maxval=1.0, step=0.05, group=group_macro)
+w_lsp    = input.float(0.15, "Weight: 10Y-policy spread", minval=0.0, maxval=1.0, step=0.05, group=group_macro)
+
+group_eq = "Equity / Research"
+tf_equity      = input.timeframe("D", "Equity timeframe", group=group_eq)
+calc_R5        = input.bool(false, "Compute R5", group=group_eq)
+calc_R20       = input.bool(true,  "Compute R20", group=group_eq)
+calc_R60       = input.bool(false, "Compute R60", group=group_eq)
+calc_DD20      = input.bool(true,  "Compute DD20", group=group_eq)
+calc_DD60      = input.bool(false, "Compute DD60", group=group_eq)
+use_log_return = input.bool(false, "Use log returns", group=group_eq)
+ret_clip_hi    = input.float(2.0,  "Return clip high", minval=0.1, maxval=10.0, step=0.1, group=group_eq)
+ret_clip_lo    = input.float(-0.8, "Return clip low",  minval=-0.99, maxval=0.0, step=0.05, group=group_eq)
+
+group_sample = "Sample Controls"
+use_start_year  = input.bool(false, "Start sample from year", group=group_sample)
+start_year      = input.int(2015, "Start year", minval=2000, maxval=2100, group=group_sample)
+use_non_overlap = input.bool(false, "Use non-overlapping samples", group=group_sample)
+reset_stats     = input.bool(false, "Reset stats", group=group_sample)
+
+group_view = "View"
+bucket_view = input.string("Auto (current)", "Bucket view",
+     options=["Auto (current)", "B0 (0-20)", "B1 (20-40)", "B2 (40-60)", "B3 (60-80)", "B4 (80-100)"],
+     group=group_view)
+min_n_market = input.int(30, "Min N market", minval=1, group=group_view)
+min_n_sector = input.int(30, "Min N sector", minval=1, group=group_view)
+min_n_trans  = input.int(30, "Min N transition", minval=1, group=group_view)
+show_bucket_guide = input.bool(true, "Show bucket guide", group=group_view)
+
+group_ui = "Panel"
+panel_view = input.string("Panel 1 - Macro Weather", "Panel",
+     options = [
+         "Panel 1 - Macro Weather",
+         "Panel 2 - Market Regime Map",
+         "Panel 3 - Sector Rotation Map",
+         "Panel 4 - Transition Summary"
+     ],
+     group = group_ui)
+
+group_trans = "Transition"
+trans_L = input.int(20, "Transition horizon", minval=5, maxval=252, group=group_trans)
+
+//======================================================
+// 2) MACRO DATA
+//======================================================
+
+policy_rate    = request.security("VNINTR", tf_macro, close, barmerge.gaps_off, barmerge.lookahead_off)
+bond_2y        = request.security("VN02Y",  tf_macro, close, barmerge.gaps_off, barmerge.lookahead_off)
+bond_10y       = request.security("VN10Y",  tf_macro, close, barmerge.gaps_off, barmerge.lookahead_off)
+us_10y         = request.security("US10Y",  tf_macro, close, barmerge.gaps_off, barmerge.lookahead_off)
+interbank_rate = request.security("VNINBR", tf_macro, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+liquidity_stress  = interbank_rate - policy_rate
+curve_standard    = bond_10y - bond_2y
+intl_yield_diff   = bond_10y - us_10y
+long_short_spread = bond_10y - policy_rate
+
+score_stress = f_score_high_bad(liquidity_stress, score_lb)
+score_curve  = f_score_low_bad(curve_standard, score_lb)
+score_intl   = f_score_low_bad(intl_yield_diff, score_lb)
+score_lsp    = f_score_low_bad(long_short_spread, score_lb)
+
+w_sum = w_stress + w_curve + w_intl + w_lsp
+risk_pct_raw = w_sum > 0 ? (w_stress * score_stress + w_curve * score_curve + w_intl * score_intl + w_lsp * score_lsp) / w_sum : na
+risk_pct = f_clamp(risk_pct_raw, 0.0, 100.0)
+
+risk_ma20      = ta.sma(risk_pct, 20)
+risk_mom5      = risk_pct - risk_pct[5]
+risk_vol20     = ta.stdev(risk_pct, 20)
+risk_bucket_now    = f_bucket_from_risk(risk_pct)
+risk_bucket_prev20 = f_bucket_from_risk(risk_pct[20])
+
+plot(risk_pct, "Macro Risk %", color=color.new(color.orange, 0), linewidth=2)
+plot(risk_ma20, "Risk MA20", color=color.new(color.blue, 20), linewidth=1)
+plot(20, "B0/B1", color=color.new(color.gray, 85))
+plot(40, "B1/B2", color=color.new(color.gray, 85))
+plot(60, "B2/B3", color=color.new(color.gray, 85))
+plot(80, "B3/B4", color=color.new(color.gray, 85))
+
+//======================================================
+// 3) EQUITY DATA
+//======================================================
+
+// Market indices
+mkt_vnindex = request.security("HOSE:VNINDEX",    tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vn30    = request.security("HOSE:VN30",       tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vn100   = request.security("HOSE:VN100",      tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vnall   = request.security("HOSE:VNALLSHARE", tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vnmid   = request.security("HOSE:VNMIDCAP",   tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vnsmall = request.security("HOSE:VNSMALLCAP", tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+mkt_vnindex_low = request.security("HOSE:VNINDEX",    tf_equity, low, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vn30_low    = request.security("HOSE:VN30",       tf_equity, low, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vn100_low   = request.security("HOSE:VN100",      tf_equity, low, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vnall_low   = request.security("HOSE:VNALLSHARE", tf_equity, low, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vnmid_low   = request.security("HOSE:VNMIDCAP",   tf_equity, low, barmerge.gaps_off, barmerge.lookahead_off)
+mkt_vnsmall_low = request.security("HOSE:VNSMALLCAP", tf_equity, low, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Sector indices
+sec_vnfin     = request.security("HOSE:VNFIN",       tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnfin_sel = request.security("HOSE:VNFINSELECT", tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnind     = request.security("HOSE:VNIND",       tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnit      = request.security("HOSE:VNIT",        tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnreal    = request.security("HOSE:VNREAL",      tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vncons    = request.security("HOSE:VNCONS",      tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vncond    = request.security("HOSE:VNCOND",      tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnene     = request.security("HOSE:VNENE",       tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnmat     = request.security("HOSE:VNMAT",       tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnheal    = request.security("HOSE:VNHEAL",      tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+sec_vnuti     = request.security("HOSE:VNUTI",       tf_equity, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+benchmark_close = mkt_vnindex
+
+var string[] market_name = array.new_string()
+var string[] sector_name = array.new_string()
+
+if barstate.isfirst
+    array.push(market_name, "VNINDEX")
+    array.push(market_name, "VN30")
+    array.push(market_name, "VN100")
+    array.push(market_name, "VNALLSHARE")
+    array.push(market_name, "VNMIDCAP")
+    array.push(market_name, "VNSMALLCAP")
+
+    array.push(sector_name, "VNFIN")
+    array.push(sector_name, "VNFINSELECT")
+    array.push(sector_name, "VNIND")
+    array.push(sector_name, "VNIT")
+    array.push(sector_name, "VNREAL")
+    array.push(sector_name, "VNCONS")
+    array.push(sector_name, "VNCOND")
+    array.push(sector_name, "VNENE")
+    array.push(sector_name, "VNMAT")
+    array.push(sector_name, "VNHEAL")
+    array.push(sector_name, "VNUTI")
+
+f_market_close(int m) =>
+    m == 0 ? mkt_vnindex :
+     m == 1 ? mkt_vn30 :
+     m == 2 ? mkt_vn100 :
+     m == 3 ? mkt_vnall :
+     m == 4 ? mkt_vnmid :
+     m == 5 ? mkt_vnsmall : na
+
+f_market_low(int m) =>
+    m == 0 ? mkt_vnindex_low :
+     m == 1 ? mkt_vn30_low :
+     m == 2 ? mkt_vn100_low :
+     m == 3 ? mkt_vnall_low :
+     m == 4 ? mkt_vnmid_low :
+     m == 5 ? mkt_vnsmall_low : na
+
+f_sector_close(int s) =>
+    s == 0 ? sec_vnfin :
+     s == 1 ? sec_vnfin_sel :
+     s == 2 ? sec_vnind :
+     s == 3 ? sec_vnit :
+     s == 4 ? sec_vnreal :
+     s == 5 ? sec_vncons :
+     s == 6 ? sec_vncond :
+     s == 7 ? sec_vnene :
+     s == 8 ? sec_vnmat :
+     s == 9 ? sec_vnheal :
+     s == 10 ? sec_vnuti : na
+
+//======================================================
+// 4) STATS ARRAYS
+//======================================================
+
+var float[] sumR20_market   = array.new_float(30, 0.0)
+var float[] sumSqR20_market = array.new_float(30, 0.0)
+var float[] cntR20_market   = array.new_float(30, 0.0)
+var float[] winR20_market   = array.new_float(30, 0.0)
+
+var float[] sumR5_market    = array.new_float(30, 0.0)
+var float[] sumSqR5_market  = array.new_float(30, 0.0)
+var float[] cntR5_market    = array.new_float(30, 0.0)
+var float[] winR5_market    = array.new_float(30, 0.0)
+
+var float[] sumR60_market   = array.new_float(30, 0.0)
+var float[] sumSqR60_market = array.new_float(30, 0.0)
+var float[] cntR60_market   = array.new_float(30, 0.0)
+var float[] winR60_market   = array.new_float(30, 0.0)
+
+var float[] sumDD20_market  = array.new_float(30, 0.0)
+var float[] cntDD20_market  = array.new_float(30, 0.0)
+var float[] sumDD60_market  = array.new_float(30, 0.0)
+var float[] cntDD60_market  = array.new_float(30, 0.0)
+
+var float[] sumRR20_sector   = array.new_float(55, 0.0)
+var float[] sumSqRR20_sector = array.new_float(55, 0.0)
+var float[] cntRR20_sector   = array.new_float(55, 0.0)
+var float[] winRR20_sector   = array.new_float(55, 0.0)
+
+var float[] sumRR5_sector    = array.new_float(55, 0.0)
+var float[] sumSqRR5_sector  = array.new_float(55, 0.0)
+var float[] cntRR5_sector    = array.new_float(55, 0.0)
+var float[] winRR5_sector    = array.new_float(55, 0.0)
+
+var float[] sumRR60_sector   = array.new_float(55, 0.0)
+var float[] sumSqRR60_sector = array.new_float(55, 0.0)
+var float[] cntRR60_sector   = array.new_float(55, 0.0)
+var float[] winRR60_sector   = array.new_float(55, 0.0)
+
+var float[] transCnt    = array.new_float(25, 0.0)
+var float[] transSumRet = array.new_float(25, 0.0)
+var float[] transWin    = array.new_float(25, 0.0)
+
+//======================================================
+// 5) RESET
+//======================================================
+
+f_reset_all_stats() =>
+    f_reset_float_array(sumR20_market)
+    f_reset_float_array(sumSqR20_market)
+    f_reset_float_array(cntR20_market)
+    f_reset_float_array(winR20_market)
+
+    f_reset_float_array(sumR5_market)
+    f_reset_float_array(sumSqR5_market)
+    f_reset_float_array(cntR5_market)
+    f_reset_float_array(winR5_market)
+
+    f_reset_float_array(sumR60_market)
+    f_reset_float_array(sumSqR60_market)
+    f_reset_float_array(cntR60_market)
+    f_reset_float_array(winR60_market)
+
+    f_reset_float_array(sumDD20_market)
+    f_reset_float_array(cntDD20_market)
+    f_reset_float_array(sumDD60_market)
+    f_reset_float_array(cntDD60_market)
+
+    f_reset_float_array(sumRR20_sector)
+    f_reset_float_array(sumSqRR20_sector)
+    f_reset_float_array(cntRR20_sector)
+    f_reset_float_array(winRR20_sector)
+
+    f_reset_float_array(sumRR5_sector)
+    f_reset_float_array(sumSqRR5_sector)
+    f_reset_float_array(cntRR5_sector)
+    f_reset_float_array(winRR5_sector)
+
+    f_reset_float_array(sumRR60_sector)
+    f_reset_float_array(sumSqRR60_sector)
+    f_reset_float_array(cntRR60_sector)
+    f_reset_float_array(winRR60_sector)
+
+    f_reset_float_array(transCnt)
+    f_reset_float_array(transSumRet)
+    f_reset_float_array(transWin)
+
+bool do_reset = barstate.isfirst or (reset_stats and not reset_stats[1])
+if do_reset
+    f_reset_all_stats()
+
+//======================================================
+// 6) UPDATE ENGINE
+//======================================================
+
+f_update_return_stats(float[] sumArr, float[] sumSqArr, float[] cntArr, float[] winArr, int idx, float ret, bool do_update) =>
+    if do_update and not na(ret)
+        _sum   = array.get(sumArr, idx)
+        _sumSq = array.get(sumSqArr, idx)
+        _cnt   = array.get(cntArr, idx)
+        _win   = array.get(winArr, idx)
+        array.set(sumArr, idx, _sum + ret)
+        array.set(sumSqArr, idx, _sumSq + ret * ret)
+        array.set(cntArr, idx, _cnt + 1.0)
+        if ret > 0
+            array.set(winArr, idx, _win + 1.0)
+
+f_update_dd_stats(float[] sumArr, float[] cntArr, int idx, float dd, bool do_update) =>
+    if do_update and not na(dd)
+        _sum = array.get(sumArr, idx)
+        _cnt = array.get(cntArr, idx)
+        array.set(sumArr, idx, _sum + dd)
+        array.set(cntArr, idx, _cnt + 1.0)
+
+f_update_market_for_L(int L, bool do_update, float[] sumArr, float[] sumSqArr, float[] cntArr, float[] winArr, bool doDD, float[] sumDD, float[] cntDD) =>
+    _bucket = f_bucket_from_risk(risk_pct[L])
+    for m = 0 to 5
+        _c    = f_market_close(m)
+        _cL   = _c[L]
+        _ret  = f_compute_return(_c, _cL, use_log_return, ret_clip_lo, ret_clip_hi)
+        _lo   = f_market_low(m)
+        _loL  = ta.lowest(_lo, L + 1)
+        _dd   = not na(_cL) and not na(_loL) and _cL != 0 ? _loL / _cL - 1.0 : na
+
+        if do_update and not na(_bucket)
+            _idx = m * 5 + _bucket
+            f_update_return_stats(sumArr, sumSqArr, cntArr, winArr, _idx, _ret, true)
+            if doDD
+                f_update_dd_stats(sumDD, cntDD, _idx, _dd, true)
+
+f_update_sector_for_L(int L, bool do_update, float[] sumArr, float[] sumSqArr, float[] cntArr, float[] winArr) =>
+    _bucket = f_bucket_from_risk(risk_pct[L])
+    _cb     = benchmark_close
+    _cbL    = _cb[L]
+    _rb     = f_compute_return(_cb, _cbL, use_log_return, ret_clip_lo, ret_clip_hi)
+
+    for s = 0 to 10
+        _c   = f_sector_close(s)
+        _cL  = _c[L]
+        _rs  = f_compute_return(_c, _cL, use_log_return, ret_clip_lo, ret_clip_hi)
+        _rr  = not na(_rs) and not na(_rb) ? _rs - _rb : na
+
+        if do_update and not na(_bucket)
+            _idx = s * 5 + _bucket
+            f_update_return_stats(sumArr, sumSqArr, cntArr, winArr, _idx, _rr, true)
+
+f_update_transition(int L, bool do_update) =>
+    _from = f_bucket_from_risk(risk_pct[L])
+    _to   = f_bucket_from_risk(risk_pct)
+    _cb   = benchmark_close
+    _cbL  = _cb[L]
+    _rb   = f_compute_return(_cb, _cbL, use_log_return, ret_clip_lo, ret_clip_hi)
+
+    if do_update and not na(_from) and not na(_to)
+        _idx = _from * 5 + _to
+        array.set(transCnt, _idx, array.get(transCnt, _idx) + 1.0)
+        if not na(_rb)
+            array.set(transSumRet, _idx, array.get(transSumRet, _idx) + _rb)
+            if _rb > 0
+                array.set(transWin, _idx, array.get(transWin, _idx) + 1.0)
+
+bool is_new_equity_bar = ta.change(time(tf_equity)) != 0
+var int eq_bar_count = 0
+
+f_should_update_for_L(int L) =>
+    not use_non_overlap ? true : (eq_bar_count % L == 0)
+
+bool valid_sample_bar = not use_start_year or year(time(tf_equity)) >= start_year
+
+if is_new_equity_bar
+    eq_bar_count += 1
+
+do_update_R5   = is_new_equity_bar and valid_sample_bar and calc_R5  and f_should_update_for_L(5)
+do_update_R20  = is_new_equity_bar and valid_sample_bar and calc_R20 and f_should_update_for_L(20)
+do_update_R60  = is_new_equity_bar and valid_sample_bar and calc_R60 and f_should_update_for_L(60)
+do_update_trans= is_new_equity_bar and valid_sample_bar and f_should_update_for_L(trans_L)
+
+f_update_market_for_L(5,  do_update_R5,  sumR5_market,  sumSqR5_market,  cntR5_market,  winR5_market,  false,      sumDD20_market, cntDD20_market)
+f_update_sector_for_L(5,  do_update_R5,  sumRR5_sector, sumSqRR5_sector, cntRR5_sector, winRR5_sector)
+
+f_update_market_for_L(20, do_update_R20, sumR20_market, sumSqR20_market, cntR20_market, winR20_market, calc_DD20,  sumDD20_market, cntDD20_market)
+f_update_sector_for_L(20, do_update_R20, sumRR20_sector, sumSqRR20_sector, cntRR20_sector, winRR20_sector)
+
+f_update_market_for_L(60, do_update_R60, sumR60_market, sumSqR60_market, cntR60_market, winR60_market, calc_DD60,  sumDD60_market, cntDD60_market)
+f_update_sector_for_L(60, do_update_R60, sumRR60_sector, sumSqRR60_sector, cntRR60_sector, winRR60_sector)
+
+f_update_transition(trans_L, do_update_trans)
+
+//======================================================
+// 7) BUCKET SELECTION
+//======================================================
+
+int bucket_auto = f_bucket_from_risk(risk_pct)
+int bucket_sel  = na
+
+if bucket_view == "Auto (current)"
+    bucket_sel := bucket_auto
+else if bucket_view == "B0 (0-20)"
+    bucket_sel := 0
+else if bucket_view == "B1 (20-40)"
+    bucket_sel := 1
+else if bucket_view == "B2 (40-60)"
+    bucket_sel := 2
+else if bucket_view == "B3 (60-80)"
+    bucket_sel := 3
+else if bucket_view == "B4 (80-100)"
+    bucket_sel := 4
+
+if na(bucket_sel)
+    bucket_sel := 2
+
+//======================================================
+// 8) PANEL FLAGS
+//======================================================
+
+show_panel1 = panel_view == "Panel 1 - Macro Weather"
+show_panel2 = panel_view == "Panel 2 - Market Regime Map"
+show_panel3 = panel_view == "Panel 3 - Sector Rotation Map"
+show_panel4 = panel_view == "Panel 4 - Transition Summary"
+
+//======================================================
+// 9) PANEL 1
+//======================================================
+
+stress_txt = score_stress >= 80 ? "TIGHT" : score_stress <= 20 ? "EASY" : "MID"
+curve_txt  = score_curve  >= 80 ? "FLAT/INV" : score_curve <= 20 ? "STEEP/OK" : "MID"
+intl_txt   = score_intl   >= 80 ? "EXT PRESS" : score_intl <= 20 ? "OK" : "MID"
+lsp_txt    = score_lsp    >= 80 ? "COMPRESSED" : score_lsp <= 20 ? "OK" : "MID"
+
+int idx_vni_cur = 0 * 5 + risk_bucket_now
+vni_avgR20 = f_avg(array.get(sumR20_market, idx_vni_cur), array.get(cntR20_market, idx_vni_cur))
+vni_win20  = f_winrate(array.get(winR20_market, idx_vni_cur), array.get(cntR20_market, idx_vni_cur))
+vni_t20    = f_tlike(array.get(sumR20_market, idx_vni_cur), array.get(sumSqR20_market, idx_vni_cur), array.get(cntR20_market, idx_vni_cur))
+vni_n20    = array.get(cntR20_market, idx_vni_cur)
+vni_dd20   = f_avg(array.get(sumDD20_market, idx_vni_cur), array.get(cntDD20_market, idx_vni_cur))
+vni_conf20 = f_conf_label(vni_t20, vni_n20, min_n_market)
+
+takeaway_dir =
+     na(vni_avgR20) or vni_n20 < min_n_market ? "DATA THIN" :
+     vni_avgR20 > 0 and risk_bucket_now <= 1 ? "RISK-ON SUPPORTIVE" :
+     vni_avgR20 > 0 and risk_bucket_now == 2 ? "BALANCED POSITIVE" :
+     vni_avgR20 <= 0 and risk_bucket_now >= 3 ? "DEFENSIVE / HIGH RISK" :
+     "MIXED"
+
+var table summary_table = na
+var table bucket_table  = na
+var label risk_label    = na
+
+if barstate.islast
+    if not na(risk_label)
+        label.delete(risk_label)
+    risk_label := label.new(bar_index, risk_pct,
+         "Risk " + str.tostring(risk_pct, "#.#") + "% | " + f_bucket_label(risk_bucket_now),
+         style=label.style_label_left,
+         textcolor=color.white,
+         color=color.new(color.blue, 65),
+         size=size.small)
+
+if barstate.islast
+    if show_panel1
+        if na(summary_table)
+            summary_table := table.new(position.top_right, 3, 8, bgcolor=color.new(color.black, 15), border_width=2, border_color=color.new(color.white, 20))
+            table.merge_cells(summary_table, 0, 0, 2, 0)
+    else
+        if not na(summary_table)
+            table.delete(summary_table)
+            summary_table := na
+
+if barstate.islast and show_panel1 and not na(summary_table)
+    table.cell(summary_table, 0, 0, " Macro Weather | " + f_bucket_label(risk_bucket_now) + " | " + f_bucket_text(risk_bucket_now), bgcolor=color.new(color.orange, 0), text_color=color.white, text_size=size.small)
+    table.cell(summary_table, 0, 1, "Risk", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(summary_table, 1, 1, str.tostring(risk_pct, "#.#") + "%", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(summary_table, 2, 1, "Arrow " + f_regime_arrow(risk_bucket_now, risk_bucket_prev20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+    table.cell(summary_table, 0, 2, "Pillar", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(summary_table, 1, 2, "Status", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(summary_table, 2, 2, "Score",  bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+
+    table.cell(summary_table, 0, 3, "Liquidity", bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.small)
+    table.cell(summary_table, 1, 3, stress_txt, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(summary_table, 2, 3, str.tostring(score_stress, "#.#"), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+    table.cell(summary_table, 0, 4, "Curve", bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.small)
+    table.cell(summary_table, 1, 4, curve_txt, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(summary_table, 2, 4, str.tostring(score_curve, "#.#"), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+    table.cell(summary_table, 0, 5, "Intl", bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.small)
+    table.cell(summary_table, 1, 5, intl_txt, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(summary_table, 2, 5, str.tostring(score_intl, "#.#"), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+    table.cell(summary_table, 0, 6, "10Y-Policy", bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.small)
+    table.cell(summary_table, 1, 6, lsp_txt, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(summary_table, 2, 6, str.tostring(score_lsp, "#.#"), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+    txtAvg = not na(vni_avgR20) ? str.tostring(vni_avgR20 * 100.0, "#.##") + "%" : "--"
+    txtWin = not na(vni_win20) ? str.tostring(vni_win20, "#.#") + "%" : "--"
+    txtDD  = not na(vni_dd20)  ? str.tostring(vni_dd20  * 100.0, "#.##") + "%" : "--"
+    txtN   = str.tostring(math.round(vni_n20))
+
+    table.cell(summary_table, 0, 7, "TAKEAWAY", bgcolor=color.new(color.blue, 15), text_color=color.white, text_size=size.small)
+    table.cell(summary_table, 1, 7, takeaway_dir + " | AvgR20 " + txtAvg + " | Win " + txtWin, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(summary_table, 2, 7, "DD20 " + txtDD + " | N " + txtN + " | " + vni_conf20, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+if barstate.islast
+    if show_panel1 and show_bucket_guide
+        if na(bucket_table)
+            bucket_table := table.new(position.bottom_left, 2, 6, bgcolor=color.new(color.black, 75), border_width=1, border_color=color.new(color.white, 25))
+            table.merge_cells(bucket_table, 0, 0, 1, 0)
+    else
+        if not na(bucket_table)
+            table.delete(bucket_table)
+            bucket_table := na
+
+if barstate.islast and show_panel1 and show_bucket_guide and not na(bucket_table)
+    table.cell(bucket_table, 0, 0, "Macro Risk Buckets", bgcolor=color.new(color.blue, 35), text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 0, 1, "B0", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 1, 1, "0-20  : very supportive", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 0, 2, "B1", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 1, 2, "20-40 : supportive", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 0, 3, "B2", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 1, 3, "40-60 : neutral", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 0, 4, "B3", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 1, 4, "60-80 : risky", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 0, 5, "B4", text_color=color.white, text_size=size.tiny)
+    table.cell(bucket_table, 1, 5, "80-100: high stress", text_color=color.white, text_size=size.tiny)
+
+//======================================================
+// 10) PANEL 2
+//======================================================
+
+var table market_table = na
+if barstate.islast
+    if show_panel2
+        if na(market_table)
+            market_table := table.new(position.top_right, 7, 8, bgcolor=color.new(color.black, 20), border_width=2, border_color=color.new(color.white, 20))
+            table.merge_cells(market_table, 0, 0, 6, 0)
+    else
+        if not na(market_table)
+            table.delete(market_table)
+            market_table := na
+
+if barstate.islast and show_panel2 and not na(market_table)
+    table.cell(market_table, 0, 0, " Market Regime Map | " + f_bucket_label(bucket_sel) + " | Risk " + str.tostring(risk_pct, "#.#") + "%", bgcolor=color.new(color.blue, 0), text_color=color.white, text_size=size.small)
+
+    table.cell(market_table, 0, 1, "Index",   bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 1, 1, "AvgR20",  bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 2, 1, "Win20%",  bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 3, 1, "T-like",  bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 4, 1, "AvgR60",  bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 5, 1, "AvgDD20", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 6, 1, "N20",     bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+
+    for m = 0 to 5
+        row = m + 2
+        idx = m * 5 + bucket_sel
+
+        avgR20 = f_avg(array.get(sumR20_market, idx), array.get(cntR20_market, idx))
+        win20  = f_winrate(array.get(winR20_market, idx), array.get(cntR20_market, idx))
+        t20    = f_tlike(array.get(sumR20_market, idx), array.get(sumSqR20_market, idx), array.get(cntR20_market, idx))
+        n20    = array.get(cntR20_market, idx)
+
+        avgR60 = f_avg(array.get(sumR60_market, idx), array.get(cntR60_market, idx))
+        avgDD20= f_avg(array.get(sumDD20_market, idx), array.get(cntDD20_market, idx))
+
+        enough = n20 >= min_n_market
+
+        txtR20 = enough and not na(avgR20) ? str.tostring(avgR20 * 100.0, "#.##") + "%" : "--"
+        txtW20 = enough and not na(win20)  ? str.tostring(win20, "#.#") + "%" : "--"
+        txtT20 = enough and not na(t20)    ? str.tostring(t20, "#.##") : "--"
+        txtR60 = calc_R60 and not na(avgR60) ? str.tostring(avgR60 * 100.0, "#.##") + "%" : (calc_R60 ? "--" : "OFF")
+        txtDD  = calc_DD20 and not na(avgDD20) ? str.tostring(avgDD20 * 100.0, "#.##") + "%" : (calc_DD20 ? "--" : "OFF")
+        txtN   = str.tostring(math.round(n20))
+
+        table.cell(market_table, 0, row, array.get(market_name, m), bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 1, row, txtR20, bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 2, row, txtW20, bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 3, row, txtT20, bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 4, row, txtR60, bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 5, row, txtDD,  bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 6, row, txtN,   bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+
+//======================================================
+// 11) PANEL 3
+//======================================================
+
+var table sector_table = na
+if barstate.islast
+    if show_panel3
+        if na(sector_table)
+            sector_table := table.new(position.bottom_right, 5, 12, bgcolor=color.new(color.black, 15), border_width=2, border_color=color.new(color.white, 20))
+            table.merge_cells(sector_table, 0, 0, 4, 0)
+    else
+        if not na(sector_table)
+            table.delete(sector_table)
+            sector_table := na
+
+if barstate.islast and show_panel3 and not na(sector_table)
+    table.cell(sector_table, 0, 0, " Sector Rotation Map | " + f_bucket_label(bucket_sel) + " | RR vs VNINDEX", bgcolor=color.new(color.teal, 0), text_color=color.white, text_size=size.small)
+
+    avgRR = array.new_float(11, na)
+    cntRR = array.new_float(11, na)
+    tRR   = array.new_float(11, na)
+
+    for s = 0 to 10
+        idx = s * 5 + bucket_sel
+        _avg = f_avg(array.get(sumRR20_sector, idx), array.get(cntRR20_sector, idx))
+        _cnt = array.get(cntRR20_sector, idx)
+        _t   = f_tlike(array.get(sumRR20_sector, idx), array.get(sumSqRR20_sector, idx), array.get(cntRR20_sector, idx))
+        array.set(avgRR, s, _avg)
+        array.set(cntRR, s, _cnt)
+        array.set(tRR, s, _t)
+
+    topIdx  = array.new_int(3, -1)
+    botIdx  = array.new_int(3, -1)
+    usedTop = array.new_bool(11, false)
+    usedBot = array.new_bool(11, false)
+
+    for k = 0 to 2
+        float bestVal = na
+        int bestIdx = -1
+        for s = 0 to 10
+            v = array.get(avgRR, s)
+            c = array.get(cntRR, s)
+            u = array.get(usedTop, s)
+            if not u and not na(v) and c >= min_n_sector
+                if bestIdx == -1 or v > bestVal
+                    bestVal := v
+                    bestIdx := s
+        array.set(topIdx, k, bestIdx)
+        if bestIdx != -1
+            array.set(usedTop, bestIdx, true)
+
+    for k = 0 to 2
+        float worstVal = na
+        int worstIdx = -1
+        for s = 0 to 10
+            v = array.get(avgRR, s)
+            c = array.get(cntRR, s)
+            u = array.get(usedBot, s)
+            if not u and not na(v) and c >= min_n_sector
+                if worstIdx == -1 or v < worstVal
+                    worstVal := v
+                    worstIdx := s
+        array.set(botIdx, k, worstIdx)
+        if worstIdx != -1
+            array.set(usedBot, worstIdx, true)
+
+    table.cell(sector_table, 0, 1, "Top", bgcolor=color.new(color.green, 20), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 1, 1, "Sector", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 2, 1, "AvgRR20", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 3, 1, "T-like", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 4, 1, "N", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+
+    for k = 0 to 2
+        row = 2 + k
+        sidx = array.get(topIdx, k)
+        if sidx == -1
+            table.cell(sector_table, 0, row, "T" + str.tostring(k + 1), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 1, row, "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 2, row, "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 3, row, "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 4, row, "0", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        else
+            _avg = array.get(avgRR, sidx)
+            _cnt = array.get(cntRR, sidx)
+            _t   = array.get(tRR, sidx)
+            table.cell(sector_table, 0, row, "T" + str.tostring(k + 1), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 1, row, array.get(sector_name, sidx), bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 2, row, str.tostring(_avg * 100.0, "#.##") + "%", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 3, row, not na(_t) ? str.tostring(_t, "#.##") : "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 4, row, str.tostring(math.round(_cnt)), bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+
+    table.cell(sector_table, 0, 6, "Bottom", bgcolor=color.new(color.red, 20), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 1, 6, "Sector", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 2, 6, "AvgRR20", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 3, 6, "T-like", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 4, 6, "N", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+
+    for k = 0 to 2
+        row = 7 + k
+        sidx = array.get(botIdx, k)
+        if sidx == -1
+            table.cell(sector_table, 0, row, "B" + str.tostring(k + 1), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 1, row, "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 2, row, "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 3, row, "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 4, row, "0", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        else
+            _avg = array.get(avgRR, sidx)
+            _cnt = array.get(cntRR, sidx)
+            _t   = array.get(tRR, sidx)
+            table.cell(sector_table, 0, row, "B" + str.tostring(k + 1), bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 1, row, array.get(sector_name, sidx), bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 2, row, str.tostring(_avg * 100.0, "#.##") + "%", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 3, row, not na(_t) ? str.tostring(_t, "#.##") : "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 4, row, str.tostring(math.round(_cnt)), bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+
+    best_name  = array.get(topIdx, 0) != -1 ? array.get(sector_name, array.get(topIdx, 0)) : "--"
+    worst_name = array.get(botIdx, 0) != -1 ? array.get(sector_name, array.get(botIdx, 0)) : "--"
+    table.cell(sector_table, 0, 10, "Takeaway", bgcolor=color.new(color.blue, 15), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 1, 10, best_name, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 2, 10, "vs", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 3, 10, worst_name, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 4, 10, f_bucket_label(bucket_sel), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+//======================================================
+// 12) PANEL 4
+//======================================================
+
+var table trans_table = na
+if barstate.islast
+    if show_panel4
+        if na(trans_table)
+            trans_table := table.new(position.bottom_left, 4, 6, bgcolor=color.new(color.black, 15), border_width=2, border_color=color.new(color.white, 20))
+            table.merge_cells(trans_table, 0, 0, 3, 0)
+    else
+        if not na(trans_table)
+            table.delete(trans_table)
+            trans_table := na
+
+if barstate.islast and show_panel4 and not na(trans_table)
+    b_now = risk_bucket_now
+    table.cell(trans_table, 0, 0, " Transition Summary (L=" + str.tostring(trans_L) + ") | From " + f_bucket_label(b_now), bgcolor=color.new(color.orange, 0), text_color=color.white, text_size=size.small)
+
+    rowTot  = 0.0
+    upCnt   = 0.0
+    sameCnt = 0.0
+    downCnt = 0.0
+    retSum  = 0.0
+    winSum  = 0.0
+
+    for c = 0 to 4
+        _idx = b_now * 5 + c
+        _cnt = array.get(transCnt, _idx)
+        _ret = array.get(transSumRet, _idx)
+        _win = array.get(transWin, _idx)
+
+        rowTot += _cnt
+        retSum += _ret
+        winSum += _win
+
+        if c > b_now
+            upCnt += _cnt
+        else if c < b_now
+            downCnt += _cnt
+        else
+            sameCnt += _cnt
+
+    upProb   = rowTot > 0 ? upCnt / rowTot * 100.0 : na
+    sameProb = rowTot > 0 ? sameCnt / rowTot * 100.0 : na
+    downProb = rowTot > 0 ? downCnt / rowTot * 100.0 : na
+    avgRet   = rowTot > 0 ? retSum / rowTot : na
+    winProb  = rowTot > 0 ? winSum / rowTot * 100.0 : na
+
+    enoughTrans = rowTot >= min_n_trans
+
+    table.cell(trans_table, 0, 1, "Direction", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(trans_table, 1, 1, "Prob%", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(trans_table, 2, 1, "AvgRet", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(trans_table, 3, 1, "N", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+
+    table.cell(trans_table, 0, 2, "Up risk", bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+    table.cell(trans_table, 1, 2, enoughTrans and not na(upProb) ? str.tostring(upProb, "#.#") + "%" : "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+    table.cell(trans_table, 2, 2, "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+    table.cell(trans_table, 3, 2, str.tostring(math.round(rowTot)), bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+
+    table.cell(trans_table, 0, 3, "Same bucket", bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+    table.cell(trans_table, 1, 3, enoughTrans and not na(sameProb) ? str.tostring(sameProb, "#.#") + "%" : "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+    table.cell(trans_table, 2, 3, enoughTrans and not na(avgRet) ? str.tostring(avgRet * 100.0, "#.##") + "%" : "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+    table.cell(trans_table, 3, 3, str.tostring(math.round(rowTot)), bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+
+    table.cell(trans_table, 0, 4, "Down risk", bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+    table.cell(trans_table, 1, 4, enoughTrans and not na(downProb) ? str.tostring(downProb, "#.#") + "%" : "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+    table.cell(trans_table, 2, 4, enoughTrans and not na(winProb) ? "Win " + str.tostring(winProb, "#.#") + "%" : "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+    table.cell(trans_table, 3, 4, str.tostring(math.round(rowTot)), bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+
+    transTakeaway =
+         not enoughTrans ? "DATA THIN" :
+         sameProb >= 50 ? "STICKY REGIME" :
+         upProb > downProb ? "RISK DETERIORATING" :
+         downProb > upProb ? "RISK IMPROVING" : "BALANCED"
+
+    table.cell(trans_table, 0, 5, "Takeaway", bgcolor=color.new(color.blue, 15), text_color=color.white, text_size=size.small)
+    table.cell(trans_table, 1, 5, transTakeaway, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(trans_table, 2, 5, enoughTrans and not na(avgRet) ? "Avg " + str.tostring(avgRet * 100.0, "#.##") + "%" : "--", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(trans_table, 3, 5, "N " + str.tostring(math.round(rowTot)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
