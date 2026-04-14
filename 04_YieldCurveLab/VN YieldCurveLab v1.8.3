@@ -1,6 +1,6 @@
 //@version=5
-indicator("VN YieldCurveLab v1.8.1 — Academic Defaults + Predictive Overlay (STRICT, CLEAN)",
-     shorttitle="VN YieldCurveLab 1.8.1",
+indicator("VN YieldCurveLab v1.8.3 — Daily Dashboard + Split Research",
+     shorttitle="VN YieldCurveLab 1.8.3",
      overlay=false,
      max_labels_count=500,
      max_lines_count=500,
@@ -10,10 +10,11 @@ indicator("VN YieldCurveLab v1.8.1 — Academic Defaults + Predictive Overlay (S
 //======================================================
 // 0) INPUT (ONLY PANEL)
 //======================================================
-panel_view = input.int(1, "Panel (1=Shape, 2=Grid, 3=Research+Predictive)", minval=1, maxval=3)
+panel_view = input.int(1, "Panel (1=Daily, 2=Grid, 3=Research, 4=Predictive)", minval=1, maxval=4)
 show_p1 = panel_view == 1
 show_p2 = panel_view == 2
 show_p3 = panel_view == 3
+show_p4 = panel_view == 4
 
 //======================================================
 // 1) ACADEMIC DEFAULTS (STRICT, HARD-CODED)
@@ -109,10 +110,12 @@ f_partial_corr(r_xy, r_xz, r_yz) =>
 
 f_bg_tag(tag) =>
     color out = color.new(color.gray, 85)
-    if tag == "HIGH" or tag == "RICH" or tag == "YC4" or tag == "INVERTED" or tag == "STRESS HIGH" or tag == "LOWQ" or tag == "DATAQ LOW" or tag == "DEFENSIVE"
+    if tag == "HIGH" or tag == "RICH" or tag == "YC4" or tag == "INVERTED" or tag == "STRESS HIGH" or tag == "LOWQ" or tag == "DATAQ LOW" or tag == "DEFENSIVE" or tag == "TIGHT"
         out := color.new(color.red, 12)
-    else if tag == "LOW" or tag == "CHEAP" or tag == "YC1" or tag == "STRESS LOW" or tag == "HIGHQ" or tag == "DATAQ HIGH" or tag == "RISK-ON"
+    else if tag == "LOW" or tag == "CHEAP" or tag == "YC1" or tag == "STRESS LOW" or tag == "HIGHQ" or tag == "DATAQ HIGH" or tag == "RISK-ON" or tag == "EASING"
         out := color.new(color.lime, 14)
+    else if tag == "MID" or tag == "MIXED"
+        out := color.new(color.orange, 16)
     else
         out := color.new(color.orange, 16)
     out
@@ -242,14 +245,18 @@ dataq_label =
      cov_core >= COV_HIGH ? "DATAQ HIGH" :
      cov_core >= COV_MED  ? "DATAQ MED"  : "DATAQ LOW"
 
-stress_adj = macro_stress * (qual_total / 100.0)
-
-stress_pct  = ta.percentrank(macro_stress, LEN_STATS)
-stressA_pct = ta.percentrank(stress_adj,   LEN_STATS)
+// v1.8.2: quality no longer dilutes macro stress.
+// Macro stress is the economic signal; quality is confidence / gating only.
+stress_pct = ta.percentrank(macro_stress, LEN_STATS)
+stress_conf = qual_total
 
 stress_reg =
-     stressA_pct >= STRESS_HIGH_PCTL ? "STRESS HIGH" :
-     stressA_pct <= STRESS_LOW_PCTL  ? "STRESS LOW"  : "MID"
+     stress_pct >= STRESS_HIGH_PCTL ? "STRESS HIGH" :
+     stress_pct <= STRESS_LOW_PCTL  ? "STRESS LOW"  : "MID"
+
+stress_level =
+     stress_pct >= STRESS_HIGH_PCTL ? "HIGH" :
+     stress_pct <= STRESS_LOW_PCTL  ? "LOW"  : "MID"
 
 //======================================================
 // 6) YC REGIME
@@ -274,6 +281,37 @@ else if level_reg == "LOW" and slope_reg == "STEEP_HIGH"
 else if level_reg == "LOW"
     yc_code  := "YC1"
     yc_label := "Easing mature: low level."
+
+//======================================================
+// 6B) MACRO REGIME + STRESS TYPE (v1.8.2a)
+//======================================================
+string macro_regime = "MIXED"
+
+if yc_code == "YC4" or yc_code == "YC3"
+    macro_regime := "TIGHT"
+else if yc_code == "YC2" or yc_code == "YC1"
+    macro_regime := "EASING"
+else
+    macro_regime := "MIXED"
+
+string stress_type = "MIXED/TRANSITION"
+
+if macro_regime == "TIGHT" and slope_reg == "STEEP_HIGH" and (stress_level == "HIGH" or stress_level == "MID")
+    stress_type := "GROWTH/TIGHTENING"
+else if macro_regime == "TIGHT" and stress_level == "HIGH"
+    stress_type := "TIGHT/RISK-OFF"
+else if macro_regime == "TIGHT" and stress_level == "MID"
+    stress_type := "TIGHT/TRANSITION"
+else if macro_regime == "TIGHT" and stress_level == "LOW"
+    stress_type := "TIGHT/BENIGN"
+else if macro_regime == "EASING" and stress_level == "LOW"
+    stress_type := "EASING/BENIGN"
+else if macro_regime == "EASING" and stress_level == "MID"
+    stress_type := "EASING/TRANSITION"
+else if macro_regime == "EASING" and stress_level == "HIGH"
+    stress_type := "EASING/STRESS"
+else
+    stress_type := "MIXED/TRANSITION"
 
 //======================================================
 // 7) PLOTS
@@ -301,8 +339,8 @@ y_min = ta.lowest(yc_min6, LEN_STATS)
 y_max = ta.highest(yc_max6, LEN_STATS)
 y_rng = y_max - y_min
 
-stress_map = y_min + (stressA_pct / 100.0) * (y_rng > 0 ? y_rng : 1.0)
-plot(stress_map, "StressPCTL(mapped)", color.new(color.white, 35), 2)
+stress_map = y_min + (stress_pct / 100.0) * (y_rng > 0 ? y_rng : 1.0)
+plot(stress_map, "MacroStressPCTL(mapped)", color.new(color.white, 35), 2)
 
 //======================================================
 // 8) RESEARCH CORE (STRICT)
@@ -311,13 +349,13 @@ bool tf_ok = timeframe.isdaily
 int  needBars = LEN_STATS + LEN_RESEARCH + LAG3 + H20 + 30
 bool enoughBars = bar_index >= needBars
 
-bool valid_all = tf_ok and enoughBars and core_raw_ok and (not na(stressA_pct)) and (not na(vnx_ret_clip))
+bool valid_all = tf_ok and enoughBars and core_raw_ok and (not na(stress_pct)) and (not na(vnx_ret_clip))
 
 float n_eff = f_count(valid_all, LEN_RESEARCH)
 float ratio = n_eff / LEN_RESEARCH
 bool  ready = (ratio >= MIN_EFF_RATIO) and (cov_core >= COV_MED) and tf_ok and enoughBars
 
-float rhoS = ta.correlation(stressA_pct, stressA_pct[1], LEN_RESEARCH)
+float rhoS = ta.correlation(stress_pct, stress_pct[1], LEN_RESEARCH)
 float rhoR = ta.correlation(vnx_ret_clip, vnx_ret_clip[1], LEN_RESEARCH)
 float cdi  = rhoS * rhoR
 
@@ -331,26 +369,26 @@ if ready and not na(cdi) and math.abs(cdi) < 0.98 and (1 + cdi) != 0
 float df_corr  = (persist_on and not na(n_eff_ar)) ? (n_eff_ar - 2.0) : na
 float df_pcorr = (persist_on and not na(n_eff_ar)) ? (n_eff_ar - 3.0) : na
 
-float corr_raw = ta.correlation(stress_pct,  vnx_ret_clip, LEN_RESEARCH)
-float corr_adj = ta.correlation(stressA_pct, vnx_ret_clip, LEN_RESEARCH)
+float corr_raw = ta.correlation(stress_pct, vnx_ret_clip, LEN_RESEARCH)
+float corr_adj = corr_raw
 float r2_adj   = not na(corr_adj) ? corr_adj * corr_adj : na
 float t_adj_ar = f_t_from_df(corr_adj, df_corr)
 
 float ctrl = (ib + pr) / 2.0
 float ctrl_pct = ta.percentrank(ctrl, LEN_STATS)
-float r_xz = ta.correlation(stressA_pct,  ctrl_pct, LEN_RESEARCH)
+float r_xz = ta.correlation(stress_pct,  ctrl_pct, LEN_RESEARCH)
 float r_yz = ta.correlation(vnx_ret_clip, ctrl_pct, LEN_RESEARCH)
 float pcorr = f_partial_corr(corr_adj, r_xz, r_yz)
 float t_pcorr_ar = f_t_from_df(pcorr, df_pcorr)
 
-float rL1  = ta.correlation(stressA_pct[LAG1], vnx_ret_clip, LEN_RESEARCH)
-float rL5  = ta.correlation(stressA_pct[LAG2], vnx_ret_clip, LEN_RESEARCH)
-float rL20 = ta.correlation(stressA_pct[LAG3], vnx_ret_clip, LEN_RESEARCH)
+float rL1  = ta.correlation(stress_pct[LAG1], vnx_ret_clip, LEN_RESEARCH)
+float rL5  = ta.correlation(stress_pct[LAG2], vnx_ret_clip, LEN_RESEARCH)
+float rL20 = ta.correlation(stress_pct[LAG3], vnx_ret_clip, LEN_RESEARCH)
 
 // Precompute half-window lag correlations on every bar
-float rL1_half  = ta.correlation(stressA_pct[LAG1], vnx_ret_clip, LEN_HALF)
-float rL5_half  = ta.correlation(stressA_pct[LAG2], vnx_ret_clip, LEN_HALF)
-float rL20_half = ta.correlation(stressA_pct[LAG3], vnx_ret_clip, LEN_HALF)
+float rL1_half  = ta.correlation(stress_pct[LAG1], vnx_ret_clip, LEN_HALF)
+float rL5_half  = ta.correlation(stress_pct[LAG2], vnx_ret_clip, LEN_HALF)
+float rL20_half = ta.correlation(stress_pct[LAG3], vnx_ret_clip, LEN_HALF)
 
 int   bestLag = na
 float bestCorr = na
@@ -393,16 +431,16 @@ float stab_pct = eff_stab > 0 ? 100.0 * (1.0 - chg_stab / eff_stab) : na
 ret5_now  = (not na(vnx) and not na(vnx[H5])  and vnx[H5]  > 0) ? math.log(vnx / vnx[H5])  : na
 ret20_now = (not na(vnx) and not na(vnx[H20]) and vnx[H20] > 0) ? math.log(vnx / vnx[H20]) : na
 
-bool valid_pred5  = tf_ok and enoughBars and core_raw_ok[H5]  and (not na(stressA_pct[H5]))  and (not na(ret5_now))
-bool valid_pred20 = tf_ok and enoughBars and core_raw_ok[H20] and (not na(stressA_pct[H20])) and (not na(ret20_now))
+bool valid_pred5  = tf_ok and enoughBars and core_raw_ok[H5]  and (not na(stress_pct[H5]))  and (not na(ret5_now))
+bool valid_pred20 = tf_ok and enoughBars and core_raw_ok[H20] and (not na(stress_pct[H20])) and (not na(ret20_now))
 
-bool low5  = valid_pred5  and stressA_pct[H5]  <= STRESS_LOW_PCTL
-bool mid5  = valid_pred5  and stressA_pct[H5]  > STRESS_LOW_PCTL and stressA_pct[H5]  < STRESS_HIGH_PCTL
-bool high5 = valid_pred5  and stressA_pct[H5]  >= STRESS_HIGH_PCTL
+bool low5  = valid_pred5  and stress_pct[H5]  <= STRESS_LOW_PCTL
+bool mid5  = valid_pred5  and stress_pct[H5]  > STRESS_LOW_PCTL and stress_pct[H5]  < STRESS_HIGH_PCTL
+bool high5 = valid_pred5  and stress_pct[H5]  >= STRESS_HIGH_PCTL
 
-bool low20  = valid_pred20 and stressA_pct[H20] <= STRESS_LOW_PCTL
-bool mid20  = valid_pred20 and stressA_pct[H20] > STRESS_LOW_PCTL and stressA_pct[H20] < STRESS_HIGH_PCTL
-bool high20 = valid_pred20 and stressA_pct[H20] >= STRESS_HIGH_PCTL
+bool low20  = valid_pred20 and stress_pct[H20] <= STRESS_LOW_PCTL
+bool mid20  = valid_pred20 and stress_pct[H20] > STRESS_LOW_PCTL and stress_pct[H20] < STRESS_HIGH_PCTL
+bool high20 = valid_pred20 and stress_pct[H20] >= STRESS_HIGH_PCTL
 
 float n_low5  = f_count(low5,  LEN_RESEARCH)
 float n_mid5  = f_count(mid5,  LEN_RESEARCH)
@@ -475,8 +513,18 @@ float hit20 = stress_reg == "STRESS HIGH" ? hitDn_high20 : stress_reg == "STRESS
 float neg5 = stress_reg == "STRESS HIGH" ? neg_mean_high5 : stress_reg == "STRESS LOW" ? neg_mean_low5 : neg_mean_mid5
 float neg20 = stress_reg == "STRESS HIGH" ? neg_mean_high20 : stress_reg == "STRESS LOW" ? neg_mean_low20 : neg_mean_mid20
 
+// v1.8.2: paradox flag.
+// High macro stress with positive realized forward returns suggests the regime may be growth/tightening, not pure risk-off.
+bool paradox_high_positive =
+     pred_ready and stress_reg == "STRESS HIGH" and
+     not na(exp5) and not na(exp20) and
+     exp5 > 0 and exp20 > 0
+
+string paradox_note =
+     paradox_high_positive ? "PARADOX: high stress but positive forward returns." : "No major paradox."
+
 // Transition persistence
-int stress_state = stressA_pct >= STRESS_HIGH_PCTL ? 3 : stressA_pct <= STRESS_LOW_PCTL ? 1 : 2
+int stress_state = stress_pct >= STRESS_HIGH_PCTL ? 3 : stress_pct <= STRESS_LOW_PCTL ? 1 : 2
 
 bool trans_valid = tf_ok and enoughBars and (not na(stress_state)) and (not na(stress_state[1]))
 bool from_high = trans_valid and stress_state[1] == 3
@@ -517,19 +565,23 @@ float conf_infer   = best_accept ? 100.0 : 60.0
 float conf_persist = not na(regime_persist) ? regime_persist : 50.0
 float pred_conf    = math.min(qual_total, math.min(conf_sample, math.min(conf_infer, conf_persist)))
 
-string decision_bias = "NEUTRAL"
+string tactical_bias = "NEUTRAL"
 if pred_ready
     if stress_reg == "STRESS HIGH" and not na(exp5) and not na(hit5) and exp5 < 0 and hit5 >= HIT_ACCEPT and nz(regime_persist, 0) >= PERSIST_ACCEPT
-        decision_bias := "DEFENSIVE"
+        tactical_bias := "DEFENSIVE"
     else if stress_reg == "STRESS LOW" and not na(exp5) and not na(hit5) and exp5 > 0 and hit5 <= (100.0 - HIT_ACCEPT) and nz(regime_persist, 0) >= PERSIST_ACCEPT
-        decision_bias := "RISK-ON"
+        tactical_bias := "RISK-ON"
     else
-        decision_bias := "NEUTRAL"
+        tactical_bias := "NEUTRAL"
 
 string pred_note =
      not pred_ready ? "PRED WAIT" :
-     decision_bias == "DEFENSIVE" ? "Bias phong thu." :
-     decision_bias == "RISK-ON" ? "Bias thuan rui ro." : "Bias trung tinh."
+     tactical_bias == "DEFENSIVE" ? "Macro stress confirmed by bearish evidence." :
+     tactical_bias == "RISK-ON" ? "Low stress confirmed by positive evidence." :
+     paradox_high_positive ? "Macro tight, but historical forward returns are positive." :
+     "Macro signal and tactical evidence are mixed."
+
+string short_msg = "Macro " + macro_regime + " | Stress " + stress_level + " | Bias " + tactical_bias
 
 //======================================================
 // 10) TABLES
@@ -537,6 +589,7 @@ string pred_note =
 var table t1 = na
 var table t2 = na
 var table t3 = na
+var table t4 = na
 
 bg_title  = color.new(color.black, 10)
 bg_head   = color.new(color.black, 25)
@@ -549,61 +602,71 @@ f_cell(t, c, r, txt, bg, ha, sz) =>
     table.cell(t, c, r, txt, bgcolor=bg, text_color=tc, text_halign=ha, text_size=sz)
 
 if barstate.islast
-    // -------- Panel 1
+    // -------- Panel 1: Daily Dashboard
     if show_p1
         if na(t1)
-            t1 := table.new(position.top_left, 4, 10, frame_width=2, frame_color=frame_col)
+            t1 := table.new(position.top_left, 4, 12, frame_width=2, frame_color=frame_col)
 
-        f_cell(t1, 0, 0, "P1 | SHAPE (STRICT DEFAULTS + V1.8.1)", bg_title, text.align_left, size.small)
+        f_cell(t1, 0, 0, "P1 | DAILY DASHBOARD (V1.8.3)", bg_title, text.align_left, size.small)
         f_cell(t1, 1, 0, "", bg_title, text.align_left, size.small)
         f_cell(t1, 2, 0, "", bg_title, text.align_left, size.small)
         f_cell(t1, 3, 0, "", bg_title, text.align_left, size.small)
 
-        f_cell(t1, 0, 1, "ITEM",  bg_head, text.align_left,  size.tiny)
-        f_cell(t1, 1, 1, "VALUE", bg_head, text.align_right, size.tiny)
-        f_cell(t1, 2, 1, "PCTL",  bg_head, text.align_right, size.tiny)
-        f_cell(t1, 3, 1, "STATE", bg_head, text.align_left,  size.tiny)
+        f_cell(t1, 0, 1, "TODAY", bg_head, text.align_left, size.tiny)
+        f_cell(t1, 1, 1, "STATE", bg_head, text.align_right, size.tiny)
+        f_cell(t1, 2, 1, "CONF", bg_head, text.align_right, size.tiny)
+        f_cell(t1, 3, 1, "NOTE", bg_head, text.align_left, size.tiny)
 
-        f_cell(t1, 0, 2, "LEVEL", bg_a, text.align_left, size.tiny)
-        f_cell(t1, 1, 2, f_num(level, "#.2"), bg_a, text.align_right, size.tiny)
-        f_cell(t1, 2, 2, f_num(level_pct, "#.1") + "%", bg_a, text.align_right, size.tiny)
-        f_cell(t1, 3, 2, level_reg, f_bg_tag(level_reg), text.align_left, size.tiny)
+        f_cell(t1, 0, 2, "MACRO REGIME", bg_a, text.align_left, size.tiny)
+        f_cell(t1, 1, 2, macro_regime, f_bg_tag(macro_regime), text.align_right, size.tiny)
+        f_cell(t1, 2, 2, quality_label, f_bg_tag(quality_label), text.align_right, size.tiny)
+        f_cell(t1, 3, 2, stress_type, bg_a, text.align_left, size.tiny)
 
-        f_cell(t1, 0, 3, "SLOPE(10-2)", bg_b, text.align_left, size.tiny)
-        f_cell(t1, 1, 3, f_num(slope, "#.2"), bg_b, text.align_right, size.tiny)
-        f_cell(t1, 2, 3, f_num(slope_pct, "#.1") + "%", bg_b, text.align_right, size.tiny)
-        f_cell(t1, 3, 3, slope_reg, f_bg_tag(slope_reg), text.align_left, size.tiny)
+        f_cell(t1, 0, 3, "STRESS PCTL", bg_b, text.align_left, size.tiny)
+        f_cell(t1, 1, 3, f_num(stress_pct, "#.1"), bg_b, text.align_right, size.tiny)
+        f_cell(t1, 2, 3, stress_level, f_bg_tag(stress_level), text.align_right, size.tiny)
+        f_cell(t1, 3, 3, "Q " + f_num(stress_conf, "#.0"), f_bg_tag(quality_label), text.align_left, size.tiny)
 
-        f_cell(t1, 0, 4, "YC REGIME", bg_a, text.align_left, size.tiny)
-        f_cell(t1, 1, 4, yc_code, f_bg_tag(yc_code), text.align_right, size.tiny)
-        f_cell(t1, 2, 4, "", bg_a, text.align_right, size.tiny)
-        f_cell(t1, 3, 4, yc_label, bg_a, text.align_left, size.tiny)
+        f_cell(t1, 0, 4, "TACTICAL", bg_a, text.align_left, size.tiny)
+        f_cell(t1, 1, 4, tactical_bias, f_decision_bg(tactical_bias), text.align_right, size.tiny)
+        f_cell(t1, 2, 4, "Conf " + f_num(pred_conf, "#.0"), bg_a, text.align_right, size.tiny)
+        f_cell(t1, 3, 4, pred_ready ? "PRED READY" : "PRED WAIT", pred_ready ? color.new(color.lime, 80) : color.new(color.orange, 70), text.align_left, size.tiny)
 
-        f_cell(t1, 0, 5, "STRESS PCTL (raw/adj)", bg_b, text.align_left, size.tiny)
-        f_cell(t1, 1, 5, f_num(stress_pct, "#.1"), f_bg_tag(stress_reg), text.align_right, size.tiny)
-        f_cell(t1, 2, 5, f_num(stressA_pct, "#.1"), f_bg_tag(stress_reg), text.align_right, size.tiny)
-        f_cell(t1, 3, 5, stress_reg, f_bg_tag(stress_reg), text.align_left, size.tiny)
+        f_cell(t1, 0, 5, "STRUCTURE", bg_head, text.align_left, size.tiny)
+        f_cell(t1, 1, 5, "VALUE", bg_head, text.align_right, size.tiny)
+        f_cell(t1, 2, 5, "PCTL", bg_head, text.align_right, size.tiny)
+        f_cell(t1, 3, 5, "STATE", bg_head, text.align_left, size.tiny)
 
-        f_cell(t1, 0, 6, "QUALITY / DATAQ", bg_a, text.align_left, size.tiny)
-        f_cell(t1, 1, 6, quality_label, f_bg_tag(quality_label), text.align_right, size.tiny)
-        f_cell(t1, 2, 6, dataq_label, f_bg_tag(dataq_label), text.align_right, size.tiny)
-        f_cell(t1, 3, 6, "cov " + f_num(cov_core * 100.0, "#.1") + "%", bg_a, text.align_left, size.tiny)
+        f_cell(t1, 0, 6, "YC REGIME", bg_a, text.align_left, size.tiny)
+        f_cell(t1, 1, 6, yc_code, f_bg_tag(yc_code), text.align_right, size.tiny)
+        f_cell(t1, 2, 6, "", bg_a, text.align_right, size.tiny)
+        f_cell(t1, 3, 6, yc_label, bg_a, text.align_left, size.tiny)
 
-        f_cell(t1, 0, 7, "RATES", bg_b, text.align_left, size.tiny)
-        f_cell(t1, 1, 7, "IB " + f_num(ib, "#.2"), bg_b, text.align_left, size.tiny)
-        f_cell(t1, 2, 7, "PR " + f_num(pr, "#.2"), bg_b, text.align_left, size.tiny)
-        f_cell(t1, 3, 7, dist_label, f_bg_tag(dist_label), text.align_left, size.tiny)
+        f_cell(t1, 0, 7, "LEVEL", bg_b, text.align_left, size.tiny)
+        f_cell(t1, 1, 7, f_num(level, "#.2"), bg_b, text.align_right, size.tiny)
+        f_cell(t1, 2, 7, f_num(level_pct, "#.1") + "%", bg_b, text.align_right, size.tiny)
+        f_cell(t1, 3, 7, level_reg, f_bg_tag(level_reg), text.align_left, size.tiny)
 
-        f_cell(t1, 0, 8, "DECISION", bg_a, text.align_left, size.tiny)
-        f_cell(t1, 1, 8, decision_bias, f_decision_bg(decision_bias), text.align_right, size.tiny)
-        f_cell(t1, 2, 8, "Conf " + f_num(pred_conf, "#.0"), bg_a, text.align_right, size.tiny)
-        f_cell(t1, 3, 8, pred_note, bg_a, text.align_left, size.tiny)
+        f_cell(t1, 0, 8, "SLOPE(10-2)", bg_a, text.align_left, size.tiny)
+        f_cell(t1, 1, 8, f_num(slope, "#.2"), bg_a, text.align_right, size.tiny)
+        f_cell(t1, 2, 8, f_num(slope_pct, "#.1") + "%", bg_a, text.align_right, size.tiny)
+        f_cell(t1, 3, 8, slope_reg, f_bg_tag(slope_reg), text.align_left, size.tiny)
 
-        msg = (quality_label == "LOWQ" or dataq_label == "DATAQ LOW") ? "MESSAGE: LOW QUALITY -> avoid strong inference." : "MESSAGE: use P3 for predictive overlay."
-        f_cell(t1, 0, 9, msg, bg_title, text.align_left, size.small)
-        f_cell(t1, 1, 9, "", bg_title, text.align_left, size.small)
-        f_cell(t1, 2, 9, "", bg_title, text.align_left, size.small)
-        f_cell(t1, 3, 9, "", bg_title, text.align_left, size.small)
+        f_cell(t1, 0, 9, "QUALITY", bg_b, text.align_left, size.tiny)
+        f_cell(t1, 1, 9, quality_label, f_bg_tag(quality_label), text.align_right, size.tiny)
+        f_cell(t1, 2, 9, dataq_label, f_bg_tag(dataq_label), text.align_right, size.tiny)
+        f_cell(t1, 3, 9, "cov " + f_num(cov_core * 100.0, "#.1") + "% | " + dist_label, bg_b, text.align_left, size.tiny)
+
+        f_cell(t1, 0, 10, "RATES", bg_a, text.align_left, size.tiny)
+        f_cell(t1, 1, 10, "IB " + f_num(ib, "#.2"), bg_a, text.align_left, size.tiny)
+        f_cell(t1, 2, 10, "PR " + f_num(pr, "#.2"), bg_a, text.align_left, size.tiny)
+        f_cell(t1, 3, 10, paradox_note, bg_a, text.align_left, size.tiny)
+
+        dash_msg = "TODAY: Macro " + macro_regime + " | Stress " + stress_level + " | Bias " + tactical_bias
+        f_cell(t1, 0, 11, dash_msg, bg_title, text.align_left, size.small)
+        f_cell(t1, 1, 11, "", bg_title, text.align_left, size.small)
+        f_cell(t1, 2, 11, "", bg_title, text.align_left, size.small)
+        f_cell(t1, 3, 11, "", bg_title, text.align_left, size.small)
     else
         if not na(t1)
             table.delete(t1)
@@ -614,7 +677,7 @@ if barstate.islast
         if na(t2)
             t2 := table.new(position.top_left, 7, 8, frame_width=2, frame_color=frame_col)
 
-        f_cell(t2, 0, 0, "P2 | GRID (Z-state + structure)", bg_title, text.align_left, size.small)
+        f_cell(t2, 0, 0, "P2 | GRID (Z-state + structure + tactical)", bg_title, text.align_left, size.small)
         for i = 1 to 6
             f_cell(t2, i, 0, "", bg_title, text.align_left, size.small)
 
@@ -642,15 +705,15 @@ if barstate.islast
         f_cell(t2, 5, 3, dataq_label, f_bg_tag(dataq_label), text.align_right, size.tiny)
         f_cell(t2, 6, 3, "", bg_b, text.align_right, size.tiny)
 
-        f_cell(t2, 0, 5, "PRED", bg_a, text.align_left, size.tiny)
+        f_cell(t2, 0, 5, "TACTICAL", bg_a, text.align_left, size.tiny)
         f_cell(t2, 1, 5, "5D " + f_num(exp5 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
         f_cell(t2, 2, 5, "20D " + f_num(exp20 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
         f_cell(t2, 3, 5, "Hit5 " + f_num(hit5, "#.1") + "%", f_pct_bg(hit5), text.align_right, size.tiny)
         f_cell(t2, 4, 5, "Persist " + f_num(regime_persist, "#.1") + "%", f_pct_bg(regime_persist), text.align_right, size.tiny)
-        f_cell(t2, 5, 5, decision_bias, f_decision_bg(decision_bias), text.align_right, size.tiny)
+        f_cell(t2, 5, 5, tactical_bias, f_decision_bg(tactical_bias), text.align_right, size.tiny)
         f_cell(t2, 6, 5, "", bg_a, text.align_right, size.tiny)
 
-        take = "TAKEAWAY: " + yc_code + " | " + stress_reg + " | " + quality_label + " | " + dataq_label + " | " + decision_bias
+        take = "TAKEAWAY: " + yc_code + " | MACRO " + macro_regime + " | STRESS " + stress_level + " | " + quality_label + " | " + dataq_label + " | TACTICAL " + tactical_bias
         f_cell(t2, 0, 7, take, bg_title, text.align_left, size.small)
         for i = 1 to 6
             f_cell(t2, i, 7, "", bg_title, text.align_left, size.small)
@@ -659,20 +722,20 @@ if barstate.islast
             table.delete(t2)
             t2 := na
 
-    // -------- Panel 3
+    // -------- Panel 3: Research Diagnostics
     if show_p3
         if na(t3)
-            t3 := table.new(position.top_right, 4, 31, frame_width=2, frame_color=frame_col)
+            t3 := table.new(position.top_right, 4, 18, frame_width=2, frame_color=frame_col)
 
-        f_cell(t3, 0, 0, "P3 | RESEARCH + PREDICTIVE OVERLAY (STRICT, CLEAN)", bg_title, text.align_left, size.small)
+        f_cell(t3, 0, 0, "P3 | RESEARCH DIAGNOSTICS (V1.8.3)", bg_title, text.align_left, size.small)
         f_cell(t3, 1, 0, "", bg_title, text.align_left, size.small)
         f_cell(t3, 2, 0, "", bg_title, text.align_left, size.small)
         f_cell(t3, 3, 0, "", bg_title, text.align_left, size.small)
 
-        f_cell(t3, 0, 1, "STRESS PCTL (raw/adj)", bg_a, text.align_left, size.tiny)
-        f_cell(t3, 1, 1, f_num(stress_pct, "#.1"), f_bg_tag(stress_reg), text.align_right, size.tiny)
-        f_cell(t3, 2, 1, f_num(stressA_pct, "#.1"), f_bg_tag(stress_reg), text.align_right, size.tiny)
-        f_cell(t3, 3, 1, yc_code + " | " + quality_label, f_bg_tag(yc_code), text.align_right, size.tiny)
+        f_cell(t3, 0, 1, "REGIME", bg_a, text.align_left, size.tiny)
+        f_cell(t3, 1, 1, yc_code + " | " + macro_regime, f_bg_tag(yc_code), text.align_right, size.tiny)
+        f_cell(t3, 2, 1, "Stress " + stress_level, f_bg_tag(stress_level), text.align_right, size.tiny)
+        f_cell(t3, 3, 1, "Conf " + f_num(stress_conf, "#.0"), f_bg_tag(quality_label), text.align_right, size.tiny)
 
         ready_txt = ready ? "READY" : (tf_ok ? "WAIT" : "USE 1D")
         f_cell(t3, 0, 2, "SAMPLE", bg_b, text.align_left, size.tiny)
@@ -695,7 +758,7 @@ if barstate.islast
         f_cell(t3, 2, 6, "", bg_a, text.align_right, size.tiny)
         f_cell(t3, 3, 6, "", bg_a, text.align_right, size.tiny)
 
-        f_cell(t3, 0, 7, "ADJ t0 (STRICT)", bg_b, text.align_left, size.tiny)
+        f_cell(t3, 0, 7, "MACRO t0 (STRICT)", bg_b, text.align_left, size.tiny)
         f_cell(t3, 1, 7, ready ? f_num(corr_adj, "#.3") : "NA", f_corrBg(corr_adj), text.align_right, size.tiny)
         f_cell(t3, 2, 7, ready ? f_num(t_adj_ar, "#.2") : "NA", bg_b, text.align_right, size.tiny)
         f_cell(t3, 3, 7, ready ? f_num(r2_adj, "#.2") : "NA", bg_b, text.align_right, size.tiny)
@@ -705,7 +768,7 @@ if barstate.islast
         f_cell(t3, 2, 8, ready ? f_num(t_pcorr_ar, "#.2") : "NA", bg_a, text.align_right, size.tiny)
         f_cell(t3, 3, 8, "", bg_a, text.align_right, size.tiny)
 
-        f_cell(t3, 0, 10, "LAGS (AdjPCTL stress)", bg_head, text.align_left, size.tiny)
+        f_cell(t3, 0, 10, "LAGS (MacroStress PCTL)", bg_head, text.align_left, size.tiny)
         f_cell(t3, 1, 10, "L1", bg_head, text.align_right, size.tiny)
         f_cell(t3, 2, 10, "L5", bg_head, text.align_right, size.tiny)
         f_cell(t3, 3, 10, "L20", bg_head, text.align_right, size.tiny)
@@ -733,68 +796,92 @@ if barstate.islast
         f_cell(t3, 2, 15, "req |t|>=2.4", bg_b, text.align_right, size.tiny)
         f_cell(t3, 3, 15, "req m>=0.05", bg_b, text.align_right, size.tiny)
 
-        f_cell(t3, 0, 17, "PREDICTIVE 5D", bg_head, text.align_left, size.tiny)
-        f_cell(t3, 1, 17, "Mean", bg_head, text.align_right, size.tiny)
-        f_cell(t3, 2, 17, "HitDn", bg_head, text.align_right, size.tiny)
-        f_cell(t3, 3, 17, "AvgLoss", bg_head, text.align_right, size.tiny)
-
-        f_cell(t3, 0, 18, "LOW", bg_a, text.align_left, size.tiny)
-        f_cell(t3, 1, 18, f_num(mean_low5 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
-        f_cell(t3, 2, 18, f_num(hitDn_low5, "#.1") + "%", f_pct_bg(hitDn_low5), text.align_right, size.tiny)
-        f_cell(t3, 3, 18, f_num(neg_mean_low5 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
-
-        f_cell(t3, 0, 19, "MID", bg_b, text.align_left, size.tiny)
-        f_cell(t3, 1, 19, f_num(mean_mid5 * 100.0, "#.2") + "%", bg_b, text.align_right, size.tiny)
-        f_cell(t3, 2, 19, f_num(hitDn_mid5, "#.1") + "%", f_pct_bg(hitDn_mid5), text.align_right, size.tiny)
-        f_cell(t3, 3, 19, f_num(neg_mean_mid5 * 100.0, "#.2") + "%", bg_b, text.align_right, size.tiny)
-
-        f_cell(t3, 0, 20, "HIGH", bg_a, text.align_left, size.tiny)
-        f_cell(t3, 1, 20, f_num(mean_high5 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
-        f_cell(t3, 2, 20, f_num(hitDn_high5, "#.1") + "%", f_pct_bg(hitDn_high5), text.align_right, size.tiny)
-        f_cell(t3, 3, 20, f_num(neg_mean_high5 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
-
-        f_cell(t3, 0, 22, "PREDICTIVE 20D", bg_head, text.align_left, size.tiny)
-        f_cell(t3, 1, 22, "Mean", bg_head, text.align_right, size.tiny)
-        f_cell(t3, 2, 22, "HitDn", bg_head, text.align_right, size.tiny)
-        f_cell(t3, 3, 22, "AvgLoss", bg_head, text.align_right, size.tiny)
-
-        f_cell(t3, 0, 23, "LOW", bg_a, text.align_left, size.tiny)
-        f_cell(t3, 1, 23, f_num(mean_low20 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
-        f_cell(t3, 2, 23, f_num(hitDn_low20, "#.1") + "%", f_pct_bg(hitDn_low20), text.align_right, size.tiny)
-        f_cell(t3, 3, 23, f_num(neg_mean_low20 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
-
-        f_cell(t3, 0, 24, "MID", bg_b, text.align_left, size.tiny)
-        f_cell(t3, 1, 24, f_num(mean_mid20 * 100.0, "#.2") + "%", bg_b, text.align_right, size.tiny)
-        f_cell(t3, 2, 24, f_num(hitDn_mid20, "#.1") + "%", f_pct_bg(hitDn_mid20), text.align_right, size.tiny)
-        f_cell(t3, 3, 24, f_num(neg_mean_mid20 * 100.0, "#.2") + "%", bg_b, text.align_right, size.tiny)
-
-        f_cell(t3, 0, 25, "HIGH", bg_a, text.align_left, size.tiny)
-        f_cell(t3, 1, 25, f_num(mean_high20 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
-        f_cell(t3, 2, 25, f_num(hitDn_high20, "#.1") + "%", f_pct_bg(hitDn_high20), text.align_right, size.tiny)
-        f_cell(t3, 3, 25, f_num(neg_mean_high20 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
-
-        f_cell(t3, 0, 27, "TRANSITION", bg_head, text.align_left, size.tiny)
-        f_cell(t3, 1, 27, "HIGH->HIGH " + f_num(pHH, "#.1") + "%", f_pct_bg(pHH), text.align_right, size.tiny)
-        f_cell(t3, 2, 27, "MID->MID " + f_num(pMM, "#.1") + "%", f_pct_bg(pMM), text.align_right, size.tiny)
-        f_cell(t3, 3, 27, "LOW->LOW " + f_num(pLL, "#.1") + "%", f_pct_bg(pLL), text.align_right, size.tiny)
-
-        f_cell(t3, 0, 28, "DECISION", bg_a, text.align_left, size.tiny)
-        f_cell(t3, 1, 28, decision_bias, f_decision_bg(decision_bias), text.align_right, size.tiny)
-        f_cell(t3, 2, 28, "Conf " + f_num(pred_conf, "#.0"), bg_a, text.align_right, size.tiny)
-        f_cell(t3, 3, 28, pred_ready ? "PRED READY" : "PRED WAIT", pred_ready ? color.new(color.lime, 80) : color.new(color.orange, 70), text.align_right, size.tiny)
-
-        note1 = "STRICT: percentiles; inference uses AR-AdjN; partial corr controls avg(IB,PR)."
-        note2 = "PREDICTIVE: regime-conditional realized 5D/20D outcomes; statistical overlay, not causal model."
-        f_cell(t3, 0, 29, note1, bg_title, text.align_left, size.small)
-        f_cell(t3, 1, 29, "", bg_title, text.align_left, size.small)
-        f_cell(t3, 2, 29, "", bg_title, text.align_left, size.small)
-        f_cell(t3, 3, 29, "", bg_title, text.align_left, size.small)
-
-        f_cell(t3, 0, 30, note2, bg_title, text.align_left, size.small)
-        f_cell(t3, 1, 30, "", bg_title, text.align_left, size.small)
-        f_cell(t3, 2, 30, "", bg_title, text.align_left, size.small)
-        f_cell(t3, 3, 30, "", bg_title, text.align_left, size.small)
+        note1 = "STRICT: structural regime and stress percentile are separated; quality is confidence only."
+        f_cell(t3, 0, 17, note1, bg_title, text.align_left, size.small)
+        f_cell(t3, 1, 17, "", bg_title, text.align_left, size.small)
+        f_cell(t3, 2, 17, "", bg_title, text.align_left, size.small)
+        f_cell(t3, 3, 17, "", bg_title, text.align_left, size.small)
     else
         if not na(t3)
             table.delete(t3)
             t3 := na
+
+    // -------- Panel 4: Predictive Overlay
+    if show_p4
+        if na(t4)
+            t4 := table.new(position.top_right, 4, 18, frame_width=2, frame_color=frame_col)
+
+        f_cell(t4, 0, 0, "P4 | PREDICTIVE OVERLAY (V1.8.3)", bg_title, text.align_left, size.small)
+        f_cell(t4, 1, 0, "", bg_title, text.align_left, size.small)
+        f_cell(t4, 2, 0, "", bg_title, text.align_left, size.small)
+        f_cell(t4, 3, 0, "", bg_title, text.align_left, size.small)
+
+        f_cell(t4, 0, 1, "CURRENT", bg_a, text.align_left, size.tiny)
+        f_cell(t4, 1, 1, macro_regime, f_bg_tag(macro_regime), text.align_right, size.tiny)
+        f_cell(t4, 2, 1, "Stress " + stress_level, f_bg_tag(stress_level), text.align_right, size.tiny)
+        f_cell(t4, 3, 1, stress_type, bg_a, text.align_right, size.tiny)
+
+        f_cell(t4, 0, 2, "TACTICAL BIAS", bg_b, text.align_left, size.tiny)
+        f_cell(t4, 1, 2, tactical_bias, f_decision_bg(tactical_bias), text.align_right, size.tiny)
+        f_cell(t4, 2, 2, "Conf " + f_num(pred_conf, "#.0"), bg_b, text.align_right, size.tiny)
+        f_cell(t4, 3, 2, pred_ready ? "PRED READY" : "PRED WAIT", pred_ready ? color.new(color.lime, 80) : color.new(color.orange, 70), text.align_right, size.tiny)
+
+        f_cell(t4, 0, 4, "PREDICTIVE 5D", bg_head, text.align_left, size.tiny)
+        f_cell(t4, 1, 4, "Mean", bg_head, text.align_right, size.tiny)
+        f_cell(t4, 2, 4, "HitDn", bg_head, text.align_right, size.tiny)
+        f_cell(t4, 3, 4, "AvgLoss", bg_head, text.align_right, size.tiny)
+
+        f_cell(t4, 0, 5, "LOW", bg_a, text.align_left, size.tiny)
+        f_cell(t4, 1, 5, f_num(mean_low5 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
+        f_cell(t4, 2, 5, f_num(hitDn_low5, "#.1") + "%", f_pct_bg(hitDn_low5), text.align_right, size.tiny)
+        f_cell(t4, 3, 5, f_num(neg_mean_low5 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
+
+        f_cell(t4, 0, 6, "MID", bg_b, text.align_left, size.tiny)
+        f_cell(t4, 1, 6, f_num(mean_mid5 * 100.0, "#.2") + "%", bg_b, text.align_right, size.tiny)
+        f_cell(t4, 2, 6, f_num(hitDn_mid5, "#.1") + "%", f_pct_bg(hitDn_mid5), text.align_right, size.tiny)
+        f_cell(t4, 3, 6, f_num(neg_mean_mid5 * 100.0, "#.2") + "%", bg_b, text.align_right, size.tiny)
+
+        f_cell(t4, 0, 7, "HIGH", bg_a, text.align_left, size.tiny)
+        f_cell(t4, 1, 7, f_num(mean_high5 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
+        f_cell(t4, 2, 7, f_num(hitDn_high5, "#.1") + "%", f_pct_bg(hitDn_high5), text.align_right, size.tiny)
+        f_cell(t4, 3, 7, f_num(neg_mean_high5 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
+
+        f_cell(t4, 0, 9, "PREDICTIVE 20D", bg_head, text.align_left, size.tiny)
+        f_cell(t4, 1, 9, "Mean", bg_head, text.align_right, size.tiny)
+        f_cell(t4, 2, 9, "HitDn", bg_head, text.align_right, size.tiny)
+        f_cell(t4, 3, 9, "AvgLoss", bg_head, text.align_right, size.tiny)
+
+        f_cell(t4, 0, 10, "LOW", bg_a, text.align_left, size.tiny)
+        f_cell(t4, 1, 10, f_num(mean_low20 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
+        f_cell(t4, 2, 10, f_num(hitDn_low20, "#.1") + "%", f_pct_bg(hitDn_low20), text.align_right, size.tiny)
+        f_cell(t4, 3, 10, f_num(neg_mean_low20 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
+
+        f_cell(t4, 0, 11, "MID", bg_b, text.align_left, size.tiny)
+        f_cell(t4, 1, 11, f_num(mean_mid20 * 100.0, "#.2") + "%", bg_b, text.align_right, size.tiny)
+        f_cell(t4, 2, 11, f_num(hitDn_mid20, "#.1") + "%", f_pct_bg(hitDn_mid20), text.align_right, size.tiny)
+        f_cell(t4, 3, 11, f_num(neg_mean_mid20 * 100.0, "#.2") + "%", bg_b, text.align_right, size.tiny)
+
+        f_cell(t4, 0, 12, "HIGH", bg_a, text.align_left, size.tiny)
+        f_cell(t4, 1, 12, f_num(mean_high20 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
+        f_cell(t4, 2, 12, f_num(hitDn_high20, "#.1") + "%", f_pct_bg(hitDn_high20), text.align_right, size.tiny)
+        f_cell(t4, 3, 12, f_num(neg_mean_high20 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
+
+        f_cell(t4, 0, 14, "TRANSITION", bg_head, text.align_left, size.tiny)
+        f_cell(t4, 1, 14, "HIGH->HIGH " + f_num(pHH, "#.1") + "%", f_pct_bg(pHH), text.align_right, size.tiny)
+        f_cell(t4, 2, 14, "MID->MID " + f_num(pMM, "#.1") + "%", f_pct_bg(pMM), text.align_right, size.tiny)
+        f_cell(t4, 3, 14, "LOW->LOW " + f_num(pLL, "#.1") + "%", f_pct_bg(pLL), text.align_right, size.tiny)
+
+        f_cell(t4, 0, 15, "CURRENT BUCKET", bg_a, text.align_left, size.tiny)
+        f_cell(t4, 1, 15, "5D " + f_num(exp5 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
+        f_cell(t4, 2, 15, "20D " + f_num(exp20 * 100.0, "#.2") + "%", bg_a, text.align_right, size.tiny)
+        f_cell(t4, 3, 15, "Hit " + f_num(hit5, "#.1") + "%", f_pct_bg(hit5), text.align_right, size.tiny)
+
+        note2 = "PREDICTIVE: regime-conditional 5D/20D outcomes; not causal. " + short_msg
+        f_cell(t4, 0, 17, note2, bg_title, text.align_left, size.small)
+        f_cell(t4, 1, 17, "", bg_title, text.align_left, size.small)
+        f_cell(t4, 2, 17, "", bg_title, text.align_left, size.small)
+        f_cell(t4, 3, 17, "", bg_title, text.align_left, size.small)
+    else
+        if not na(t4)
+            table.delete(t4)
+            t4 := na
