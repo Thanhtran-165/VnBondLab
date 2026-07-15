@@ -19,7 +19,7 @@ Mỗi dự án được thiết kế độc lập nhưng có thể sử dụng k
 ### 📊 01_MacroAcademic_Engine
 **Dashboard phân tích vĩ mô Việt Nam**
 
-Phiên bản: v2.1 | Tác giả: MacroAcademic
+Phiên bản: v3.2.1 | Tác giả: MacroAcademic
 
 **Mục đích:** Đánh giá sức khỏe kinh tế Việt Nam qua 4 trụ cột chính:
 - Lạm phát (Inflation)
@@ -35,7 +35,7 @@ Phiên bản: v2.1 | Tác giả: MacroAcademic
 - Bạn cần hiểu bối cảnh vĩ mô trước khi quyết định đầu tư
 
 **File chính:**
-- `MacroAcademic_Engine_v2.1_Full.pine` (Bản đầy đủ)
+- `MacroAcademic_Engine_v3.2.1.pine`
 
 📖 **Xem chi tiết:** [README MacroAcademic Engine](./01_MacroAcademic_Engine/)
 
@@ -335,7 +335,7 @@ Tất cả các dự án đều được xây dựng với các chuẩn mực h�
 - **Phiên bản hiện tại:** v3.0 (5 Projects Structure)
 
 ### Sub-projects:
-- **01_MacroAcademic_Engine:** v2.1 (Interpretation Upgrade)
+- **01_MacroAcademic_Engine:** v3.2.1 (Semantic Clarity Patch)
 - **02_Macro_Alert_System:** v5.0.1 (Validated Regime Engine)
 - **03_Indices_Research_Map:** v2.0.1 (Clean Fixed Build)
 - **04_YieldCurveLab:** v2.3.0 (Horizon Separation & Sample Power)

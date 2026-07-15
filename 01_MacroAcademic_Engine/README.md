@@ -1,4 +1,4 @@
-Dưới đây là **README + Guideline học thuật** cho **MacroAcademic – VN Economy Engine v2.1 (Interpretation Upgrade)** theo đúng thói quen MacroAcademic: vừa “academic”, vừa “dịch nghĩa bình dân” để dùng được ngay trong TradingView.
+Dưới đây là **README + Guideline học thuật** cho **MacroAcademic – VN Economy Engine v3.2.1 (Semantic Clarity Patch)** theo đúng thói quen MacroAcademic: vừa “academic”, vừa “dịch nghĩa bình dân” để dùng được ngay trong TradingView.
 
 ---
 
@@ -199,7 +199,7 @@ Quan trọng:
 * Với chỉ số “high is bad” (inflation pressure, tightness, risk…), PCTL cao = xấu hơn.
 * Với chỉ số “high is good” (GDP strength), PCTL cao = tốt hơn.
 
-Trong v2.1:
+Trong v3.2.1:
 
 * Dòng **không phải số** → “KHONG XEP HANG”
 * Dòng số mà thiếu lịch sử/ticker NA → “-” (thực sự thiếu dữ liệu)

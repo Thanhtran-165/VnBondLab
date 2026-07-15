@@ -1,0 +1,944 @@
+//@version=6
+indicator("MacroAcademic - VN Economy Engine v3.2.1 (Semantic Clarity Patch)",
+     shorttitle="MAVN v3.2.1",
+     overlay=false,
+     max_labels_count=300,
+     max_lines_count=300,
+     max_bars_back=5000,
+     precision=4)
+
+// =====================================================================
+// 0) MODEL SCOPE
+// =====================================================================
+// v3.2.1 is a macro monitoring framework, not a structural causal model.
+// Core design principles:
+// 1) Frequency-safe: monthly/quarterly transforms are calculated in their
+//    native higher-timeframe context or sampled only once per month.
+// 2) Non-repainting default: uses the last confirmed HTF observation.
+// 3) Robust scaling: median/MAD z-scores with standard-deviation fallback.
+// 4) Missing-data neutrality is avoided through weight renormalization.
+// 5) Validation compares CPI forecast errors with a naive random-walk proxy.
+// 6) Regime classification uses two-month hysteresis to reduce false flips.
+// 7) Decision UI: one executive dashboard plus three research drill-downs.
+// 8) Nowcast confidence and forecast reliability are reported separately.
+// 9) Semantic clarity: level, direction, confidence, and regime age are not conflated.
+
+// =====================================================================
+// A) USER CONTROLS
+// =====================================================================
+view = input.string("Bảng điều hành", "Góc nhìn", options=["Bảng điều hành", "Tiền tệ & đường cong", "Chu kỳ & lạm phát", "Kiểm định mô hình"])
+detailMode = input.string("Chỉ bảng", "Hiển thị", options=["Chỉ bảng", "Biểu đồ tối giản", "Phân tích đầy đủ"])
+tblPosOpt = input.string("Top Right", "Vị trí bảng", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"])
+fontOpt = input.string("Small", "Cỡ chữ bảng", options=["Tiny", "Small", "Normal"])
+dataMode = input.string("Confirmed", "Chế độ dữ liệu HTF", options=["Confirmed", "Live"])
+
+piTarget = input.float(4.0, "Moc tham chieu lam phat (%)", step=0.1, minval=0.0, maxval=15.0)
+rStar = input.float(1.0, "Lai suat thuc trung tinh tham chieu (%)", step=0.1, minval=-3.0, maxval=8.0)
+phiPi = input.float(0.5, "He so Taylor-style: lam phat", step=0.05, minval=0.0, maxval=2.0)
+phiY = input.float(0.5, "He so Taylor-style: tang truong", step=0.05, minval=0.0, maxval=2.0)
+
+// =====================================================================
+// B) SYMBOLS
+// =====================================================================
+symInfl  = input.symbol("ECONOMICS:VNIRYY",  "Lam phat YoY (thang)", display=display.none)
+symPolicy = input.symbol("ECONOMICS:VNINTR", "Lai suat dieu hanh", display=display.none)
+symIB = input.symbol("ECONOMICS:VNINBR", "Lai suat lien ngan hang", display=display.none)
+symGDP = input.symbol("ECONOMICS:VNGDPYY", "GDP YoY (quy)", display=display.none)
+symPPI = input.symbol("ECONOMICS:VNPPI", "PPI (quy)", display=display.none)
+symFX = input.symbol("FX_IDC:USDVND", "USDVND", display=display.none)
+symOil = input.symbol("TVC:UKOIL", "Brent proxy", display=display.none)
+symVN10Y = input.symbol("TVC:VN10Y", "VN 10Y", display=display.none)
+symVN02Y = input.symbol("TVC:VN02Y", "VN 2Y", display=display.none)
+
+// =====================================================================
+// C) LOCKED ACADEMIC DEFAULTS
+// =====================================================================
+const string TF_M = "M"
+const string TF_Q = "3M"
+
+const int CPI_TREND_M = 24
+const int CPI_Z_M = 60
+const int CPI_AR_M = 60
+const int GDP_TREND_Q = 12
+const int GDP_Z_Q = 32
+const int PPI_TREND_Q = 12
+const int PPI_Z_Q = 32
+const int DRIVER_Z_M = 60
+const int ARRAY_CAP_M = 120
+const int EVAL_CAP_M = 36
+const int MIN_RANK_M = 36
+const int MIN_ROBUST_M = 24
+const float Z_CLIP = 3.0
+
+// Composite weights. Values are renormalized when a component is missing.
+const float W_INFL = 0.28
+const float W_MON = 0.28
+const float W_GROW = 0.20
+const float W_EXT = 0.14
+const float W_CURVE = 0.10
+
+bool useConfirmed = dataMode == "Confirmed"
+bool isNewMonth = timeframe.change(TF_M)
+bool isNewQuarter = timeframe.change(TF_Q)
+bool showPlots = detailMode != "Chỉ bảng"
+bool fullMode = detailMode == "Phân tích đầy đủ"
+
+if barstate.isfirst and timeframe.in_seconds(timeframe.period) > timeframe.in_seconds(TF_M)
+    runtime.error("MacroAcademic v3 yeu cau chart timeframe <= 1 thang de bao toan lay mau theo thang.")
+
+// =====================================================================
+// D) GENERIC HELPERS
+// =====================================================================
+f_clip(float x, float lo, float hi) =>
+    na(x) ? na : math.max(lo, math.min(hi, x))
+
+f_round(float x, int decimals) =>
+    float m = math.pow(10.0, decimals)
+    math.round(x * m) / m
+
+f_fmt(float x, int decimals) =>
+    na(x) ? "-" : str.tostring(f_round(x, decimals))
+
+f_fmt_pct(float x, int decimals) =>
+    na(x) ? "-" : str.tostring(f_round(x, decimals)) + "%"
+
+f_fmt_rank(float x, bool ready) =>
+    ready and not na(x) ? "P" + str.tostring(int(math.round(x))) : "UNRANKED"
+
+f_cov(float x, float y, int length) =>
+    float mx = ta.sma(x, length)
+    float my = ta.sma(y, length)
+    ta.sma((x - mx) * (y - my), length)
+
+f_var(float x, int length) =>
+    float mx = ta.sma(x, length)
+    ta.sma(math.pow(x - mx, 2.0), length)
+
+f_robust_z_series(float src, int length, float clipValue) =>
+    float med = ta.percentile_nearest_rank(src, length, 50)
+    float mad = ta.percentile_nearest_rank(math.abs(src - med), length, 50)
+    float robustDenom = 1.4826 * mad
+    float fallback = ta.stdev(src, length)
+    float denom = robustDenom > 1e-10 ? robustDenom : fallback
+    float z = not na(src) and not na(med) and not na(denom) and denom > 1e-10 ? (src - med) / denom : na
+    f_clip(z, -clipValue, clipValue)
+
+f_weighted5(float v1, float w1, float v2, float w2, float v3, float w3, float v4, float w4, float v5, float w5) =>
+    float num = 0.0
+    float den = 0.0
+    if not na(v1) and w1 > 0
+        num += v1 * w1
+        den += w1
+    if not na(v2) and w2 > 0
+        num += v2 * w2
+        den += w2
+    if not na(v3) and w3 > 0
+        num += v3 * w3
+        den += w3
+    if not na(v4) and w4 > 0
+        num += v4 * w4
+        den += w4
+    if not na(v5) and w5 > 0
+        num += v5 * w5
+        den += w5
+    den > 0 ? num / den : na
+
+f_arr_push(array<float> arr, float value, int maxLength) =>
+    if not na(value)
+        array.push(arr, value)
+        if array.size(arr) > maxLength
+            array.shift(arr)
+
+f_arr_lag(array<float> arr, int lag) =>
+    int n = array.size(arr)
+    n > lag ? array.get(arr, n - 1 - lag) : na
+
+f_arr_mean(array<float> arr) =>
+    int n = array.size(arr)
+    float s = 0.0
+    if n > 0
+        for i = 0 to n - 1
+            s += array.get(arr, i)
+    n > 0 ? s / n : na
+
+f_arr_rmse(array<float> arr) =>
+    int n = array.size(arr)
+    float s = 0.0
+    if n > 0
+        for i = 0 to n - 1
+            float e = array.get(arr, i)
+            s += e * e
+    n > 0 ? math.sqrt(s / n) : na
+
+f_arr_mae(array<float> arr) =>
+    int n = array.size(arr)
+    float s = 0.0
+    if n > 0
+        for i = 0 to n - 1
+            s += math.abs(array.get(arr, i))
+    n > 0 ? s / n : na
+
+f_arr_sum(array<float> arr) =>
+    int n = array.size(arr)
+    float s = 0.0
+    if n > 0
+        for i = 0 to n - 1
+            s += array.get(arr, i)
+    s
+
+f_arr_percentrank(array<float> arr, float value) =>
+    int n = array.size(arr)
+    float p = na
+    if n > 0 and not na(value)
+        int countLE = 0
+        for i = 0 to n - 1
+            if array.get(arr, i) <= value
+                countLE += 1
+        p := 100.0 * countLE / n
+    p
+
+f_arr_robust_z(array<float> arr, float value, int minN, float clipValue) =>
+    int n = array.size(arr)
+    float z = na
+    if n >= minN and not na(value)
+        float med = array.median(arr)
+        array<float> deviations = array.new<float>()
+        for i = 0 to n - 1
+            array.push(deviations, math.abs(array.get(arr, i) - med))
+        float mad = array.median(deviations)
+        float denom = 1.4826 * mad
+        if denom <= 1e-10
+            float mean = f_arr_mean(arr)
+            float ss = 0.0
+            for i = 0 to n - 1
+                float d = array.get(arr, i) - mean
+                ss += d * d
+            denom := n > 1 ? math.sqrt(ss / (n - 1)) : na
+        z := not na(denom) and denom > 1e-10 ? (value - med) / denom : 0.0
+        z := f_clip(z, -clipValue, clipValue)
+    z
+
+f_sign(float x, float threshold) =>
+    na(x) ? 0 : x > threshold ? 1 : x < -threshold ? -1 : 0
+
+f_coherence(float composite, float b1, float b2, float b3, float b4, float b5) =>
+    int target = f_sign(composite, 0.10)
+    int active = 0
+    int agree = 0
+    int s1 = f_sign(b1, 0.25)
+    int s2 = f_sign(b2, 0.25)
+    int s3 = f_sign(b3, 0.25)
+    int s4 = f_sign(b4, 0.25)
+    int s5 = f_sign(b5, 0.25)
+    if s1 != 0
+        active += 1
+        agree += s1 == target ? 1 : 0
+    if s2 != 0
+        active += 1
+        agree += s2 == target ? 1 : 0
+    if s3 != 0
+        active += 1
+        agree += s3 == target ? 1 : 0
+    if s4 != 0
+        active += 1
+        agree += s4 == target ? 1 : 0
+    if s5 != 0
+        active += 1
+        agree += s5 == target ? 1 : 0
+    active > 0 and target != 0 ? 100.0 * agree / active : 50.0
+
+f_regime_id(float inflationPressure, float growthCycle) =>
+    int id = 0
+    if not na(inflationPressure) and not na(growthCycle)
+        bool inflHigh = inflationPressure >= 0.50
+        bool inflLow = inflationPressure <= -0.35
+        bool growHigh = growthCycle >= 0.35
+        bool growLow = growthCycle <= -0.35
+        id := inflHigh and growHigh ? 1 :
+              inflHigh and growLow ? 2 :
+              inflLow and growHigh ? 3 :
+              inflLow and growLow ? 4 : 0
+    id
+
+f_regime_text(int id) =>
+    id == 1 ? "QUÁ NHIỆT" :
+     id == 2 ? "ĐÌNH LẠM" :
+     id == 3 ? "GOLDILOCKS" :
+     id == 4 ? "GIẢM LẠM PHÁT / CHẬM LẠI" :
+     "TRUNG TÍNH / CHUYỂN TIẾP"
+
+f_bucket(float x, float p, bool ready) =>
+    string b = "B2"
+    if not ready or na(x) or na(p)
+        b := "NA"
+    else if x >= 1.00 and p >= 90
+        b := "B4"
+    else if x >= 0.35 and p >= 75
+        b := "B3"
+    else if x <= -1.00 and p <= 10
+        b := "B0"
+    else if x <= -0.35 and p <= 25
+        b := "B1"
+    b
+
+f_bucket_text(string bucket) =>
+    bucket == "B4" ? "Cuc cang" :
+     bucket == "B3" ? "Cang" :
+     bucket == "B2" ? "Trung tinh" :
+     bucket == "B1" ? "De hon" :
+     bucket == "B0" ? "Rat de" : "Chua xep hang"
+
+f_bucket_bg(string bucket) =>
+    bucket == "B4" ? color.new(color.red, 55) :
+     bucket == "B3" ? color.new(color.orange, 62) :
+     bucket == "B1" ? color.new(color.green, 78) :
+     bucket == "B0" ? color.new(color.green, 60) :
+     color.new(color.gray, 82)
+
+f_pctl_bg(float p, bool highBad) =>
+    color bg = color.new(color.gray, 84)
+    if not na(p)
+        if highBad
+            bg := p >= 80 ? color.new(color.red, 62) : p >= 60 ? color.new(color.orange, 72) : p <= 20 ? color.new(color.green, 68) : p <= 40 ? color.new(color.green, 82) : color.new(color.gray, 84)
+        else
+            bg := p >= 80 ? color.new(color.green, 68) : p >= 60 ? color.new(color.green, 82) : p <= 20 ? color.new(color.red, 62) : p <= 40 ? color.new(color.orange, 72) : color.new(color.gray, 84)
+    bg
+
+f_direction(float x) =>
+    na(x) ? "NA" : x >= 0.50 ? "Xau len manh" : x >= 0.20 ? "Xau len" : x <= -0.50 ? "Ha nhiet manh" : x <= -0.20 ? "Ha nhiet" : "On dinh"
+
+f_stance(float x) =>
+    na(x) ? "NA" : x >= 0.75 ? "Rat chat" : x >= 0.25 ? "Chat" : x <= -0.75 ? "Rat de" : x <= -0.25 ? "De" : "Trung tinh"
+
+f_quality(float confidence, bool confirmedMode) =>
+    na(confidence) ? "NA" : confidence >= 80 and confirmedMode ? "A" : confidence >= 65 ? "B" : confidence >= 50 ? "C" : "D"
+
+f_confidence_label(float score) =>
+    na(score) ? "Chưa đủ dữ liệu" : score >= 80 ? "Cao" : score >= 65 ? "Khá" : score >= 50 ? "Trung bình" : "Thấp"
+
+f_forecast_label(float score) =>
+    na(score) ? "Chưa đủ dữ liệu" : score >= 70 ? "Cao" : score >= 50 ? "Trung bình" : "Thấp"
+
+f_block_state(float x) =>
+    na(x) ? "Chưa đủ dữ liệu" : x >= 0.75 ? "Áp lực cao" : x >= 0.25 ? "Nghiêng bất lợi" : x <= -0.75 ? "Thuận lợi rõ" : x <= -0.25 ? "Nghiêng thuận lợi" : "Trung tính"
+
+f_top_index(float a, float b, float c, float d, float e, int exclude1, int exclude2) =>
+    int idx = -1
+    float best = -1.0
+    if exclude1 != 0 and exclude2 != 0 and not na(a) and math.abs(a) > best
+        idx := 0
+        best := math.abs(a)
+    if exclude1 != 1 and exclude2 != 1 and not na(b) and math.abs(b) > best
+        idx := 1
+        best := math.abs(b)
+    if exclude1 != 2 and exclude2 != 2 and not na(c) and math.abs(c) > best
+        idx := 2
+        best := math.abs(c)
+    if exclude1 != 3 and exclude2 != 3 and not na(d) and math.abs(d) > best
+        idx := 3
+        best := math.abs(d)
+    if exclude1 != 4 and exclude2 != 4 and not na(e) and math.abs(e) > best
+        idx := 4
+    idx
+
+// =====================================================================
+// E) NATIVE-FREQUENCY PACKS
+// =====================================================================
+f_cpi_pack(float pi) =>
+    float trend = ta.ema(pi, CPI_TREND_M)
+    float gap = pi - trend
+    float momentum = pi - pi[1]
+    float ewma = ta.ema(pi, 6)
+
+    float y = pi[1]
+    float x = pi[2]
+    float covYX = f_cov(y, x, CPI_AR_M)
+    float varX = f_var(x, CPI_AR_M)
+    float betaRaw = varX > 1e-10 ? covYX / varX : na
+    float beta = f_clip(betaRaw, -0.95, 0.95)
+    float meanY = ta.sma(y, CPI_AR_M)
+    float meanX = ta.sma(x, CPI_AR_M)
+    float intercept = not na(beta) and not na(meanY) and not na(meanX) ? meanY - beta * meanX : na
+    float arForecast = not na(intercept) and not na(beta) and not na(y) ? intercept + beta * y : na
+
+    float forecast = not na(trend[1]) and not na(ewma[1]) and not na(arForecast) ? 0.40 * trend[1] + 0.30 * ewma[1] + 0.30 * arForecast : na
+    float naiveForecast = pi[1]
+    float error = not na(forecast) ? pi - forecast : na
+    float naiveError = not na(naiveForecast) ? pi - naiveForecast : na
+
+    float zGap = f_robust_z_series(gap, CPI_Z_M, Z_CLIP)
+    float zMomentum = f_robust_z_series(momentum, CPI_Z_M, Z_CLIP)
+    float zSurprise = f_robust_z_series(error, CPI_Z_M, Z_CLIP)
+    [pi, trend, gap, momentum, forecast, naiveForecast, error, naiveError, zGap, zMomentum, zSurprise]
+
+f_ppi_pack(float ppi) =>
+    float trend = ta.ema(ppi, PPI_TREND_Q)
+    float gap = ppi - trend
+    float zGap = f_robust_z_series(gap, PPI_Z_Q, Z_CLIP)
+    [ppi, trend, gap, zGap]
+
+f_return_pack(float px) =>
+    float ret = not na(px[1]) and px > 0 and px[1] > 0 ? 100.0 * math.log(px / px[1]) : na
+    float zRet = f_robust_z_series(ret, DRIVER_Z_M, Z_CLIP)
+    [ret, zRet]
+
+f_gdp_pack(float gdp) =>
+    float trend = ta.ema(gdp, GDP_TREND_Q)
+    float gap = gdp - trend
+    float accel = gdp - gdp[1]
+    float zGap = f_robust_z_series(gap, GDP_Z_Q, Z_CLIP)
+    float zAccel = f_robust_z_series(accel, GDP_Z_Q, Z_CLIP)
+    [gdp, trend, gap, accel, zGap, zAccel]
+
+// =====================================================================
+// F) DATA REQUESTS: LIVE AND CONFIRMED
+// =====================================================================
+[cpiLive, cpiTrendLive, cpiGapLive, cpiMomLive, cpiForecastLive, cpiNaiveLive, cpiErrLive, cpiNaiveErrLive, zCpiGapLive, zCpiMomLive, zCpiSurLive] = request.security(symInfl, TF_M, f_cpi_pack(close), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[cpiConf, cpiTrendConf, cpiGapConf, cpiMomConf, cpiForecastConf, cpiNaiveConf, cpiErrConf, cpiNaiveErrConf, zCpiGapConf, zCpiMomConf, zCpiSurConf] = request.security(symInfl, TF_M, f_cpi_pack(close[1]), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+
+[ppiLive, ppiTrendLive, ppiGapLive, zPpiLive] = request.security(symPPI, TF_Q, f_ppi_pack(close), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[ppiConf, ppiTrendConf, ppiGapConf, zPpiConf] = request.security(symPPI, TF_Q, f_ppi_pack(close[1]), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+
+[fxRetLive, zFxLive] = request.security(symFX, TF_M, f_return_pack(close), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[fxRetConf, zFxConf] = request.security(symFX, TF_M, f_return_pack(close[1]), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+
+[oilRetLive, zOilLive] = request.security(symOil, TF_M, f_return_pack(close), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[oilRetConf, zOilConf] = request.security(symOil, TF_M, f_return_pack(close[1]), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+
+[gdpLive, gdpTrendLive, gdpGapLive, gdpAccelLive, zGdpGapLive, zGdpAccelLive] = request.security(symGDP, TF_Q, f_gdp_pack(close), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[gdpConf, gdpTrendConf, gdpGapConf, gdpAccelConf, zGdpGapConf, zGdpAccelConf] = request.security(symGDP, TF_Q, f_gdp_pack(close[1]), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+
+policyLive = request.security(symPolicy, TF_M, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+policyConf = request.security(symPolicy, TF_M, close[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+ibLive = request.security(symIB, TF_M, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+ibConf = request.security(symIB, TF_M, close[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+vn10yLive = request.security(symVN10Y, TF_M, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+vn10yConf = request.security(symVN10Y, TF_M, close[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+vn02yLive = request.security(symVN02Y, TF_M, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+vn02yConf = request.security(symVN02Y, TF_M, close[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+
+float cpi = useConfirmed ? cpiConf : cpiLive
+float cpiTrend = useConfirmed ? cpiTrendConf : cpiTrendLive
+float cpiGap = useConfirmed ? cpiGapConf : cpiGapLive
+float cpiMomentum = useConfirmed ? cpiMomConf : cpiMomLive
+float cpiForecast = useConfirmed ? cpiForecastConf : cpiForecastLive
+float cpiNaiveForecast = useConfirmed ? cpiNaiveConf : cpiNaiveLive
+float cpiError = useConfirmed ? cpiErrConf : cpiErrLive
+float cpiNaiveError = useConfirmed ? cpiNaiveErrConf : cpiNaiveErrLive
+float zCpiGap = useConfirmed ? zCpiGapConf : zCpiGapLive
+float zCpiMomentum = useConfirmed ? zCpiMomConf : zCpiMomLive
+float zCpiSurprise = useConfirmed ? zCpiSurConf : zCpiSurLive
+
+float ppi = useConfirmed ? ppiConf : ppiLive
+float ppiTrend = useConfirmed ? ppiTrendConf : ppiTrendLive
+float ppiGap = useConfirmed ? ppiGapConf : ppiGapLive
+float zPpi = useConfirmed ? zPpiConf : zPpiLive
+float fxReturn = useConfirmed ? fxRetConf : fxRetLive
+float zFx = useConfirmed ? zFxConf : zFxLive
+float oilReturn = useConfirmed ? oilRetConf : oilRetLive
+float zOil = useConfirmed ? zOilConf : zOilLive
+
+float gdp = useConfirmed ? gdpConf : gdpLive
+float gdpTrend = useConfirmed ? gdpTrendConf : gdpTrendLive
+float gdpGap = useConfirmed ? gdpGapConf : gdpGapLive
+float gdpAccel = useConfirmed ? gdpAccelConf : gdpAccelLive
+float zGdpGap = useConfirmed ? zGdpGapConf : zGdpGapLive
+float zGdpAccel = useConfirmed ? zGdpAccelConf : zGdpAccelLive
+
+float policyRate = useConfirmed ? policyConf : policyLive
+float interbankRate = useConfirmed ? ibConf : ibLive
+float vn10y = useConfirmed ? vn10yConf : vn10yLive
+float vn02y = useConfirmed ? vn02yConf : vn02yLive
+
+// =====================================================================
+// G) CROSS-SERIES MONTHLY ARRAYS
+// =====================================================================
+var array<float> arrRealPolicy = array.new<float>()
+var array<float> arrIBSpread = array.new<float>()
+var array<float> arrPolicyGap = array.new<float>()
+var array<float> arrCurveSlope = array.new<float>()
+var array<float> arrLongPolicy = array.new<float>()
+
+var array<float> arrStress = array.new<float>()
+var array<float> arrFCI = array.new<float>()
+var array<float> arrPassThrough = array.new<float>()
+var array<float> arrInflBlock = array.new<float>()
+var array<float> arrMonBlock = array.new<float>()
+var array<float> arrGrowBlock = array.new<float>()
+var array<float> arrExtBlock = array.new<float>()
+var array<float> arrCurveBlock = array.new<float>()
+var array<float> arrStateConfidence = array.new<float>()
+var array<float> arrForecastReliability = array.new<float>()
+
+var array<float> arrForecastErr = array.new<float>()
+var array<float> arrNaiveErr = array.new<float>()
+var array<float> arrRegimeFlip = array.new<float>()
+
+float realPolicyRate = not na(policyRate) and not na(cpiForecast) ? policyRate - cpiForecast : na
+float ibPolicySpread = not na(interbankRate) and not na(policyRate) ? interbankRate - policyRate : na
+float impliedPolicy = not na(cpi) and not na(gdpGap) ? rStar + cpi + phiPi * (cpi - piTarget) + phiY * gdpGap : na
+float policyRuleGap = not na(policyRate) and not na(impliedPolicy) ? policyRate - impliedPolicy : na
+float curveSlope = not na(vn10y) and not na(vn02y) ? vn10y - vn02y : na
+float longPolicySpread = not na(vn10y) and not na(policyRate) ? vn10y - policyRate : na
+
+var float zRealPolicy = na
+var float zIBSpread = na
+var float zPolicyGap = na
+var float zCurveSlope = na
+var float zLongPolicy = na
+
+var float inflationBlock = na
+var float monetaryBlock = na
+var float growthBlock = na
+var float externalBlock = na
+var float curveBlock = na
+var float macroStress = na
+var float financialConditions = na
+var float passThroughPressure = na
+
+var float macroImpulse1M = na
+var float macroImpulse3M = na
+var float macroAcceleration = na
+var float fciImpulse1M = na
+var float inflationDelta1M = na
+var float monetaryDelta1M = na
+var float growthDelta1M = na
+var float externalDelta1M = na
+var float curveDelta1M = na
+
+var float rmseModel = na
+var float rmseNaive = na
+var float maeModel = na
+var float forecastBias = na
+var float forecastSkill = na
+var float forecastScore = na
+var float forecastSkillScore = na
+var float forecastSampleScore = na
+var float forecastBiasScore = na
+var float forecastReliabilityScore = na
+var float coverageScore = na
+var float sampleScore = na
+var float coherenceScore = na
+var float stabilityScore = na
+var float stateConfidenceScore = na
+var float confidenceScore = na
+
+var int rawRegime = 0
+var int confirmedRegime = -1
+var int candidateRegime = -1
+var int candidateCount = 0
+var int regimeAge = 0
+var bool regimeChanged = false
+
+if isNewMonth
+    f_arr_push(arrRealPolicy, realPolicyRate, ARRAY_CAP_M)
+    f_arr_push(arrIBSpread, ibPolicySpread, ARRAY_CAP_M)
+    f_arr_push(arrPolicyGap, policyRuleGap, ARRAY_CAP_M)
+    f_arr_push(arrCurveSlope, curveSlope, ARRAY_CAP_M)
+    f_arr_push(arrLongPolicy, longPolicySpread, ARRAY_CAP_M)
+
+    zRealPolicy := f_arr_robust_z(arrRealPolicy, realPolicyRate, MIN_ROBUST_M, Z_CLIP)
+    zIBSpread := f_arr_robust_z(arrIBSpread, ibPolicySpread, MIN_ROBUST_M, Z_CLIP)
+    zPolicyGap := f_arr_robust_z(arrPolicyGap, policyRuleGap, MIN_ROBUST_M, Z_CLIP)
+    zCurveSlope := f_arr_robust_z(arrCurveSlope, curveSlope, MIN_ROBUST_M, Z_CLIP)
+    zLongPolicy := f_arr_robust_z(arrLongPolicy, longPolicySpread, MIN_ROBUST_M, Z_CLIP)
+
+    inflationBlock := f_weighted5(zCpiGap, 0.50, zCpiMomentum, 0.30, zCpiSurprise, 0.20, na, 0.0, na, 0.0)
+    monetaryBlock := f_weighted5(zRealPolicy, 0.45, zIBSpread, 0.35, zPolicyGap, 0.20, na, 0.0, na, 0.0)
+    growthBlock := f_weighted5(-zGdpGap, 0.70, -zGdpAccel, 0.30, na, 0.0, na, 0.0, na, 0.0)
+    externalBlock := f_weighted5(zPpi, 0.45, zFx, 0.35, zOil, 0.20, na, 0.0, na, 0.0)
+    curveBlock := f_weighted5(-zCurveSlope, 0.65, zLongPolicy, 0.35, na, 0.0, na, 0.0, na, 0.0)
+
+    macroStress := f_weighted5(inflationBlock, W_INFL, monetaryBlock, W_MON, growthBlock, W_GROW, externalBlock, W_EXT, curveBlock, W_CURVE)
+    financialConditions := f_weighted5(monetaryBlock, 0.40, externalBlock, 0.25, curveBlock, 0.25, growthBlock, 0.10, na, 0.0)
+    passThroughPressure := f_weighted5(externalBlock, 0.35, monetaryBlock, 0.30, inflationBlock, 0.25, curveBlock, 0.10, na, 0.0)
+
+    f_arr_push(arrInflBlock, inflationBlock, ARRAY_CAP_M)
+    f_arr_push(arrMonBlock, monetaryBlock, ARRAY_CAP_M)
+    f_arr_push(arrGrowBlock, growthBlock, ARRAY_CAP_M)
+    f_arr_push(arrExtBlock, externalBlock, ARRAY_CAP_M)
+    f_arr_push(arrCurveBlock, curveBlock, ARRAY_CAP_M)
+    f_arr_push(arrStress, macroStress, ARRAY_CAP_M)
+    f_arr_push(arrFCI, financialConditions, ARRAY_CAP_M)
+    f_arr_push(arrPassThrough, passThroughPressure, ARRAY_CAP_M)
+
+    macroImpulse1M := macroStress - f_arr_lag(arrStress, 1)
+    macroImpulse3M := macroStress - f_arr_lag(arrStress, 3)
+    macroAcceleration := macroImpulse1M + 0.50 * macroImpulse3M
+    fciImpulse1M := financialConditions - f_arr_lag(arrFCI, 1)
+
+    inflationDelta1M := inflationBlock - f_arr_lag(arrInflBlock, 1)
+    monetaryDelta1M := monetaryBlock - f_arr_lag(arrMonBlock, 1)
+    growthDelta1M := growthBlock - f_arr_lag(arrGrowBlock, 1)
+    externalDelta1M := externalBlock - f_arr_lag(arrExtBlock, 1)
+    curveDelta1M := curveBlock - f_arr_lag(arrCurveBlock, 1)
+
+    f_arr_push(arrForecastErr, cpiError, EVAL_CAP_M)
+    f_arr_push(arrNaiveErr, cpiNaiveError, EVAL_CAP_M)
+    rmseModel := f_arr_rmse(arrForecastErr)
+    rmseNaive := f_arr_rmse(arrNaiveErr)
+    maeModel := f_arr_mae(arrForecastErr)
+    forecastBias := f_arr_mean(arrForecastErr)
+    forecastSkill := not na(rmseModel) and not na(rmseNaive) and rmseNaive > 1e-10 ? 1.0 - rmseModel / rmseNaive : na
+    int forecastN = array.size(arrForecastErr)
+    forecastSkillScore := forecastN >= 12 and not na(forecastSkill) ? f_clip(50.0 + 50.0 * forecastSkill, 0.0, 100.0) : math.min(50.0, 50.0 * forecastN / 12.0)
+    forecastSampleScore := math.min(100.0, 100.0 * forecastN / 24.0)
+    forecastBiasScore := not na(forecastBias) ? f_clip(100.0 - 25.0 * math.abs(forecastBias), 0.0, 100.0) : 0.0
+    forecastReliabilityScore := 0.65 * forecastSkillScore + 0.20 * forecastSampleScore + 0.15 * forecastBiasScore
+    forecastReliabilityScore := useConfirmed ? forecastReliabilityScore : math.max(0.0, forecastReliabilityScore - 10.0)
+    if forecastN < 12 or na(forecastSkill) or forecastSkill < 0
+        forecastReliabilityScore := math.min(forecastReliabilityScore, 49.0)
+    forecastScore := forecastReliabilityScore
+
+    rawRegime := f_regime_id(inflationBlock, -growthBlock)
+    int oldConfirmedRegime = confirmedRegime
+    if confirmedRegime == -1
+        confirmedRegime := rawRegime
+        candidateRegime := rawRegime
+        candidateCount := 0
+        regimeAge := 1
+    else if rawRegime == confirmedRegime
+        candidateRegime := rawRegime
+        candidateCount := 0
+        regimeAge += 1
+    else
+        if rawRegime == candidateRegime
+            candidateCount += 1
+        else
+            candidateRegime := rawRegime
+            candidateCount := 1
+        if candidateCount >= 2
+            confirmedRegime := candidateRegime
+            candidateCount := 0
+            regimeAge := 1
+        else
+            regimeAge += 1
+
+    regimeChanged := oldConfirmedRegime != -1 and confirmedRegime != oldConfirmedRegime
+    f_arr_push(arrRegimeFlip, regimeChanged ? 1.0 : 0.0, 12)
+
+    int avail = 0
+    avail += not na(inflationBlock) ? 1 : 0
+    avail += not na(monetaryBlock) ? 1 : 0
+    avail += not na(growthBlock) ? 1 : 0
+    avail += not na(externalBlock) ? 1 : 0
+    avail += not na(curveBlock) ? 1 : 0
+    coverageScore := 100.0 * avail / 5.0
+    sampleScore := math.min(100.0, 100.0 * array.size(arrStress) / 60.0)
+    coherenceScore := f_coherence(macroStress, inflationBlock, monetaryBlock, growthBlock, externalBlock, curveBlock)
+    float churn12 = f_arr_sum(arrRegimeFlip)
+    stabilityScore := math.max(0.0, 100.0 - 18.0 * churn12)
+    stateConfidenceScore := 0.30 * coverageScore + 0.20 * sampleScore + 0.30 * coherenceScore + 0.20 * stabilityScore
+    stateConfidenceScore := useConfirmed ? stateConfidenceScore : math.max(0.0, stateConfidenceScore - 10.0)
+    confidenceScore := stateConfidenceScore
+    f_arr_push(arrStateConfidence, stateConfidenceScore, ARRAY_CAP_M)
+    f_arr_push(arrForecastReliability, forecastReliabilityScore, ARRAY_CAP_M)
+
+// =====================================================================
+// H) CURRENT RANKS, STATES, AND DECISION INTERPRETATION
+// =====================================================================
+bool rankReady = array.size(arrStress) >= MIN_RANK_M
+float pStress = rankReady ? f_arr_percentrank(arrStress, macroStress) : na
+float pFCI = array.size(arrFCI) >= MIN_RANK_M ? f_arr_percentrank(arrFCI, financialConditions) : na
+float pPass = array.size(arrPassThrough) >= MIN_RANK_M ? f_arr_percentrank(arrPassThrough, passThroughPressure) : na
+float pInfl = array.size(arrInflBlock) >= MIN_RANK_M ? f_arr_percentrank(arrInflBlock, inflationBlock) : na
+float pMon = array.size(arrMonBlock) >= MIN_RANK_M ? f_arr_percentrank(arrMonBlock, monetaryBlock) : na
+float pGrow = array.size(arrGrowBlock) >= MIN_RANK_M ? f_arr_percentrank(arrGrowBlock, growthBlock) : na
+float pExt = array.size(arrExtBlock) >= MIN_RANK_M ? f_arr_percentrank(arrExtBlock, externalBlock) : na
+float pCurve = array.size(arrCurveBlock) >= MIN_RANK_M ? f_arr_percentrank(arrCurveBlock, curveBlock) : na
+
+string stressBucket = f_bucket(macroStress, pStress, rankReady)
+string regimeText = confirmedRegime == -1 ? "NA" : f_regime_text(confirmedRegime)
+string stateConfidenceGrade = f_quality(stateConfidenceScore, useConfirmed)
+string stateConfidenceLabel = f_confidence_label(stateConfidenceScore)
+string stateEvidenceLabel = stateConfidenceGrade == "A" ? "Mạnh" : stateConfidenceGrade == "B" ? "Khá" : "Yếu"
+string forecastReliabilityLabel = f_forecast_label(forecastReliabilityScore)
+string monetaryStance = f_stance(monetaryBlock)
+string stressDirection = f_direction(macroAcceleration)
+float churn12 = f_arr_sum(arrRegimeFlip)
+bool transitionFlag = confirmedRegime != -1 and (rawRegime != confirmedRegime or candidateCount > 0 or regimeChanged)
+
+f_driver_name(string key) =>
+    key == "Inflation" ? "Lạm phát" :
+     key == "Monetary" ? "Tiền tệ / thanh khoản" :
+     key == "Growth" ? "Tăng trưởng" :
+     key == "External" ? "Chi phí bên ngoài" : "Đường cong lợi suất"
+
+string mainDriverKey = "Inflation"
+float mainAbs = math.abs(nz(inflationBlock))
+if math.abs(nz(monetaryBlock)) > mainAbs
+    mainDriverKey := "Monetary"
+    mainAbs := math.abs(nz(monetaryBlock))
+if math.abs(nz(growthBlock)) > mainAbs
+    mainDriverKey := "Growth"
+    mainAbs := math.abs(nz(growthBlock))
+if math.abs(nz(externalBlock)) > mainAbs
+    mainDriverKey := "External"
+    mainAbs := math.abs(nz(externalBlock))
+if math.abs(nz(curveBlock)) > mainAbs
+    mainDriverKey := "Curve"
+
+string impulseDriverKey = "Inflation"
+float impulseAbs = math.abs(nz(inflationDelta1M))
+if math.abs(nz(monetaryDelta1M)) > impulseAbs
+    impulseDriverKey := "Monetary"
+    impulseAbs := math.abs(nz(monetaryDelta1M))
+if math.abs(nz(growthDelta1M)) > impulseAbs
+    impulseDriverKey := "Growth"
+    impulseAbs := math.abs(nz(growthDelta1M))
+if math.abs(nz(externalDelta1M)) > impulseAbs
+    impulseDriverKey := "External"
+    impulseAbs := math.abs(nz(externalDelta1M))
+if math.abs(nz(curveDelta1M)) > impulseAbs
+    impulseDriverKey := "Curve"
+
+string mainDriver = f_driver_name(mainDriverKey)
+string impulseDriver = f_driver_name(impulseDriverKey)
+
+int driver1Idx = f_top_index(inflationBlock, monetaryBlock, growthBlock, externalBlock, curveBlock, -1, -1)
+int driver2Idx = f_top_index(inflationBlock, monetaryBlock, growthBlock, externalBlock, curveBlock, driver1Idx, -1)
+int driver3Idx = f_top_index(inflationBlock, monetaryBlock, growthBlock, externalBlock, curveBlock, driver1Idx, driver2Idx)
+
+string driver1Name = driver1Idx == 0 ? "Lạm phát" : driver1Idx == 1 ? "Tiền tệ / thanh khoản" : driver1Idx == 2 ? "Tăng trưởng" : driver1Idx == 3 ? "Chi phí bên ngoài" : "Đường cong lợi suất"
+string driver2Name = driver2Idx == 0 ? "Lạm phát" : driver2Idx == 1 ? "Tiền tệ / thanh khoản" : driver2Idx == 2 ? "Tăng trưởng" : driver2Idx == 3 ? "Chi phí bên ngoài" : "Đường cong lợi suất"
+string driver3Name = driver3Idx == 0 ? "Lạm phát" : driver3Idx == 1 ? "Tiền tệ / thanh khoản" : driver3Idx == 2 ? "Tăng trưởng" : driver3Idx == 3 ? "Chi phí bên ngoài" : "Đường cong lợi suất"
+float driver1Value = driver1Idx == 0 ? inflationBlock : driver1Idx == 1 ? monetaryBlock : driver1Idx == 2 ? growthBlock : driver1Idx == 3 ? externalBlock : curveBlock
+float driver2Value = driver2Idx == 0 ? inflationBlock : driver2Idx == 1 ? monetaryBlock : driver2Idx == 2 ? growthBlock : driver2Idx == 3 ? externalBlock : curveBlock
+float driver3Value = driver3Idx == 0 ? inflationBlock : driver3Idx == 1 ? monetaryBlock : driver3Idx == 2 ? growthBlock : driver3Idx == 3 ? externalBlock : curveBlock
+float driver1Pctl = driver1Idx == 0 ? pInfl : driver1Idx == 1 ? pMon : driver1Idx == 2 ? pGrow : driver1Idx == 3 ? pExt : pCurve
+float driver2Pctl = driver2Idx == 0 ? pInfl : driver2Idx == 1 ? pMon : driver2Idx == 2 ? pGrow : driver2Idx == 3 ? pExt : pCurve
+float driver3Pctl = driver3Idx == 0 ? pInfl : driver3Idx == 1 ? pMon : driver3Idx == 2 ? pGrow : driver3Idx == 3 ? pExt : pCurve
+
+int positiveDrivers = (f_sign(zPpi, 0.35) == 1 ? 1 : 0) + (f_sign(zFx, 0.35) == 1 ? 1 : 0) + (f_sign(zOil, 0.35) == 1 ? 1 : 0)
+int negativeDrivers = (f_sign(zPpi, 0.35) == -1 ? 1 : 0) + (f_sign(zFx, 0.35) == -1 ? 1 : 0) + (f_sign(zOil, 0.35) == -1 ? 1 : 0)
+string externalBreadth = positiveDrivers == 3 ? "3/3 cùng tăng" : negativeDrivers == 3 ? "3/3 cùng giảm" : positiveDrivers >= 2 ? "2/3 nghiêng tăng" : negativeDrivers >= 2 ? "2/3 nghiêng giảm" : "Phân tán"
+
+// Policy-easing readiness is a transparent qualitative heuristic, not a probability.
+float easingReadiness = f_weighted5(-inflationBlock, 0.30, growthBlock, 0.25, zRealPolicy, 0.20, zPolicyGap, 0.15, -externalBlock, 0.10)
+bool easingDataReady = not na(inflationBlock) and not na(growthBlock) and not na(zRealPolicy) and not na(externalBlock)
+bool condEasingInfl = not na(inflationBlock) and not na(zCpiMomentum) and inflationBlock <= 0.10 and zCpiMomentum <= 0.10
+bool condEasingGrowth = not na(growthBlock) and growthBlock >= 0.25
+bool condEasingExternal = not na(externalBlock) and not na(zFx) and externalBlock <= 0.25 and zFx <= 0.75
+bool condEasingRestrictive = (not na(zRealPolicy) and zRealPolicy >= 0.25) or (not na(zPolicyGap) and zPolicyGap >= 0.25)
+int easingConfirmCount = (condEasingInfl ? 1 : 0) + (condEasingGrowth ? 1 : 0) + (condEasingExternal ? 1 : 0) + (condEasingRestrictive ? 1 : 0)
+string easingLevel = not easingDataReady ? "Chưa đủ dữ liệu" : easingConfirmCount >= 3 and easingReadiness >= 0.35 ? "Cao" : easingConfirmCount >= 2 and easingReadiness >= 0.00 ? "Trung bình" : "Thấp"
+
+string liquidityState = na(zIBSpread) ? "Chưa đủ lịch sử" : zIBSpread >= 1.50 ? "Căng thẳng" : zIBSpread >= 0.50 ? "Hơi căng" : zIBSpread <= -0.50 ? "Dồi dào" : "Bình thường"
+string curveState = na(curveSlope) ? "Chưa có dữ liệu" : curveSlope < 0 ? "Đảo ngược" : not na(zCurveSlope) and zCurveSlope <= -1.0 ? "Phẳng bất thường" : "Dốc dương"
+string inflationState = na(inflationBlock) ? "Chưa đủ dữ liệu" : inflationBlock >= 0.75 ? "Áp lực cao" : inflationBlock >= 0.25 ? "Nghiêng tăng" : inflationBlock <= -0.50 ? "Hạ nhiệt rõ" : inflationBlock <= -0.15 ? "Đang hạ nhiệt" : "Trung tính"
+string growthState = na(growthBlock) ? "Chưa đủ dữ liệu" : growthBlock >= 0.75 ? "Suy yếu mạnh" : growthBlock >= 0.25 ? "Chậm lại" : growthBlock <= -0.50 ? "Mở rộng mạnh" : growthBlock <= -0.15 ? "Mở rộng" : "Đi ngang"
+
+string riskOverlay = inflationBlock >= 0.75 and (monetaryBlock >= 0.25 or zIBSpread >= 1.50) ? "Áp lực thắt chặt do lạm phát và thanh khoản" : inflationBlock >= 0.75 ? "Áp lực thắt chặt do lạm phát" : monetaryBlock >= 0.75 ? "Áp lực tiền tệ / thanh khoản" : growthBlock >= 0.75 ? "Rủi ro suy giảm tăng trưởng" : externalBlock >= 0.75 ? "Áp lực chi phí bên ngoài" : curveBlock >= 0.75 ? "Căng thẳng đường cong lợi suất" : stressBucket == "B4" or stressBucket == "B3" ? "Áp lực vĩ mô diện rộng" : "Không có lớp rủi ro nổi trội"
+
+string stressNarrative = stressBucket == "B4" ? "Căng thẳng vĩ mô ở vùng cực cao." : stressBucket == "B3" ? "Căng thẳng vĩ mô cao hơn bình thường." : stressBucket == "B1" or stressBucket == "B0" ? "Điều kiện vĩ mô tương đối thuận lợi." : "Điều kiện vĩ mô ở vùng trung tính."
+string directionNarrative = macroAcceleration >= 0.20 ? "Áp lực tiếp tục tăng." : macroAcceleration <= -0.20 ? "Áp lực đang hạ nhiệt." : "Xung lực hiện tương đối ổn định."
+string policyNarrative = "Tiền tệ " + monetaryStance + "; thanh khoản " + liquidityState + "; đường cong " + curveState + "."
+string stateValidationNarrative = stateConfidenceGrade == "A" ? "Nowcast có bằng chứng mạnh." : stateConfidenceGrade == "B" ? "Nowcast có bằng chứng khá." : stateConfidenceGrade == "C" ? "Nowcast chỉ có độ tin cậy trung bình." : "Nowcast có độ tin cậy thấp."
+string forecastNarrative = forecastReliabilityLabel == "Cao" ? "Forecast có thể dùng như tín hiệu bổ trợ." : forecastReliabilityLabel == "Trung bình" ? "Forecast cần đọc cùng dữ liệu hiện tại." : "Ưu tiên nowcast; forecast chưa vượt chuẩn đủ thuyết phục."
+
+string decisionPosture = stressBucket == "B4" ? "Phòng thủ cao" : stressBucket == "B3" and macroAcceleration >= 0.20 ? "Tăng phòng thủ" : stressBucket == "B1" or stressBucket == "B0" ? "Có thể linh hoạt hơn" : "Giữ cân bằng"
+string transitionText = transitionFlag ? "Đang chờ xác nhận chuyển pha" : "Regime tương đối ổn định"
+
+// =====================================================================
+// I) DECISION-ORIENTED PLOTS
+// =====================================================================
+bool viewExecutive = view == "Bảng điều hành"
+bool viewMonetary = view == "Tiền tệ & đường cong"
+bool viewBalance = view == "Chu kỳ & lạm phát"
+bool viewResearch = view == "Kiểm định mô hình"
+
+plot(showPlots and viewExecutive ? macroStress : na, "Điều hành - Căng thẳng vĩ mô", linewidth=3)
+plot(fullMode and viewExecutive ? macroAcceleration : na, "Điều hành - Xung lực", linewidth=2)
+
+plot(showPlots and viewMonetary ? zIBSpread : na, "Tiền tệ - Stress thanh khoản Z", linewidth=3)
+plot(fullMode and viewMonetary ? curveBlock : na, "Tiền tệ - Căng thẳng đường cong", linewidth=2)
+
+plot(showPlots and viewBalance ? inflationBlock : na, "Chu kỳ - Áp lực lạm phát", linewidth=3)
+plot(fullMode and viewBalance ? growthBlock : na, "Chu kỳ - Stress tăng trưởng", linewidth=2)
+
+plot(showPlots and viewResearch ? stateConfidenceScore : na, "Kiểm định - State Confidence", linewidth=3)
+plot(fullMode and viewResearch ? forecastReliabilityScore : na, "Kiểm định - Forecast Reliability", linewidth=2)
+
+// =====================================================================
+// J) TABLE HELPERS
+// =====================================================================
+f_tbl_pos() =>
+    tblPosOpt == "Top Left" ? position.top_left :
+     tblPosOpt == "Bottom Right" ? position.bottom_right :
+     tblPosOpt == "Bottom Left" ? position.bottom_left : position.top_right
+
+f_tbl_size() =>
+    fontOpt == "Tiny" ? size.tiny : fontOpt == "Normal" ? size.normal : size.small
+
+var table t = table.new(position.top_right, 4, 22, border_width=1)
+
+f_cell(int row, int col, string txt, color bg, color tc, halign) =>
+    table.cell(t, col, row, txt, bgcolor=bg, text_color=tc, text_size=f_tbl_size(), text_halign=halign)
+
+f_hdr(int row, string headerTxt) =>
+    for col = 0 to 3
+        f_cell(row, col, col == 0 ? headerTxt : "", color.new(color.gray, 74), color.white, text.align_left)
+
+f_row(int row, string metric, string valueTxt, string rankTxt, float rankValue, bool highBad, string meaning) =>
+    f_cell(row, 0, metric, color.black, color.white, text.align_left)
+    f_cell(row, 1, valueTxt, color.black, color.white, text.align_right)
+    f_cell(row, 2, rankTxt, f_pctl_bg(rankValue, highBad), color.white, text.align_center)
+    f_cell(row, 3, meaning, color.black, color.white, text.align_left)
+
+f_status_bg(string status) =>
+    status == "Cao" or status == "CÓ" or status == "Đang hình thành" or status == "Phòng thủ cao" ? color.new(color.red, 58) :
+     status == "Trung bình" or status == "Tăng phòng thủ" or status == "Đang chờ xác nhận chuyển pha" ? color.new(color.orange, 64) :
+     status == "Thấp" or status == "KHÔNG" or status == "Chưa xác nhận" or status == "Có thể linh hoạt hơn" ? color.new(color.green, 70) :
+     color.new(color.gray, 82)
+
+f_conf_bg(string grade) =>
+    grade == "A" ? color.new(color.green, 58) : grade == "B" ? color.new(color.green, 75) : grade == "C" ? color.new(color.orange, 65) : color.new(color.red, 60)
+
+f_forecast_bg(string level) =>
+    level == "Cao" ? color.new(color.green, 62) : level == "Trung bình" ? color.new(color.orange, 66) : color.new(color.red, 64)
+
+f_regime_bg(int id) =>
+    id == 1 ? color.new(color.red, 60) : id == 2 ? color.new(color.red, 48) : id == 3 ? color.new(color.green, 58) : id == 4 ? color.new(color.orange, 65) : color.new(color.gray, 80)
+
+f_bool_bg(bool condition) =>
+    condition ? color.new(color.green, 70) : color.new(color.gray, 84)
+
+f_status_row(int row, string metric, string valueTxt, string tagTxt, string meaning, color valueBg) =>
+    f_cell(row, 0, metric, color.black, color.white, text.align_left)
+    f_cell(row, 1, valueTxt, valueBg, color.white, text.align_center)
+    f_cell(row, 2, tagTxt, color.new(color.gray, 84), color.white, text.align_center)
+    f_cell(row, 3, meaning, color.black, color.white, text.align_left)
+
+f_condition_row(int row, string metric, bool condition, string meaning) =>
+    f_cell(row, 0, metric, color.black, color.white, text.align_left)
+    f_cell(row, 1, condition ? "Đạt" : "Chưa đạt", f_bool_bg(condition), color.white, text.align_center)
+    f_cell(row, 2, condition ? "✓" : "—", f_bool_bg(condition), color.white, text.align_center)
+    f_cell(row, 3, meaning, color.black, color.white, text.align_left)
+
+f_text_row(int row, string labelTxt, string bodyTxt, color bg) =>
+    f_cell(row, 0, labelTxt, bg, color.white, text.align_left)
+    f_cell(row, 1, bodyTxt, bg, color.white, text.align_left)
+    f_cell(row, 2, "", bg, color.white, text.align_left)
+    f_cell(row, 3, "", bg, color.white, text.align_left)
+
+f_clear_table() =>
+    for row = 0 to 21
+        for col = 0 to 3
+            table.cell(t, col, row, "", bgcolor=color.new(color.black, 100), text_color=color.new(color.white, 100), text_size=f_tbl_size())
+
+// =====================================================================
+// K) DECISION-FIRST DASHBOARD
+// =====================================================================
+if barstate.islast
+    table.set_position(t, f_tbl_pos())
+    f_clear_table()
+
+    string stressRankText = rankReady ? "P" + str.tostring(int(math.round(pStress))) : "CHƯA XẾP HẠNG"
+    string headerStress = "CĂNG THẲNG " + stressRankText + " | XUNG LỰC: " + str.upper(stressDirection)
+    f_cell(0, 0, view, color.new(color.gray, 68), color.white, text.align_left)
+    f_cell(0, 1, regimeText, f_regime_bg(confirmedRegime), color.white, text.align_left)
+    f_cell(0, 2, "NOWCAST " + stateConfidenceGrade + " | " + f_fmt_pct(stateConfidenceScore, 0), f_conf_bg(stateConfidenceGrade), color.white, text.align_center)
+    f_cell(0, 3, headerStress, f_bucket_bg(stressBucket), color.white, text.align_left)
+
+    if viewExecutive
+        f_hdr(1, "KẾT LUẬN ĐIỀU HÀNH")
+        f_text_row(2, "Nền & rủi ro", regimeText + "; " + riskOverlay + ".", color.new(color.gray, 86))
+        f_text_row(3, "Diễn biến", stressNarrative + " " + directionNarrative, color.new(color.gray, 89))
+        f_text_row(4, "Chính sách", policyNarrative, color.new(color.gray, 89))
+
+        f_hdr(5, "BA TÍN HIỆU QUAN TRỌNG NHẤT")
+        f_row(6, driver1Name, f_fmt(driver1Value, 2), f_fmt_rank(driver1Pctl, not na(driver1Pctl)), driver1Pctl, true, f_block_state(driver1Value))
+        f_row(7, driver2Name, f_fmt(driver2Value, 2), f_fmt_rank(driver2Pctl, not na(driver2Pctl)), driver2Pctl, true, f_block_state(driver2Value))
+        f_row(8, driver3Name, f_fmt(driver3Value, 2), f_fmt_rank(driver3Pctl, not na(driver3Pctl)), driver3Pctl, true, f_block_state(driver3Value))
+
+        f_hdr(9, "HÀM Ý QUYẾT ĐỊNH")
+        f_status_row(10, "Tư thế", decisionPosture, "-", "Theo stress và xung lực", f_status_bg(decisionPosture))
+        f_status_row(11, "Giảm lãi suất", easingLevel, str.tostring(easingConfirmCount) + "/4", "Mức sẵn sàng định tính", f_status_bg(easingLevel))
+        f_status_row(12, "Chất lượng bằng chứng", stateEvidenceLabel, "Grade " + stateConfidenceGrade, stateValidationNarrative, f_conf_bg(stateConfidenceGrade))
+        f_status_row(13, "Tin dự báo", forecastReliabilityLabel, "Skill " + f_fmt(forecastSkill, 2), forecastNarrative, f_forecast_bg(forecastReliabilityLabel))
+        f_status_row(14, "Chuyển pha", transitionFlag ? "CÓ" : "KHÔNG", "-", transitionText, f_status_bg(transitionFlag ? "CÓ" : "KHÔNG"))
+        f_text_row(15, "Kỷ luật dùng", "Tin nowcast và driver trước; forecast chỉ là lớp bổ trợ.", color.new(color.gray, 86))
+
+    else if viewMonetary
+        f_hdr(1, "KẾT LUẬN TIỀN TỆ")
+        f_text_row(2, "Trạng thái", "Tiền tệ " + monetaryStance + "; thanh khoản " + liquidityState + "; đường cong " + curveState + ".", color.new(color.gray, 86))
+        f_text_row(3, "Giảm lãi suất", easingLevel + " — đạt " + str.tostring(easingConfirmCount) + "/4 điều kiện xác nhận.", color.new(color.gray, 89))
+
+        f_hdr(4, "THỊ TRƯỜNG TIỀN TỆ")
+        f_row(5, "Lãi điều hành", f_fmt_pct(policyRate, 2), "-", na, true, "Mốc chính sách")
+        f_row(6, "Liên ngân hàng", f_fmt_pct(interbankRate, 2), "-", na, true, liquidityState)
+        f_row(7, "IB - Policy", f_fmt_pct(ibPolicySpread, 2), "Z " + f_fmt(zIBSpread, 2), na, true, "Stress thanh khoản")
+        f_row(8, "Lãi thực ex-ante", f_fmt_pct(realPolicyRate, 2), "Z " + f_fmt(zRealPolicy, 2), na, true, "Policy - CPI forecast")
+        f_row(9, "Độ lệch chính sách", f_fmt_pct(policyRuleGap, 2), "Z " + f_fmt(zPolicyGap, 2), na, true, "Taylor-style diagnostic")
+
+        f_hdr(10, "ĐƯỜNG CONG LỢI SUẤT")
+        f_row(11, "VN 2Y", f_fmt_pct(vn02y, 2), "-", na, true, "Đầu ngắn")
+        f_row(12, "VN 10Y", f_fmt_pct(vn10y, 2), "-", na, true, "Đầu dài")
+        f_row(13, "10Y - 2Y", f_fmt_pct(curveSlope, 2), "Z " + f_fmt(zCurveSlope, 2), na, false, curveState)
+        f_row(14, "10Y - Policy", f_fmt_pct(longPolicySpread, 2), "Z " + f_fmt(zLongPolicy, 2), na, true, "Áp lực kỳ hạn / tài khóa")
+        f_row(15, "Căng thẳng đường cong", f_fmt(curveBlock, 2), f_fmt_rank(pCurve, not na(pCurve)), pCurve, true, "65% độ phẳng bất thường + 35% 10Y-Policy")
+
+        f_hdr(16, "CHECKLIST GIẢM LÃI SUẤT")
+        f_condition_row(17, "Lạm phát hạ", condEasingInfl, inflationState)
+        f_condition_row(18, "Tăng trưởng yếu", condEasingGrowth, growthState)
+        f_condition_row(19, "Đối ngoại thuận", condEasingExternal, externalBreadth)
+        f_condition_row(20, "Mức thắt đủ cao", condEasingRestrictive, "Lãi thực / policy gap")
+        f_text_row(21, "Lưu ý", "Checklist là điều kiện cần; không phải xác suất quyết định của SBV.", color.new(color.gray, 86))
+
+    else if viewBalance
+        f_hdr(1, "CÂN BẰNG CHU KỲ")
+        f_text_row(2, "Nền & rủi ro", regimeText + "; " + riskOverlay + ".", color.new(color.gray, 86))
+        f_text_row(3, "Trạng thái", "Lạm phát " + inflationState + "; tăng trưởng " + growthState + ".", color.new(color.gray, 89))
+
+        f_hdr(4, "BẰNG CHỨNG CỐT LÕI")
+        f_row(5, "CPI YoY", f_fmt_pct(cpi, 2), "-", na, true, "Mức hiện tại")
+        f_row(6, "CPI forecast", f_fmt_pct(cpiForecast, 2), "-", na, true, "Pseudo-OOS ensemble")
+        f_row(7, "Áp lực lạm phát", f_fmt(inflationBlock, 2), f_fmt_rank(pInfl, not na(pInfl)), pInfl, true, inflationState)
+        f_row(8, "GDP YoY", f_fmt_pct(gdp, 2), "-", na, false, "Mức hiện tại")
+        f_row(9, "Stress tăng trưởng", f_fmt(growthBlock, 2), f_fmt_rank(pGrow, not na(pGrow)), pGrow, true, growthState)
+        f_row(10, "Chi phí bên ngoài", f_fmt(externalBlock, 2), f_fmt_rank(pExt, not na(pExt)), pExt, true, externalBreadth)
+        f_row(11, "Mức truyền vào giá", f_fmt(passThroughPressure, 2), f_fmt_rank(pPass, not na(pPass)), pPass, true, "Khả năng truyền vào CPI")
+
+        f_hdr(12, "DRIVER VÀ CHUYỂN PHA")
+        f_row(13, driver1Name, f_fmt(driver1Value, 2), f_fmt_rank(driver1Pctl, not na(driver1Pctl)), driver1Pctl, true, "Driver lớn nhất")
+        f_row(14, driver2Name, f_fmt(driver2Value, 2), f_fmt_rank(driver2Pctl, not na(driver2Pctl)), driver2Pctl, true, "Driver thứ hai")
+        f_row(15, driver3Name, f_fmt(driver3Value, 2), f_fmt_rank(driver3Pctl, not na(driver3Pctl)), driver3Pctl, true, "Driver thứ ba")
+        f_status_row(16, "Driver biên", impulseDriver, "1M", "Thay đổi mạnh nhất", color.new(color.gray, 82))
+        f_status_row(17, "Chuyển pha", transitionFlag ? "Đang hình thành" : "Chưa xác nhận", "-", "Hysteresis hai tháng", f_status_bg(transitionFlag ? "Đang hình thành" : "Chưa xác nhận"))
+        f_status_row(18, "Tuổi regime", str.tostring(regimeAge) + " tháng", "-", "Số tháng của regime đã xác nhận", color.new(color.gray, 82))
+        f_text_row(19, "Giới hạn", "GDP cycle là proxy từ GDP YoY; không phải output gap cấu trúc.", color.new(color.gray, 86))
+
+    else
+        f_hdr(1, "TÁCH RIÊNG NOWCAST VÀ FORECAST")
+        f_status_row(2, "Tin cậy hiện tại", stateConfidenceLabel, f_fmt_pct(stateConfidenceScore, 0), stateValidationNarrative, f_conf_bg(stateConfidenceGrade))
+        f_status_row(3, "Tin cậy dự báo", forecastReliabilityLabel, f_fmt_pct(forecastReliabilityScore, 0), forecastNarrative, f_forecast_bg(forecastReliabilityLabel))
+
+        f_hdr(4, "KIỂM ĐỊNH HIỆN TẠI")
+        f_row(5, "Coverage", f_fmt_pct(coverageScore, 0), "-", na, false, "Số block có dữ liệu")
+        f_row(6, "Sample", f_fmt_pct(sampleScore, 0), "-", na, false, "Mục tiêu 60 tháng")
+        f_row(7, "Coherence", f_fmt_pct(coherenceScore, 0), "-", na, false, "Đồng thuận giữa blocks")
+        f_row(8, "Stability", f_fmt_pct(stabilityScore, 0), "-", na, false, "Phạt regime churn")
+        f_row(9, "Tin cậy hiện tại", f_fmt_pct(stateConfidenceScore, 0), "-", na, false, "Grade " + stateConfidenceGrade + "; dùng thang tuyệt đối")
+
+        f_hdr(10, "KIỂM ĐỊNH DỰ BÁO")
+        f_row(11, "Tin cậy dự báo", f_fmt_pct(forecastReliabilityScore, 0), "-", na, false, forecastReliabilityLabel + "; không dùng percentile")
+        f_row(12, "Forecast skill", f_fmt(forecastSkill, 2), "-", na, false, "1 - RMSE model / RMSE naive")
+        f_row(13, "RMSE model", f_fmt(rmseModel, 2), "-", na, true, "Rolling 36M")
+        f_row(14, "RMSE naive", f_fmt(rmseNaive, 2), "-", na, true, "CPI(t-1)")
+        f_row(15, "MAE model", f_fmt(maeModel, 2), "-", na, true, "Sai số tuyệt đối")
+        f_row(16, "Forecast bias", f_fmt(forecastBias, 2), "-", na, true, "Sai lệch có hệ thống")
+
+        f_hdr(17, "RAW BLOCKS / GOVERNANCE")
+        f_row(18, "Lạm phát", f_fmt(inflationBlock, 2), f_fmt_rank(pInfl, not na(pInfl)), pInfl, true, "W 28%")
+        f_row(19, "Tiền tệ", f_fmt(monetaryBlock, 2), f_fmt_rank(pMon, not na(pMon)), pMon, true, "W 28%")
+        f_row(20, "Tăng trưởng", f_fmt(growthBlock, 2), f_fmt_rank(pGrow, not na(pGrow)), pGrow, true, "W 20%")
+        f_row(21, "Đối ngoại / đường cong", f_fmt(externalBlock, 2) + " / " + f_fmt(curveBlock, 2), "W14/10", na, true, "Tái chuẩn hóa khi thiếu dữ liệu")
+
+// =====================================================================
+// L) ALERTS
+// =====================================================================
+alertcondition(isNewMonth and rankReady and macroStress >= 1.0 and macroAcceleration >= 0.20, "VN Macro Stress Escalation", "MacroAcademic v3.2.1: stress cao và đang xấu lên.")
+alertcondition(isNewMonth and transitionFlag, "VN Macro Regime Transition", "MacroAcademic v3.2.1: regime đang chuyển pha theo hysteresis.")
+alertcondition(isNewMonth and not na(zIBSpread) and zIBSpread >= 2.0, "VN Liquidity Stress", "MacroAcademic v3.2.1: IB-policy spread ở robust z >= 2.")
+alertcondition(isNewMonth and not na(forecastSkill) and forecastSkill < 0, "CPI Model Underperforms Naive", "MacroAcademic v3.2.1: CPI ensemble kém benchmark naive.")
+alertcondition(isNewMonth and easingDataReady and easingConfirmCount >= 3 and easingReadiness >= 0.35, "VN Easing Conditions Strengthen", "MacroAcademic v3.2.1: điều kiện định tính cho giảm lãi suất đang mạnh lên; đây không phải xác suất.")
