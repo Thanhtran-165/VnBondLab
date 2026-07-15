@@ -1,6 +1,6 @@
 # Giám sát truyền dẫn trái phiếu Việt Nam (P1–P6) — MacroAcademic FULL
 
-**VN Bond Transmission Monitor v5.2**
+**VN Bond Transmission Monitor v6.0.1**
 
 ---
 
@@ -177,7 +177,7 @@ Các mặc định đã đặt theo hướng ổn định/đọc regime:
 |--------|-----------|
 | Bảng/đường bị NA nhiều | Kiểm tra ticker (USDVND/VNINBR/DE02Y…) có dữ liệu không |
 | Tín hiệu giật mạnh | Tăng smoothN (nếu cần) nhưng mặc định đã cân bằng |
-| P4 "lạ" | Đảm bảo dòng impact_CRY dùng scoreDrvShock_CRY (đã fix trong bản v5.2) |
+| P4 "lạ" | Đảm bảo dòng impact_CRY dùng scoreDrvShock_CRY (đã fix trong bản v6.0.1) |
 
 ---
 
@@ -196,7 +196,7 @@ Trong **2–6 tuần**, bạn chỉ cần lưu ảnh ở **3–5 ngày tiêu bi�
 
 ## 📝 Phiên bản
 
-**v5.2** (2025) - MacroAcademic FULL Edition với 6 panels (P1–P6)
+**v6.0.1** (2025) - MacroAcademic FULL Edition với 6 panels (P1–P6), Interpretation Upgrade
 
 ---
 

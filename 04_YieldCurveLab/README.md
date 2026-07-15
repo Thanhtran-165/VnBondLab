@@ -1,4 +1,4 @@
-# VN YieldCurveLab — README (v1.6.9)
+# VN YieldCurveLab — README (v1.8.3)
 
 ## 1) Mục tiêu & phạm vi
 
@@ -195,7 +195,11 @@ Khi bạn thấy một kết luận “có vẻ đúng”, hãy check:
 
 ---
 
-## 9) Changelog tóm tắt (v1.6.9)
+## 9) Changelog tóm tắt (v1.8.3)
+
+**v1.8.3 — Daily Dashboard + Split Research**
+* Tách dashboard hằng ngày và khối research chuyên sâu
+* Cải tiến hiển thị và chẩn đoán đường cong lợi suất
 
 * Fix các lỗi phổ biến: “end of line without line continuation”, type `na` trong function, label API
 * Thêm **Stress_ADJ**

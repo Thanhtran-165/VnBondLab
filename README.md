@@ -19,7 +19,7 @@ Mỗi dự án được thiết kế độc lập nhưng có thể sử dụng k
 ### 📊 01_MacroAcademic_Engine
 **Dashboard phân tích vĩ mô Việt Nam**
 
-Phiên bản: v1.2.8 | Tác giả: MacroAcademic
+Phiên bản: v2.1 | Tác giả: MacroAcademic
 
 **Mục đích:** Đánh giá sức khỏe kinh tế Việt Nam qua 4 trụ cột chính:
 - Lạm phát (Inflation)
@@ -35,8 +35,7 @@ Phiên bản: v1.2.8 | Tác giả: MacroAcademic
 - Bạn cần hiểu bối cảnh vĩ mô trước khi quyết định đầu tư
 
 **File chính:**
-- `MacroAcademic_Engine_v1.2.8_Full.pine` (Bản đầy đủ)
-- `MacroAcademic_Engine_v1.2.8_Lite.pine` (Bản tinh gọn)
+- `MacroAcademic_Engine_v2.1_Full.pine` (Bản đầy đủ)
 
 📖 **Xem chi tiết:** [README MacroAcademic Engine](./01_MacroAcademic_Engine/)
 
@@ -45,7 +44,7 @@ Phiên bản: v1.2.8 | Tác giả: MacroAcademic
 ### 🔔 02_Macro_Alert_System
 **Hệ thống cảnh báo vĩ mô toàn diện**
 
-Phiên bản: v4.4 - Full | Tác giả: Macro Research Team
+Phiên bản: v5.0.1 | Tác giả: Macro Research Team
 
 **Mục đích:** Hệ thống cảnh báo rủi ro vĩ mô với phân tích 4 trụ cột:
 - Căng thẳng thanh khoản (Interbank - Policy Rate)
@@ -65,7 +64,7 @@ Phiên bản: v4.4 - Full | Tác giả: Macro Research Team
 - Bạn cần tìm ngành mạnh/yếu theo chu kỳ kinh tế
 
 **File chính:**
-- `Macro_Alert_System_v4.4.pine`
+- `Macro_Alert_System_v5.0.1.pine`
 
 📖 **Xem chi tiết:** [README Macro Alert System](./02_Macro_Alert_System/)
 
@@ -74,7 +73,7 @@ Phiên bản: v4.4 - Full | Tác giả: Macro Research Team
 ### 📈 03_Indices_Research_Map
 **Mapping vĩ mô → Hiệu suất thị trường (Script B)**
 
-Phiên bản: v1.0 | Tác giả: Macro Research Team
+Phiên bản: v2.0 | Tác giả: Macro Research Team
 
 **Mục đích:** Script B trong hệ thống 2 script, map Risk Score từ Script A sang hiệu suất thị trường:
 - Replicate Macro Engine từ Script A
@@ -91,7 +90,7 @@ Phiên bản: v1.0 | Tác giả: Macro Research Team
 - Bạn cần backtest chiến lược theo bucket
 
 **File chính:**
-- `Indices_Research_Map_v1.0.pine`
+- `Indices_Research_Map_v2.0.pine`
 
 📖 **Xem chi tiết:** [README Indices Research Map](./03_Indices_Research_Map/)
 
@@ -100,7 +99,7 @@ Phiên bản: v1.0 | Tác giả: Macro Research Team
 ### 💰 04_YieldCurveLab
 **Laboratory nghiên cứu đường cong lợi suất trái phiếu**
 
-Phiên bản: v1.6.9 | Tác giả: VnBondLab
+Phiên bản: v1.8.3 | Tác giả: VnBondLab
 
 **Mục đích:** Phân tích sâu đường cong lợi suất Việt Nam (1Y/2Y/3Y/5Y/7Y/10Y)
 
@@ -120,7 +119,7 @@ Phiên bản: v1.6.9 | Tác giả: VnBondLab
 - Bạn cần nghiên cứu mối quan hệ bond → equity
 
 **File chính:**
-- `VN_YieldCurveLab_v1.6.9.pine`
+- `VN_YieldCurveLab_v1.8.3.pine`
 
 📖 **Xem chi tiết:** [README YieldCurveLab](./04_YieldCurveLab/)
 
@@ -129,7 +128,7 @@ Phiên bản: v1.6.9 | Tác giả: VnBondLab
 ### 🔗 05_Bond_Transmission_Monitor
 **Giám sát truyền dẫn trái phiếu từ nước ngoài**
 
-Phiên bản: v5.2 | Tác giả: MacroAcademic Team
+Phiên bản: v6.0.1 | Tác giả: MacroAcademic Team
 
 **Mục đích:** Phân tích tác động từ thị trường nước ngoài sang trái phiếu VN thông qua 6 kênh truyền dẫn
 
@@ -154,7 +153,7 @@ Phiên bản: v5.2 | Tác giả: MacroAcademic Team
 - Bạn muốn hiểu cơ chế truyền dẫn toàn cầu → VN
 
 **File chính:**
-- `Bond_Transmission_Monitor_v5.2.pine`
+- `Bond_Transmission_Monitor_v6.0.1.pine`
 
 📖 **Xem chi tiết:** [README Bond Transmission Monitor](./05_Bond_Transmission_Monitor/)
 
@@ -332,11 +331,11 @@ Tất cả các dự án đều được xây dựng với các chuẩn mực h�
 - **Phiên bản hiện tại:** v3.0 (5 Projects Structure)
 
 ### Sub-projects:
-- **01_MacroAcademic_Engine:** v1.2.8 (PCTL Complete)
-- **02_Macro_Alert_System:** v4.4 (Full Edition)
-- **03_Indices_Research_Map:** v1.0 (Script B)
-- **04_YieldCurveLab:** v1.6.9 (Academic Research Mode)
-- **05_Bond_Transmission_Monitor:** v5.2 (6 Panels, MacroAcademic FULL)
+- **01_MacroAcademic_Engine:** v2.1 (Interpretation Upgrade)
+- **02_Macro_Alert_System:** v5.0.1 (Validated Regime Engine)
+- **03_Indices_Research_Map:** v2.0.1 (Clean Fixed Build)
+- **04_YieldCurveLab:** v1.8.3 (Daily Dashboard + Split Research)
+- **05_Bond_Transmission_Monitor:** v6.0.1 (Interpretation Upgrade)
 
 ---
 

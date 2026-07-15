@@ -1,11 +1,11 @@
-# Macro Alert System v4.4 - Full
+# Macro Alert System v5.0.1 - Validated Regime Engine
 
 ## 🎯 Tổng quan
 
-**Macro Alert System v4.4** là hệ thống cảnh báo vĩ mô toàn diện cho thị trường Việt Nam, kết hợp phân tích macro (lãi suất, thanh khoản, đường cong lợi suất) với nghiên cứu hành vi thị trường chứng khoán.
+**Macro Alert System v5.0.1** là hệ thống cảnh báo vĩ mô toàn diện cho thị trường Việt Nam, kết hợp phân tích macro (lãi suất, thanh khoản, đường cong lợi suất) với nghiên cứu hành vi thị trường chứng khoán.
 
-Phiên bản: **v4.4 - Full (Macro + Indices Research)**
-Platform: TradingView Pine Script v5
+Phiên bản: **v5.0.1 - Validated Regime Engine (Clean)**
+Platform: TradingView Pine Script v6
 
 ---
 
@@ -106,7 +106,7 @@ Platform: TradingView Pine Script v5
 - **Tính toán các chỉ số**: R5, R20, R60, DD20, DD60
 - **Min N để hiển thị**: Đảm bảo ý nghĩa thống kê
 
-### Academic options (v4.4)
+### Academic options (v5.0.1)
 - **Log returns**: Sử dụng log return thay vì simple return
 - **Clip returns**: Giới hạn biên độ return để giảm nhiễu
 - **Non-overlapping samples**: Mẫu không chồng lấn cho research
@@ -117,7 +117,7 @@ Platform: TradingView Pine Script v5
 
 ### Cách add vào TradingView:
 1. Mở chart VNINDEX hoặc bất kỳ chart nào
-2. Click "Indicators" → Search "Macro Alert System v4.4"
+2. Click "Indicators" → Search "Macro Alert System v5.0.1"
 3. Add indicator 4 lần (để có 4 panel)
 4. Mỗi instance chọn panel khác nhau (1, 2, 3, 4)
 
@@ -212,6 +212,7 @@ Platform: TradingView Pine Script v5
 
 ## 📝 Version History
 
+- **v5.0.1**: Validated Regime Engine (Clean) — Pine Script v6
 - **v4.4**: Full edition với academic options, robust z-score, 4 panels
 - **v4.3**: Beta version
 

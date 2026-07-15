@@ -1,14 +1,14 @@
-# MacroIndices Map v1.0 (Script B)
+# MacroIndices Map v2.0.1 (Script B)
 
 ## 🎯 Tổng quan
 
-**MacroIndices Map v1.0** (Script B) là công cụ mapping kết quả phân tích vĩ mô từ Script A (MacroAcademic Engine) sang hiệu suất của các chỉ số thị trường và ngành Việt Nam.
+**MacroIndices Map v2.0.1** (Script B) là công cụ mapping kết quả phân tích vĩ mô từ Script A (MacroAcademic Engine) sang hiệu suất của các chỉ số thị trường và ngành Việt Nam.
 
 Đây là **Script B** trong hệ thống 2 script:
 - **Script A**: MacroAcademic Engine (01_MacroAcademic_Engine) → Tạo Risk Score
 - **Script B**: MacroIndices Map → Map Risk Score → Market Performance
 
-Phiên bản: **v1.0**
+Phiên bản: **v2.0.1 (Clean Fixed Build)**
 Platform: TradingView Pine Script v5
 
 ---
@@ -211,6 +211,7 @@ Chuyển đổi Risk Score thành:
 
 ## 📝 Version History
 
+- **v2.0.1**: Clean Fixed Build
 - **v1.0**: Initial release - Script B với macro engine replication
 
 ---

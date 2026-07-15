@@ -1,6 +1,19 @@
 # Release Notes — VN Bond Transmission Monitor
 
-## 📅 Version 5.2 (Current Release)
+## 📅 Version 6.0.1 (Current Release)
+
+**Release Date:** 2025
+**Platform:** TradingView Pine Script v5
+
+### Interpretation Upgrade
+
+Bản v6.0.1 nâng cấp lớp diễn giải trên nền v5.2:
+- Cải tiến nhãn và cách đọc dashboard cho người dùng cuối
+- Tinh chỉnh interpretation logic cho 6 panel
+
+---
+
+## 📅 Version 5.2
 
 **Release Date:** January 2025
 **Platform:** TradingView Pine Script v5
@@ -314,7 +327,7 @@ Kiểm tra:
 
 - **README.md:** Hướng dẫn sử dụng chi tiết
 - **RELEASE_NOTES.md:** File này (lịch sử phiên bản)
-- **Pine Script Source:** Bond_Transmission_Monitor_v5.2.pine
+- **Pine Script Source:** Bond_Transmission_Monitor_v6.0.1.pine
 
 ---
 
@@ -349,7 +362,7 @@ Nếu bạn gặp bugs hoặc có đề xuất tính năng:
 
 ---
 
-**Current Version:** v5.2
+**Current Version:** v6.0.1
 **Last Updated:** January 2025
 **Status:** ✅ Stable & Production Ready
 
