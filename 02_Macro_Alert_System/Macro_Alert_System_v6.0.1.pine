@@ -1,0 +1,1259 @@
+//@version=6
+indicator("Macro Alert System v6.0.1 — Academic Calibration Patch",
+     shorttitle="MacroAcademic v6.0.1",
+     overlay=false,
+     max_labels_count=200,
+     max_lines_count=200,
+     max_bars_back=5000,
+     dynamic_requests=false)
+
+// =====================================================================
+// v6.0.1 ACADEMIC CALIBRATION PATCH
+// ---------------------------------------------------------------------
+// Calibration changes over v6.0.0
+// A) Evidence grades require interval exclusion plus directionally stable
+//    pre/post evidence. C+ is reserved for stable directional evidence
+//    that remains statistically inconclusive.
+// B) Structural confidence is capped when cross-layer concordance is low.
+// C) Sector labels separate confirmed, provisional, and rank-only status.
+// D) Regime and policy-space language is descriptive rather than a causal
+//    policy forecast or an unvalidated cycle-stage assertion.
+// E) Plot values are removed from the status line to suppress inactive
+//    panel placeholders while remaining visible in pane/scale/Data Window.
+// ---------------------------------------------------------------------
+// Design principles
+// 1) Separate signal level, signal strength, data quality, structural
+//    confidence, and predictive evidence. No component is called
+//    "confidence" merely because it is extreme.
+// 2) Missing-aware layer aggregation. The model never silently replaces
+//    missing macro data with a neutral regime.
+// 3) Non-overlapping forward windows for approximate independence.
+// 4) Exact horizon drawdowns: 5D uses 6 bars, 20D uses 21 bars,
+//    and 60D uses 61 bars, including entry and evaluation dates.
+// 5) Current-regime evidence is compared with all OTHER regimes, not with
+//    an unconditional mean that mechanically contains the current regime.
+// 6) Sample variance, standard error, approximate Welch statistic,
+//    confidence interval, and pre/post-2020 structural split.
+// 7) Sector rankings use reliability shrinkage plus a Bonferroni-style
+//    family-wise uncertainty guard instead of raw means alone.
+// 8) Transition probabilities use Jeffreys smoothing and correct economic
+//    direction labels: lower risk = improve; higher risk = worsen.
+// ---------------------------------------------------------------------
+// Statistical outputs are descriptive evidence, not causal estimates.
+// =====================================================================
+
+// =====================
+// 1) SINGLE USER INPUT
+// =====================
+string panel = input.string("Macro — Rates & Spreads", "Display Panel (only user input)",
+     options = [
+         "Macro — Rates & Spreads",
+         "Risk — Evidence Dashboard",
+         "Equity — Regime & Rotation"
+     ])
+
+bool show_macro = panel == "Macro — Rates & Spreads"
+bool show_risk  = panel == "Risk — Evidence Dashboard"
+bool show_eq    = panel == "Equity — Regime & Rotation"
+
+// =====================================================================
+// 2) LOCKED RESEARCH DEFAULTS
+// =====================================================================
+string TF_D = "D"
+
+int PCTL_LB       = 504
+int P_STRESS_HI   = 85
+int P_LOW_BAD     = 15
+int IMPULSE_H     = 20
+int PERSIST_H     = 5
+int MIN_COMPONENT = 4
+int MIN_LAYER     = 2
+
+bool USE_LOG_RET    = true
+bool USE_NONOVERLAP = true
+int H1 = 5
+int H2 = 20
+int H3 = 60
+
+int MIN_N_SHOW = 12
+int MIN_N_OK   = 30
+int MIN_N_RANK = 12
+float SHRINK_K = 20.0
+float Z95      = 1.96
+float Z90      = 1.645
+float Z_SECTOR = 2.61  // Bonferroni-style 90% family-wise guard for 11 sectors.
+
+// Structural robustness split: pre-2020 vs 2020 onward.
+int STRUCTURAL_SPLIT_TS = timestamp("GMT+7", 2020, 1, 1, 0, 0)
+
+// Data-error guard only. It rejects impossible/corrupted index observations;
+// it is not intended as economic winsorization.
+float MAX_ABS_LOG_RETURN = 2.0
+
+// =====================================================================
+// 3) HELPERS — STATES, MISSING-AWARE AGGREGATION, STATISTICS
+// =====================================================================
+f_bucket_from_risk(float riskPct) =>
+    int b = na
+    if not na(riskPct)
+        b := riskPct < 20 ? 0 :
+             riskPct < 40 ? 1 :
+             riskPct < 60 ? 2 :
+             riskPct < 80 ? 3 : 4
+    b
+
+f_bucket_label(int b) =>
+    b == 0 ? "B0 BENIGN" :
+     b == 1 ? "B1 LOW" :
+     b == 2 ? "B2 MID" :
+     b == 3 ? "B3 HIGH" :
+     b == 4 ? "B4 EXTREME" : "NA"
+
+f_percentile(float src, int length, int p) =>
+    ta.percentile_linear_interpolation(src, length, float(p))
+
+f_clamp100(float x) =>
+    math.max(0.0, math.min(100.0, x))
+
+f_wavg2(float a, float wa, float b, float wb) =>
+    float s = 0.0
+    float w = 0.0
+    if not na(a)
+        s += a * wa
+        w += wa
+    if not na(b)
+        s += b * wb
+        w += wb
+    w > 0 ? s / w : na
+
+f_wavg3(float a, float wa, float b, float wb, float c, float wc) =>
+    float s = 0.0
+    float w = 0.0
+    if not na(a)
+        s += a * wa
+        w += wa
+    if not na(b)
+        s += b * wb
+        w += wb
+    if not na(c)
+        s += c * wc
+        w += wc
+    w > 0 ? s / w : na
+
+f_count3(float a, float b, float c) =>
+    float n = 0.0
+    n += not na(a) ? 1.0 : 0.0
+    n += not na(b) ? 1.0 : 0.0
+    n += not na(c) ? 1.0 : 0.0
+    n
+
+f_count6(float a, float b, float c, float d, float e, float f) =>
+    float n = 0.0
+    n += not na(a) ? 1.0 : 0.0
+    n += not na(b) ? 1.0 : 0.0
+    n += not na(c) ? 1.0 : 0.0
+    n += not na(d) ? 1.0 : 0.0
+    n += not na(e) ? 1.0 : 0.0
+    n += not na(f) ? 1.0 : 0.0
+    n
+
+f_last_completed(float srcCur, float srcPrev) =>
+    timeframe.isintraday ? srcPrev : (barstate.isconfirmed ? srcCur : srcPrev)
+
+f_return(float currentValue, float entryValue) =>
+    float out = na
+    if not na(currentValue) and not na(entryValue) and currentValue > 0 and entryValue > 0
+        float raw = USE_LOG_RET ? math.log(currentValue / entryValue) : (currentValue / entryValue - 1.0)
+        out := math.abs(raw) <= MAX_ABS_LOG_RETURN ? raw : na
+    out
+
+f_mean(float sum, float n) =>
+    n > 0 ? sum / n : na
+
+// Unbiased sample variance.
+f_sample_var(float sum, float sumsq, float n) =>
+    float v = na
+    if n > 1
+        v := (sumsq - sum * sum / n) / (n - 1.0)
+        v := math.max(v, 0.0)
+    v
+
+f_sample_std(float sum, float sumsq, float n) =>
+    float v = f_sample_var(sum, sumsq, n)
+    not na(v) ? math.sqrt(v) : na
+
+f_se(float sum, float sumsq, float n) =>
+    float sd = f_sample_std(sum, sumsq, n)
+    not na(sd) and n > 0 ? sd / math.sqrt(n) : na
+
+f_winrate(float wins, float n) =>
+    n > 0 ? wins / n * 100.0 : na
+
+f_update_stats(float[] sumArr, float[] sumSqArr, float[] cntArr, float[] winArr, int idx, float ret) =>
+    if not na(ret)
+        array.set(sumArr,   idx, array.get(sumArr, idx)   + ret)
+        array.set(sumSqArr, idx, array.get(sumSqArr, idx) + ret * ret)
+        array.set(cntArr,   idx, array.get(cntArr, idx)   + 1.0)
+        if ret > 0
+            array.set(winArr, idx, array.get(winArr, idx) + 1.0)
+
+f_update_sum_sq_n(float[] sumArr, float[] sumSqArr, float[] cntArr, int idx, float x) =>
+    if not na(x)
+        array.set(sumArr,   idx, array.get(sumArr, idx)   + x)
+        array.set(sumSqArr, idx, array.get(sumSqArr, idx) + x * x)
+        array.set(cntArr,   idx, array.get(cntArr, idx)   + 1.0)
+
+f_update_dd(float[] sumArr, float[] cntArr, int idx, float dd) =>
+    if not na(dd)
+        array.set(sumArr, idx, array.get(sumArr, idx) + dd)
+        array.set(cntArr, idx, array.get(cntArr, idx) + 1.0)
+
+// Current regime vs all other regimes. The groups are disjoint.
+f_effect_stats(float cSum, float cSq, float cN, float totalSum, float totalSq, float totalN) =>
+    float oSum = totalSum - cSum
+    float oSq  = totalSq  - cSq
+    float oN   = totalN   - cN
+    float cMean = f_mean(cSum, cN)
+    float oMean = f_mean(oSum, oN)
+    float cVar  = f_sample_var(cSum, cSq, cN)
+    float oVar  = f_sample_var(oSum, oSq, oN)
+    float diff  = not na(cMean) and not na(oMean) ? cMean - oMean : na
+    float se    = not na(cVar) and not na(oVar) and cN > 0 and oN > 0 ? math.sqrt(cVar / cN + oVar / oN) : na
+    float t     = not na(diff) and not na(se) and se > 0 ? diff / se : na
+    float lcb   = not na(diff) and not na(se) ? diff - Z95 * se : na
+    float ucb   = not na(diff) and not na(se) ? diff + Z95 * se : na
+    [cMean, oMean, diff, se, t, lcb, ucb, oN]
+
+f_split_label(float preEffect, float postEffect, float preN, float postN) =>
+    string out = "NA"
+    bool enough = not na(preEffect) and not na(postEffect) and preN >= MIN_N_SHOW and postN >= MIN_N_SHOW
+    if enough
+        out := preEffect > 0 and postEffect > 0 ? "STABLE+" :
+               preEffect < 0 and postEffect < 0 ? "STABLE-" : "MIXED"
+    out
+
+f_evidence_grade(float nC, float nO, float effect, float effectSE, string splitLabel, float dataQ) =>
+    string g = "D"
+    bool valid = not na(nC) and not na(nO) and not na(effect) and not na(effectSE) and effectSE > 0
+    if valid and nC >= MIN_N_SHOW and nO >= MIN_N_SHOW
+        float tStat = effect / effectSE
+        float lcb95 = effect - Z95 * effectSE
+        float ucb95 = effect + Z95 * effectSE
+        float lcb90 = effect - Z90 * effectSE
+        float ucb90 = effect + Z90 * effectSE
+        bool ci95ExcludesZero = lcb95 > 0 or ucb95 < 0
+        bool ci90ExcludesZero = lcb90 > 0 or ucb90 < 0
+        bool stableDirection = (effect > 0 and splitLabel == "STABLE+") or (effect < 0 and splitLabel == "STABLE-")
+        if nC >= 30 and nO >= 30 and dataQ >= 85 and stableDirection and ci95ExcludesZero
+            g := "A"
+        else if nC >= 20 and nO >= 20 and dataQ >= 70 and stableDirection and ci90ExcludesZero
+            g := "B"
+        else if dataQ >= 70 and stableDirection and math.abs(tStat) >= 0.75
+            g := "C+"
+        else
+            g := "C"
+    g
+
+f_grade_color(string grade) =>
+    grade == "A" ? color.green :
+     grade == "B" ? color.teal :
+     grade == "C+" ? color.yellow :
+     grade == "C" ? color.orange : color.red
+
+f_sector_top_label(float shrRR, float familyLowerBound) =>
+    na(shrRR) or na(familyLowerBound) ? "NA" :
+     familyLowerBound > 0 ? "CONFIRMED LEADER" :
+     shrRR > 0 ? "PROVISIONAL LEADER" : "TOP RANK ONLY"
+
+f_sector_bottom_label(float shrRR, float familyUpperBound) =>
+    na(shrRR) or na(familyUpperBound) ? "NA" :
+     familyUpperBound < 0 ? "CONFIRMED LAGGARD" :
+     shrRR < 0 ? "PROVISIONAL LAGGARD" : "BOTTOM RANK ONLY"
+
+f_sector_label_color(string label) =>
+    str.contains(label, "CONFIRMED LEADER") ? color.green :
+     str.contains(label, "PROVISIONAL LEADER") ? color.teal :
+     str.contains(label, "CONFIRMED LAGGARD") ? color.red :
+     str.contains(label, "PROVISIONAL LAGGARD") ? color.orange : color.gray
+
+f_quality_label(float q) =>
+    na(q) ? "NA" : q >= 85 ? "HIGHQ" : q >= 70 ? "MEDQ" : "LOWQ"
+
+f_conf_label(float c) =>
+    na(c) ? "NA" : c >= 75 ? "HIGH" : c >= 55 ? "MED" : "LOW"
+
+f_n_label(float n) =>
+    na(n) ? "NA" : n >= MIN_N_OK ? "OK" : n >= MIN_N_SHOW ? "LOW-N" : "INSUF"
+
+f_impulse_label(float d) =>
+    na(d) ? "NA" : d >= 10 ? "RISING FAST" : d >= 4 ? "RISING" : d <= -10 ? "FALLING FAST" : d <= -4 ? "FALLING" : "STABLE"
+
+f_regime_label(float risk, float impulse) =>
+    string out = "DATA INSUFFICIENT"
+    if not na(risk)
+        bool rise = not na(impulse) and impulse >= 4
+        bool fall = not na(impulse) and impulse <= -4
+        out := risk >= 80 ? (rise ? "EXTREME PRESSURE / ACCELERATING" : fall ? "EXTREME PRESSURE / RELIEF" : "EXTREME PRESSURE / PERSISTENT") :
+               risk >= 60 ? (rise ? "HIGH PRESSURE / RISING" : fall ? "HIGH PRESSURE / RELIEF" : "HIGH PRESSURE / STABLE") :
+               risk >= 40 ? (rise ? "TIGHTENING PRESSURE RISING" : fall ? "PRESSURE NORMALIZING" : "MID-RISK / STABLE") :
+               rise ? "LOW RISK / RISING" : fall ? "EASING PRESSURE" : "LOW RISK / STABLE"
+    out
+
+f_fmt_raw(float x) =>
+    na(x) ? "--" : str.tostring(x, "#.##")
+
+f_fmt_score(float x) =>
+    na(x) ? "--" : str.tostring(x, "#.#")
+
+f_fmt_pct_simple(float logValue, float n) =>
+    string out = "--"
+    if not na(logValue) and not na(n) and n >= MIN_N_SHOW
+        float simple = USE_LOG_RET ? math.exp(logValue) - 1.0 : logValue
+        out := str.tostring(simple * 100.0, "#.##") + "%"
+    out
+
+f_fmt_pct_raw(float value, float n) =>
+    not na(value) and not na(n) and n >= MIN_N_SHOW ? str.tostring(value * 100.0, "#.##") + "%" : "--"
+
+f_fmt_win(float value, float n) =>
+    not na(value) and not na(n) and n >= MIN_N_SHOW ? str.tostring(value, "#.#") + "%" : "--"
+
+f_fmt_n(float n) =>
+    na(n) ? "--" : str.tostring(math.round(n))
+
+f_fmt_t(float t, float nC, float nO) =>
+    not na(t) and nC >= MIN_N_SHOW and nO >= MIN_N_SHOW ? str.tostring(t, "#.##") : "--"
+
+f_kill_table(table t) =>
+    if not na(t)
+        table.delete(t)
+
+f_update_market(float[] sumArr, float[] sqArr, float[] cntArr, float[] winArr,
+                float[] ddSumArr, float[] ddCntArr,
+                int marketId, int bucketId, float nowValue, float entryValue, float horizonLow) =>
+    int idx = marketId * 5 + bucketId
+    float r = f_return(nowValue, entryValue)
+    float d = not na(horizonLow) and not na(entryValue) and entryValue > 0 ? horizonLow / entryValue - 1.0 : na
+    f_update_stats(sumArr, sqArr, cntArr, winArr, idx, r)
+    f_update_dd(ddSumArr, ddCntArr, idx, d)
+
+f_update_sector(float[] sumArr, float[] sqArr, float[] cntArr, float[] winArr,
+                int sectorId, int bucketId, float nowValue, float entryValue, float benchmarkRet) =>
+    int idx = sectorId * 5 + bucketId
+    float rr = not na(benchmarkRet) ? f_return(nowValue, entryValue) - benchmarkRet : na
+    f_update_stats(sumArr, sqArr, cntArr, winArr, idx, rr)
+
+// =====================================================================
+// 4) DAILY MACRO DATA — INVALID SYMBOLS RETURN NA, NOT RUNTIME ERRORS
+// =====================================================================
+[policy_raw, policy_prev] = request.security("VNINTR", TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[b2_raw,     b2_prev]     = request.security("VN02Y",  TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[b10_raw,    b10_prev]    = request.security("VN10Y",  TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[us10_raw,   us10_prev]   = request.security("US10Y",  TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[ib_raw,     ib_prev]     = request.security("VNINBR", TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[fx_raw,     fx_prev]     = request.security("USDVND", TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[fed_raw,    fed_prev]    = request.security("USINTR", TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+
+float policy_rate    = f_last_completed(policy_raw, policy_prev)
+float bond_2y        = f_last_completed(b2_raw, b2_prev)
+float bond_10y       = f_last_completed(b10_raw, b10_prev)
+float us_10y         = f_last_completed(us10_raw, us10_prev)
+float interbank_rate = f_last_completed(ib_raw, ib_prev)
+float fx_rate        = f_last_completed(fx_raw, fx_prev)
+float fed_policy     = f_last_completed(fed_raw, fed_prev)
+
+// =====================================================================
+// 5) OBSERVATION CLOCK
+// =====================================================================
+bool tf_ok   = timeframe.isintraday or timeframe.isdaily
+bool obs_new = tf_ok ? (timeframe.isintraday ? ta.change(time(TF_D)) != 0 : barstate.isconfirmed) : false
+
+var int obs_count = 0
+if obs_new
+    obs_count += 1
+
+bool upd5  = USE_NONOVERLAP ? (obs_new and obs_count % H1 == 0) : obs_new
+bool upd20 = USE_NONOVERLAP ? (obs_new and obs_count % H2 == 0) : obs_new
+bool upd60 = USE_NONOVERLAP ? (obs_new and obs_count % H3 == 0) : obs_new
+
+// =====================================================================
+// 6) MACRO FEATURES AND THEORY-INFORMED LAYERS
+// =====================================================================
+float liquidity_stress = interbank_rate - policy_rate
+float curve_10y_2y     = bond_10y - bond_2y
+float vn_us_10y_gap    = bond_10y - us_10y
+float long_policy_gap  = bond_10y - policy_rate
+
+float stress_threshold = f_percentile(liquidity_stress, PCTL_LB, P_STRESS_HI)
+float curve_threshold  = f_percentile(curve_10y_2y,     PCTL_LB, P_LOW_BAD)
+float intl_threshold   = f_percentile(vn_us_10y_gap,    PCTL_LB, P_LOW_BAD)
+float spread_threshold = f_percentile(long_policy_gap,  PCTL_LB, P_LOW_BAD)
+
+bool stress_high      = not na(liquidity_stress) and not na(stress_threshold) and liquidity_stress >= stress_threshold
+bool curve_low        = not na(curve_10y_2y) and not na(curve_threshold) and curve_10y_2y <= curve_threshold
+bool intl_low         = not na(vn_us_10y_gap) and not na(intl_threshold) and vn_us_10y_gap <= intl_threshold
+bool long_policy_low  = not na(long_policy_gap) and not na(spread_threshold) and long_policy_gap <= spread_threshold
+
+float stress_risk = ta.percentrank(liquidity_stress, PCTL_LB)
+float curve_risk  = 100.0 - ta.percentrank(curve_10y_2y, PCTL_LB)
+float intl_risk   = 100.0 - ta.percentrank(vn_us_10y_gap, PCTL_LB)
+float spread_risk = 100.0 - ta.percentrank(long_policy_gap, PCTL_LB)
+
+// FX pressure is economically one-sided for the level component:
+// USDVND appreciation (VND depreciation) adds pressure; VND appreciation does not.
+float fx_yoy          = ta.roc(fx_rate, 252)
+float fx_dep_yoy      = na(fx_yoy) ? na : math.max(fx_yoy, 0.0)
+float fx_ret_21       = ta.roc(fx_rate, 21)
+float fx_vol_3m       = ta.stdev(fx_ret_21, 63)
+float fx_dep_risk     = ta.percentrank(fx_dep_yoy, PCTL_LB)
+float fx_vol_risk     = ta.percentrank(fx_vol_3m, PCTL_LB)
+float fx_pressure     = f_wavg2(fx_dep_risk, 0.65, fx_vol_risk, 0.35)
+
+float fed_gap         = fed_policy - policy_rate
+float fed_gap_risk    = ta.percentrank(fed_gap, PCTL_LB)
+
+// Layer aggregation reduces double counting among highly related spreads.
+float layer_funding   = stress_risk
+float layer_domestic  = f_wavg2(curve_risk, 0.60, spread_risk, 0.40)
+float layer_external  = f_wavg3(intl_risk, 0.35, fed_gap_risk, 0.25, fx_pressure, 0.40)
+
+float component_count = f_count6(stress_risk, curve_risk, spread_risk, intl_risk, fed_gap_risk, fx_pressure)
+float layer_count     = f_count3(layer_funding, layer_domestic, layer_external)
+
+float source_count = 0.0
+source_count += not na(policy_rate)    ? 1.0 : 0.0
+source_count += not na(bond_2y)        ? 1.0 : 0.0
+source_count += not na(bond_10y)       ? 1.0 : 0.0
+source_count += not na(us_10y)         ? 1.0 : 0.0
+source_count += not na(interbank_rate) ? 1.0 : 0.0
+source_count += not na(fx_rate)        ? 1.0 : 0.0
+source_count += not na(fed_policy)     ? 1.0 : 0.0
+
+float component_coverage = component_count / 6.0 * 100.0
+float source_coverage    = source_count / 7.0 * 100.0
+float data_quality_score = f_wavg2(component_coverage, 0.75, source_coverage, 0.25)
+string data_quality_txt  = f_quality_label(data_quality_score)
+
+bool risk_valid = component_count >= MIN_COMPONENT and layer_count >= MIN_LAYER
+float risk_pct = risk_valid ? f_wavg3(layer_funding, 0.40, layer_domestic, 0.35, layer_external, 0.25) : na
+int bucket_now = f_bucket_from_risk(risk_pct)
+
+// Policy-space constraint index. This is not a forecast of an SBV move.
+float constraint_index = risk_valid ? f_wavg3(layer_funding, 0.40, layer_domestic, 0.25, layer_external, 0.35) : na
+string constraint_zone = na(constraint_index) ? "NA" : constraint_index >= 70 ? "HIGH CONSTRAINTS" : constraint_index <= 30 ? "EASING SPACE" : "MODERATE CONSTRAINTS"
+
+// =====================================================================
+// 7) SIGNAL IMPULSE, PERSISTENCE, AND STRUCTURAL CONFIDENCE
+// =====================================================================
+float risk_5ago  = ta.valuewhen(obs_new, risk_pct, 5)
+float risk_20ago = ta.valuewhen(obs_new, risk_pct, IMPULSE_H)
+float risk_impulse = not na(risk_pct) and not na(risk_20ago) ? risk_pct - risk_20ago : na
+
+int bucket_1ago = ta.valuewhen(obs_new, bucket_now, 1)
+int bucket_2ago = ta.valuewhen(obs_new, bucket_now, 2)
+int bucket_3ago = ta.valuewhen(obs_new, bucket_now, 3)
+int bucket_4ago = ta.valuewhen(obs_new, bucket_now, 4)
+int bucket_5ago = ta.valuewhen(obs_new, bucket_now, 5)
+
+float persistence_n = 0.0
+float persistence_same = 0.0
+if not na(bucket_now)
+    if not na(bucket_1ago)
+        persistence_n += 1.0
+        persistence_same += bucket_1ago == bucket_now ? 1.0 : 0.0
+    if not na(bucket_2ago)
+        persistence_n += 1.0
+        persistence_same += bucket_2ago == bucket_now ? 1.0 : 0.0
+    if not na(bucket_3ago)
+        persistence_n += 1.0
+        persistence_same += bucket_3ago == bucket_now ? 1.0 : 0.0
+    if not na(bucket_4ago)
+        persistence_n += 1.0
+        persistence_same += bucket_4ago == bucket_now ? 1.0 : 0.0
+    if not na(bucket_5ago)
+        persistence_n += 1.0
+        persistence_same += bucket_5ago == bucket_now ? 1.0 : 0.0
+
+float persistence_score = persistence_n > 0 ? persistence_same / persistence_n * 100.0 : na
+
+float layer_mean = f_wavg3(layer_funding, 1.0, layer_domestic, 1.0, layer_external, 1.0)
+float layer_ss = 0.0
+float layer_n  = 0.0
+if not na(layer_funding)
+    layer_ss += math.pow(layer_funding - layer_mean, 2)
+    layer_n += 1.0
+if not na(layer_domestic)
+    layer_ss += math.pow(layer_domestic - layer_mean, 2)
+    layer_n += 1.0
+if not na(layer_external)
+    layer_ss += math.pow(layer_external - layer_mean, 2)
+    layer_n += 1.0
+float layer_dispersion = layer_n > 0 ? math.sqrt(layer_ss / layer_n) : na
+float concordance_score = not na(layer_dispersion) ? f_clamp100(100.0 - 2.0 * layer_dispersion) : na
+
+// Structural confidence deliberately excludes signal extremity.
+// Low concordance imposes a ceiling: complete and persistent data cannot
+// compensate for strong disagreement across the economic layers.
+float structural_confidence_raw = risk_valid ? f_wavg3(concordance_score, 0.45, persistence_score, 0.35, data_quality_score, 0.20) : na
+float structural_confidence = na(structural_confidence_raw) ? na :
+     concordance_score < 25 ? math.min(structural_confidence_raw, 44.0) :
+     concordance_score < 40 ? math.min(structural_confidence_raw, 59.0) : structural_confidence_raw
+bool confidence_capped      = not na(structural_confidence_raw) and not na(structural_confidence) and structural_confidence < structural_confidence_raw
+string confidence_cap_txt   = confidence_capped ? " CAP" : ""
+float signal_strength       = not na(risk_pct) ? math.abs(risk_pct - 50.0) * 2.0 : na
+string structural_conf_txt  = f_conf_label(structural_confidence)
+string impulse_txt          = f_impulse_label(risk_impulse)
+string macro_regime         = f_regime_label(risk_pct, risk_impulse)
+
+// =====================================================================
+// 8) PLOTS
+// =====================================================================
+plot(show_macro ? bond_10y       : na, title="VN10Y",        color=color.new(color.orange, 0), linewidth=2, display=display.all - display.status_line)
+plot(show_macro ? bond_2y        : na, title="VN02Y",        color=color.new(color.purple, 0), linewidth=2, display=display.all - display.status_line)
+plot(show_macro ? interbank_rate : na, title="VN Interbank", color=color.new(color.teal, 0), linewidth=2, display=display.all - display.status_line)
+plot(show_macro ? policy_rate    : na, title="SBV Policy",   color=color.new(color.red, 0), linewidth=2, display=display.all - display.status_line)
+plot(show_macro ? us_10y         : na, title="US10Y",        color=color.new(color.blue, 40), linewidth=1, display=display.all - display.status_line)
+
+plot(show_risk ? risk_pct              : na, title="Composite Risk",       color=color.new(color.white, 0), linewidth=3, style=plot.style_stepline, display=display.all - display.status_line)
+plot(show_risk ? layer_funding         : na, title="Funding Layer",        color=color.new(#FF6B6B, 0), linewidth=2, display=display.all - display.status_line)
+plot(show_risk ? layer_domestic        : na, title="Domestic Curve Layer", color=color.new(#FFA726, 0), linewidth=2, display=display.all - display.status_line)
+plot(show_risk ? layer_external        : na, title="External Layer",       color=color.new(#42A5F5, 0), linewidth=2, display=display.all - display.status_line)
+plot(show_risk ? constraint_index      : na, title="Constraint Index",     color=color.new(color.silver, 0), linewidth=2, display=display.all - display.status_line)
+plot(show_risk ? structural_confidence : na, title="Structural Confidence", color=color.new(color.lime, 0), linewidth=2, display=display.all - display.status_line)
+plot(show_risk ? 80 : na, title="80", color=color.new(color.red, 75), display=display.all - display.status_line)
+plot(show_risk ? 60 : na, title="60", color=color.new(color.orange, 75), display=display.all - display.status_line)
+plot(show_risk ? 40 : na, title="40", color=color.new(color.yellow, 75), display=display.all - display.status_line)
+plot(show_risk ? 20 : na, title="20", color=color.new(color.green, 75), display=display.all - display.status_line)
+plot(show_eq ? 0 : na, title="Equity axis anchor", color=color.new(color.gray, 100), display=display.none)
+
+// =====================================================================
+// 9) EQUITY DATA — EXACT HORIZON LOWS
+// =====================================================================
+[vni_c0, vni_c1, vni_l6_0, vni_l6_1, vni_l21_0, vni_l21_1, vni_l61_0, vni_l61_1] = request.security(
+    "HOSE:VNINDEX", TF_D,
+    [close, close[1], ta.lowest(low, 6), ta.lowest(low, 6)[1], ta.lowest(low, 21), ta.lowest(low, 21)[1], ta.lowest(low, 61), ta.lowest(low, 61)[1]],
+    barmerge.gaps_off, barmerge.lookahead_off, true)
+
+[vn30_c0, vn30_c1, vn30_l21_0, vn30_l21_1] = request.security("HOSE:VN30", TF_D, [close, close[1], ta.lowest(low, 21), ta.lowest(low, 21)[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[vn100_c0, vn100_c1, vn100_l21_0, vn100_l21_1] = request.security("HOSE:VN100", TF_D, [close, close[1], ta.lowest(low, 21), ta.lowest(low, 21)[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[vnall_c0, vnall_c1, vnall_l21_0, vnall_l21_1] = request.security("HOSE:VNALLSHARE", TF_D, [close, close[1], ta.lowest(low, 21), ta.lowest(low, 21)[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[vnmid_c0, vnmid_c1, vnmid_l21_0, vnmid_l21_1] = request.security("HOSE:VNMIDCAP", TF_D, [close, close[1], ta.lowest(low, 21), ta.lowest(low, 21)[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[vnsmall_c0, vnsmall_c1, vnsmall_l21_0, vnsmall_l21_1] = request.security("HOSE:VNSMALLCAP", TF_D, [close, close[1], ta.lowest(low, 21), ta.lowest(low, 21)[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+
+float mkt_vni     = f_last_completed(vni_c0, vni_c1)
+float mkt_vn30    = f_last_completed(vn30_c0, vn30_c1)
+float mkt_vn100   = f_last_completed(vn100_c0, vn100_c1)
+float mkt_vnall   = f_last_completed(vnall_c0, vnall_c1)
+float mkt_vnmid   = f_last_completed(vnmid_c0, vnmid_c1)
+float mkt_vnsmall = f_last_completed(vnsmall_c0, vnsmall_c1)
+
+float vni_low6     = f_last_completed(vni_l6_0, vni_l6_1)
+float vni_low21    = f_last_completed(vni_l21_0, vni_l21_1)
+float vni_low61    = f_last_completed(vni_l61_0, vni_l61_1)
+float vn30_low21   = f_last_completed(vn30_l21_0, vn30_l21_1)
+float vn100_low21  = f_last_completed(vn100_l21_0, vn100_l21_1)
+float vnall_low21  = f_last_completed(vnall_l21_0, vnall_l21_1)
+float vnmid_low21  = f_last_completed(vnmid_l21_0, vnmid_l21_1)
+float vnsmall_low21= f_last_completed(vnsmall_l21_0, vnsmall_l21_1)
+
+[sec_fin0, sec_fin1]       = request.security("HOSE:VNFIN",       TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[sec_fins0, sec_fins1]     = request.security("HOSE:VNFINSELECT", TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[sec_ind0, sec_ind1]       = request.security("HOSE:VNIND",       TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[sec_it0, sec_it1]         = request.security("HOSE:VNIT",        TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[sec_real0, sec_real1]     = request.security("HOSE:VNREAL",      TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[sec_cons0, sec_cons1]     = request.security("HOSE:VNCONS",      TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[sec_cond0, sec_cond1]     = request.security("HOSE:VNCOND",      TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[sec_ene0, sec_ene1]       = request.security("HOSE:VNENE",       TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[sec_mat0, sec_mat1]       = request.security("HOSE:VNMAT",       TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[sec_heal0, sec_heal1]     = request.security("HOSE:VNHEAL",      TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[sec_uti0, sec_uti1]       = request.security("HOSE:VNUTI",       TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+
+float sec_fin  = f_last_completed(sec_fin0, sec_fin1)
+float sec_fins = f_last_completed(sec_fins0, sec_fins1)
+float sec_ind  = f_last_completed(sec_ind0, sec_ind1)
+float sec_it   = f_last_completed(sec_it0, sec_it1)
+float sec_real = f_last_completed(sec_real0, sec_real1)
+float sec_cons = f_last_completed(sec_cons0, sec_cons1)
+float sec_cond = f_last_completed(sec_cond0, sec_cond1)
+float sec_ene  = f_last_completed(sec_ene0, sec_ene1)
+float sec_mat  = f_last_completed(sec_mat0, sec_mat1)
+float sec_heal = f_last_completed(sec_heal0, sec_heal1)
+float sec_uti  = f_last_completed(sec_uti0, sec_uti1)
+
+// =====================================================================
+// 10) PRECOMPUTED VALUEWHEN SERIES — ALL CALLS OUTSIDE CONDITIONALS
+// =====================================================================
+float risk_entry_5  = ta.valuewhen(obs_new, risk_pct, H1)
+float risk_entry_20 = ta.valuewhen(obs_new, risk_pct, H2)
+float risk_entry_60 = ta.valuewhen(obs_new, risk_pct, H3)
+int bucket_entry_5  = f_bucket_from_risk(risk_entry_5)
+int bucket_entry_20 = f_bucket_from_risk(risk_entry_20)
+int bucket_entry_60 = f_bucket_from_risk(risk_entry_60)
+
+int time_entry_5  = ta.valuewhen(obs_new, time, H1)
+int time_entry_20 = ta.valuewhen(obs_new, time, H2)
+int time_entry_60 = ta.valuewhen(obs_new, time, H3)
+
+float vni_now_vw  = ta.valuewhen(obs_new, mkt_vni, 0)
+float vni_5_vw    = ta.valuewhen(obs_new, mkt_vni, H1)
+float vni_20_vw   = ta.valuewhen(obs_new, mkt_vni, H2)
+float vni_60_vw   = ta.valuewhen(obs_new, mkt_vni, H3)
+float vni_l6_vw   = ta.valuewhen(obs_new, vni_low6, 0)
+float vni_l21_vw  = ta.valuewhen(obs_new, vni_low21, 0)
+float vni_l61_vw  = ta.valuewhen(obs_new, vni_low61, 0)
+
+float vn30_now_vw    = ta.valuewhen(obs_new, mkt_vn30, 0)
+float vn30_20_vw     = ta.valuewhen(obs_new, mkt_vn30, H2)
+float vn30_l21_vw    = ta.valuewhen(obs_new, vn30_low21, 0)
+float vn100_now_vw   = ta.valuewhen(obs_new, mkt_vn100, 0)
+float vn100_20_vw    = ta.valuewhen(obs_new, mkt_vn100, H2)
+float vn100_l21_vw   = ta.valuewhen(obs_new, vn100_low21, 0)
+float vnall_now_vw   = ta.valuewhen(obs_new, mkt_vnall, 0)
+float vnall_20_vw    = ta.valuewhen(obs_new, mkt_vnall, H2)
+float vnall_l21_vw   = ta.valuewhen(obs_new, vnall_low21, 0)
+float vnmid_now_vw   = ta.valuewhen(obs_new, mkt_vnmid, 0)
+float vnmid_20_vw    = ta.valuewhen(obs_new, mkt_vnmid, H2)
+float vnmid_l21_vw   = ta.valuewhen(obs_new, vnmid_low21, 0)
+float vnsmall_now_vw = ta.valuewhen(obs_new, mkt_vnsmall, 0)
+float vnsmall_20_vw  = ta.valuewhen(obs_new, mkt_vnsmall, H2)
+float vnsmall_l21_vw = ta.valuewhen(obs_new, vnsmall_low21, 0)
+
+float fin_now_vw  = ta.valuewhen(obs_new, sec_fin, 0)
+float fin_20_vw   = ta.valuewhen(obs_new, sec_fin, H2)
+float fins_now_vw = ta.valuewhen(obs_new, sec_fins, 0)
+float fins_20_vw  = ta.valuewhen(obs_new, sec_fins, H2)
+float ind_now_vw  = ta.valuewhen(obs_new, sec_ind, 0)
+float ind_20_vw   = ta.valuewhen(obs_new, sec_ind, H2)
+float it_now_vw   = ta.valuewhen(obs_new, sec_it, 0)
+float it_20_vw    = ta.valuewhen(obs_new, sec_it, H2)
+float real_now_vw = ta.valuewhen(obs_new, sec_real, 0)
+float real_20_vw  = ta.valuewhen(obs_new, sec_real, H2)
+float cons_now_vw = ta.valuewhen(obs_new, sec_cons, 0)
+float cons_20_vw  = ta.valuewhen(obs_new, sec_cons, H2)
+float cond_now_vw = ta.valuewhen(obs_new, sec_cond, 0)
+float cond_20_vw  = ta.valuewhen(obs_new, sec_cond, H2)
+float ene_now_vw  = ta.valuewhen(obs_new, sec_ene, 0)
+float ene_20_vw   = ta.valuewhen(obs_new, sec_ene, H2)
+float mat_now_vw  = ta.valuewhen(obs_new, sec_mat, 0)
+float mat_20_vw   = ta.valuewhen(obs_new, sec_mat, H2)
+float heal_now_vw = ta.valuewhen(obs_new, sec_heal, 0)
+float heal_20_vw  = ta.valuewhen(obs_new, sec_heal, H2)
+float uti_now_vw  = ta.valuewhen(obs_new, sec_uti, 0)
+float uti_20_vw   = ta.valuewhen(obs_new, sec_uti, H2)
+
+// =====================================================================
+// 11) RESEARCH ARRAYS
+// =====================================================================
+// Markets: 6 markets x 5 regimes.
+var float[] mSum   = array.new_float(30, 0.0)
+var float[] mSq    = array.new_float(30, 0.0)
+var float[] mCnt   = array.new_float(30, 0.0)
+var float[] mWin   = array.new_float(30, 0.0)
+var float[] mDDSum = array.new_float(30, 0.0)
+var float[] mDDCnt = array.new_float(30, 0.0)
+
+// Sectors: 11 sectors x 5 regimes.
+var float[] sSum = array.new_float(55, 0.0)
+var float[] sSq  = array.new_float(55, 0.0)
+var float[] sCnt = array.new_float(55, 0.0)
+var float[] sWin = array.new_float(55, 0.0)
+
+// Transition: 5 x 5.
+var float[] trCnt = array.new_float(25, 0.0)
+var float[] trRet = array.new_float(25, 0.0)
+var float[] trWin = array.new_float(25, 0.0)
+
+// Validation: 3 horizons x 5 regimes.
+var float[] cSum   = array.new_float(15, 0.0)
+var float[] cSq    = array.new_float(15, 0.0)
+var float[] cCnt   = array.new_float(15, 0.0)
+var float[] cWin   = array.new_float(15, 0.0)
+var float[] cDDSum = array.new_float(15, 0.0)
+var float[] cDDCnt = array.new_float(15, 0.0)
+
+// Total sample by horizon.
+var float[] uSum = array.new_float(3, 0.0)
+var float[] uSq  = array.new_float(3, 0.0)
+var float[] uCnt = array.new_float(3, 0.0)
+var float[] uWin = array.new_float(3, 0.0)
+
+// Structural split: 2 periods x 3 horizons x 5 regimes.
+var float[] splitCSum = array.new_float(30, 0.0)
+var float[] splitCSq  = array.new_float(30, 0.0)
+var float[] splitCCnt = array.new_float(30, 0.0)
+// Structural total: 2 periods x 3 horizons.
+var float[] splitUSum = array.new_float(6, 0.0)
+var float[] splitUSq  = array.new_float(6, 0.0)
+var float[] splitUCnt = array.new_float(6, 0.0)
+
+var string[] market_name = array.from("VNINDEX", "VN30", "VN100", "VNALLSHARE", "VNMIDCAP", "VNSMALLCAP")
+var string[] sector_name = array.from("VNFIN", "VNFINSELECT", "VNIND", "VNIT", "VNREAL", "VNCONS", "VNCOND", "VNENE", "VNMAT", "VNHEAL", "VNUTI")
+
+// =====================================================================
+// 12) UPDATE RULES — NON-OVERLAPPING FORWARD EVIDENCE
+// =====================================================================
+if upd20 and not na(bucket_entry_20) and not na(bucket_now)
+    float benchmark20 = f_return(vni_now_vw, vni_20_vw)
+
+    // Transition from the regime observed at entry to the regime after 20D.
+    if not na(benchmark20)
+        int trIdx = bucket_entry_20 * 5 + bucket_now
+        array.set(trCnt, trIdx, array.get(trCnt, trIdx) + 1.0)
+        array.set(trRet, trIdx, array.get(trRet, trIdx) + benchmark20)
+        if benchmark20 > 0
+            array.set(trWin, trIdx, array.get(trWin, trIdx) + 1.0)
+
+    f_update_market(mSum, mSq, mCnt, mWin, mDDSum, mDDCnt, 0, bucket_entry_20, vni_now_vw, vni_20_vw, vni_l21_vw)
+    f_update_market(mSum, mSq, mCnt, mWin, mDDSum, mDDCnt, 1, bucket_entry_20, vn30_now_vw, vn30_20_vw, vn30_l21_vw)
+    f_update_market(mSum, mSq, mCnt, mWin, mDDSum, mDDCnt, 2, bucket_entry_20, vn100_now_vw, vn100_20_vw, vn100_l21_vw)
+    f_update_market(mSum, mSq, mCnt, mWin, mDDSum, mDDCnt, 3, bucket_entry_20, vnall_now_vw, vnall_20_vw, vnall_l21_vw)
+    f_update_market(mSum, mSq, mCnt, mWin, mDDSum, mDDCnt, 4, bucket_entry_20, vnmid_now_vw, vnmid_20_vw, vnmid_l21_vw)
+    f_update_market(mSum, mSq, mCnt, mWin, mDDSum, mDDCnt, 5, bucket_entry_20, vnsmall_now_vw, vnsmall_20_vw, vnsmall_l21_vw)
+
+    f_update_sector(sSum, sSq, sCnt, sWin, 0,  bucket_entry_20, fin_now_vw,  fin_20_vw,  benchmark20)
+    f_update_sector(sSum, sSq, sCnt, sWin, 1,  bucket_entry_20, fins_now_vw, fins_20_vw, benchmark20)
+    f_update_sector(sSum, sSq, sCnt, sWin, 2,  bucket_entry_20, ind_now_vw,  ind_20_vw,  benchmark20)
+    f_update_sector(sSum, sSq, sCnt, sWin, 3,  bucket_entry_20, it_now_vw,   it_20_vw,   benchmark20)
+    f_update_sector(sSum, sSq, sCnt, sWin, 4,  bucket_entry_20, real_now_vw, real_20_vw, benchmark20)
+    f_update_sector(sSum, sSq, sCnt, sWin, 5,  bucket_entry_20, cons_now_vw, cons_20_vw, benchmark20)
+    f_update_sector(sSum, sSq, sCnt, sWin, 6,  bucket_entry_20, cond_now_vw, cond_20_vw, benchmark20)
+    f_update_sector(sSum, sSq, sCnt, sWin, 7,  bucket_entry_20, ene_now_vw,  ene_20_vw,  benchmark20)
+    f_update_sector(sSum, sSq, sCnt, sWin, 8,  bucket_entry_20, mat_now_vw,  mat_20_vw,  benchmark20)
+    f_update_sector(sSum, sSq, sCnt, sWin, 9,  bucket_entry_20, heal_now_vw, heal_20_vw, benchmark20)
+    f_update_sector(sSum, sSq, sCnt, sWin, 10, bucket_entry_20, uti_now_vw,  uti_20_vw,  benchmark20)
+
+if upd5 and not na(bucket_entry_5)
+    float r5 = f_return(vni_now_vw, vni_5_vw)
+    float d5 = not na(vni_l6_vw) and not na(vni_5_vw) and vni_5_vw > 0 ? vni_l6_vw / vni_5_vw - 1.0 : na
+    int idx5 = bucket_entry_5
+    f_update_stats(cSum, cSq, cCnt, cWin, idx5, r5)
+    f_update_dd(cDDSum, cDDCnt, idx5, d5)
+    f_update_stats(uSum, uSq, uCnt, uWin, 0, r5)
+    if not na(r5) and not na(time_entry_5)
+        int splitSlot5 = time_entry_5 < STRUCTURAL_SPLIT_TS ? 0 : 1
+        int splitCIdx5 = splitSlot5 * 15 + idx5
+        int splitUIdx5 = splitSlot5 * 3
+        f_update_sum_sq_n(splitCSum, splitCSq, splitCCnt, splitCIdx5, r5)
+        f_update_sum_sq_n(splitUSum, splitUSq, splitUCnt, splitUIdx5, r5)
+
+if upd20 and not na(bucket_entry_20)
+    float r20 = f_return(vni_now_vw, vni_20_vw)
+    float d20 = not na(vni_l21_vw) and not na(vni_20_vw) and vni_20_vw > 0 ? vni_l21_vw / vni_20_vw - 1.0 : na
+    int idx20 = 5 + bucket_entry_20
+    f_update_stats(cSum, cSq, cCnt, cWin, idx20, r20)
+    f_update_dd(cDDSum, cDDCnt, idx20, d20)
+    f_update_stats(uSum, uSq, uCnt, uWin, 1, r20)
+    if not na(r20) and not na(time_entry_20)
+        int splitSlot20 = time_entry_20 < STRUCTURAL_SPLIT_TS ? 0 : 1
+        int splitCIdx20 = splitSlot20 * 15 + idx20
+        int splitUIdx20 = splitSlot20 * 3 + 1
+        f_update_sum_sq_n(splitCSum, splitCSq, splitCCnt, splitCIdx20, r20)
+        f_update_sum_sq_n(splitUSum, splitUSq, splitUCnt, splitUIdx20, r20)
+
+if upd60 and not na(bucket_entry_60)
+    float r60 = f_return(vni_now_vw, vni_60_vw)
+    float d60 = not na(vni_l61_vw) and not na(vni_60_vw) and vni_60_vw > 0 ? vni_l61_vw / vni_60_vw - 1.0 : na
+    int idx60 = 10 + bucket_entry_60
+    f_update_stats(cSum, cSq, cCnt, cWin, idx60, r60)
+    f_update_dd(cDDSum, cDDCnt, idx60, d60)
+    f_update_stats(uSum, uSq, uCnt, uWin, 2, r60)
+    if not na(r60) and not na(time_entry_60)
+        int splitSlot60 = time_entry_60 < STRUCTURAL_SPLIT_TS ? 0 : 1
+        int splitCIdx60 = splitSlot60 * 15 + idx60
+        int splitUIdx60 = splitSlot60 * 3 + 2
+        f_update_sum_sq_n(splitCSum, splitCSq, splitCCnt, splitCIdx60, r60)
+        f_update_sum_sq_n(splitUSum, splitUSq, splitUCnt, splitUIdx60, r60)
+
+// =====================================================================
+// 13) CURRENT-REGIME EVIDENCE READOUTS
+// =====================================================================
+int bucket_idx = na(bucket_now) ? 2 : bucket_now
+int idx5_now   = bucket_idx
+int idx20_now  = 5 + bucket_idx
+int idx60_now  = 10 + bucket_idx
+
+float cSum5  = risk_valid ? array.get(cSum, idx5_now) : na
+float cSq5   = risk_valid ? array.get(cSq, idx5_now) : na
+float cN5    = risk_valid ? array.get(cCnt, idx5_now) : na
+float cW5    = risk_valid ? array.get(cWin, idx5_now) : na
+float cDD5   = risk_valid ? f_mean(array.get(cDDSum, idx5_now), array.get(cDDCnt, idx5_now)) : na
+float win5   = f_winrate(cW5, cN5)
+
+float cSum20 = risk_valid ? array.get(cSum, idx20_now) : na
+float cSq20  = risk_valid ? array.get(cSq, idx20_now) : na
+float cN20   = risk_valid ? array.get(cCnt, idx20_now) : na
+float cW20   = risk_valid ? array.get(cWin, idx20_now) : na
+float cDD20  = risk_valid ? f_mean(array.get(cDDSum, idx20_now), array.get(cDDCnt, idx20_now)) : na
+float win20  = f_winrate(cW20, cN20)
+
+float cSum60 = risk_valid ? array.get(cSum, idx60_now) : na
+float cSq60  = risk_valid ? array.get(cSq, idx60_now) : na
+float cN60   = risk_valid ? array.get(cCnt, idx60_now) : na
+float cW60   = risk_valid ? array.get(cWin, idx60_now) : na
+float cDD60  = risk_valid ? f_mean(array.get(cDDSum, idx60_now), array.get(cDDCnt, idx60_now)) : na
+float win60  = f_winrate(cW60, cN60)
+
+[cMean5, oMean5, effect5, effectSE5, t5, lcb5, ucb5, oN5] = f_effect_stats(cSum5, cSq5, cN5, array.get(uSum, 0), array.get(uSq, 0), array.get(uCnt, 0))
+[cMean20, oMean20, effect20, effectSE20, t20, lcb20, ucb20, oN20] = f_effect_stats(cSum20, cSq20, cN20, array.get(uSum, 1), array.get(uSq, 1), array.get(uCnt, 1))
+[cMean60, oMean60, effect60, effectSE60, t60, lcb60, ucb60, oN60] = f_effect_stats(cSum60, cSq60, cN60, array.get(uSum, 2), array.get(uSq, 2), array.get(uCnt, 2))
+
+// Pre/post structural effects.
+[preC5, preO5, preEff5, preSE5, preT5, preLCB5, preUCB5, preON5] = f_effect_stats(
+    array.get(splitCSum, idx5_now), array.get(splitCSq, idx5_now), array.get(splitCCnt, idx5_now),
+    array.get(splitUSum, 0), array.get(splitUSq, 0), array.get(splitUCnt, 0))
+[postC5, postO5, postEff5, postSE5, postT5, postLCB5, postUCB5, postON5] = f_effect_stats(
+    array.get(splitCSum, 15 + idx5_now), array.get(splitCSq, 15 + idx5_now), array.get(splitCCnt, 15 + idx5_now),
+    array.get(splitUSum, 3), array.get(splitUSq, 3), array.get(splitUCnt, 3))
+
+[preC20, preO20, preEff20, preSE20, preT20, preLCB20, preUCB20, preON20] = f_effect_stats(
+    array.get(splitCSum, idx20_now), array.get(splitCSq, idx20_now), array.get(splitCCnt, idx20_now),
+    array.get(splitUSum, 1), array.get(splitUSq, 1), array.get(splitUCnt, 1))
+[postC20, postO20, postEff20, postSE20, postT20, postLCB20, postUCB20, postON20] = f_effect_stats(
+    array.get(splitCSum, 15 + idx20_now), array.get(splitCSq, 15 + idx20_now), array.get(splitCCnt, 15 + idx20_now),
+    array.get(splitUSum, 4), array.get(splitUSq, 4), array.get(splitUCnt, 4))
+
+[preC60, preO60, preEff60, preSE60, preT60, preLCB60, preUCB60, preON60] = f_effect_stats(
+    array.get(splitCSum, idx60_now), array.get(splitCSq, idx60_now), array.get(splitCCnt, idx60_now),
+    array.get(splitUSum, 2), array.get(splitUSq, 2), array.get(splitUCnt, 2))
+[postC60, postO60, postEff60, postSE60, postT60, postLCB60, postUCB60, postON60] = f_effect_stats(
+    array.get(splitCSum, 15 + idx60_now), array.get(splitCSq, 15 + idx60_now), array.get(splitCCnt, 15 + idx60_now),
+    array.get(splitUSum, 5), array.get(splitUSq, 5), array.get(splitUCnt, 5))
+
+string split5  = f_split_label(preEff5,  postEff5,  array.get(splitCCnt, idx5_now),      array.get(splitCCnt, 15 + idx5_now))
+string split20 = f_split_label(preEff20, postEff20, array.get(splitCCnt, idx20_now),     array.get(splitCCnt, 15 + idx20_now))
+string split60 = f_split_label(preEff60, postEff60, array.get(splitCCnt, idx60_now),     array.get(splitCCnt, 15 + idx60_now))
+
+string grade5  = f_evidence_grade(cN5,  oN5,  effect5,  effectSE5,  split5,  data_quality_score)
+string grade20 = f_evidence_grade(cN20, oN20, effect20, effectSE20, split20, data_quality_score)
+string grade60 = f_evidence_grade(cN60, oN60, effect60, effectSE60, split60, data_quality_score)
+
+bool evidence20_confirmed = grade20 == "A" or grade20 == "B"
+string tactical_bias = na(effect20) or cN20 < MIN_N_SHOW or oN20 < MIN_N_SHOW ? "UNKNOWN" :
+     evidence20_confirmed and effect20 < 0 ? "DEFENSIVE" :
+     evidence20_confirmed and effect20 > 0 ? "RISK-ON" : "NEUTRAL"
+
+string takeaway = macro_regime + " | " + data_quality_txt + " | CONF " + structural_conf_txt +
+                  " | 20D " + tactical_bias + " (E" + grade20 + ")"
+
+// =====================================================================
+// 14) TABLE LIFECYCLE
+// =====================================================================
+var table t_macro = na
+var table t_risk  = na
+var table t_eq    = na
+var table t_tr    = na
+
+if barstate.islast
+    if not show_macro and not na(t_macro)
+        f_kill_table(t_macro)
+        t_macro := na
+    if not show_risk and not na(t_risk)
+        f_kill_table(t_risk)
+        t_risk := na
+    if not show_eq
+        if not na(t_eq)
+            f_kill_table(t_eq)
+            t_eq := na
+        if not na(t_tr)
+            f_kill_table(t_tr)
+            t_tr := na
+
+// =====================================================================
+// 15) MACRO PANEL
+// =====================================================================
+if barstate.islast and show_macro
+    if na(t_macro)
+        t_macro := table.new(position.top_left, 5, 12, bgcolor=color.new(color.black, 18), border_width=2, border_color=color.new(color.white, 20))
+        table.merge_cells(t_macro, 0, 0, 4, 0)
+
+    table.cell(t_macro, 0, 0, "MACRO v6.0.1 | " + f_bucket_label(bucket_now) + " | Risk " + f_fmt_score(risk_pct) + " | " + macro_regime,
+        bgcolor=color.new(color.blue, 10), text_color=color.white, text_size=size.small)
+
+    table.cell(t_macro, 0, 1, "Rates", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_macro, 1, 1, "VN10Y", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_macro, 2, 1, "VN02Y", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_macro, 3, 1, "Interbank", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_macro, 4, 1, "Policy", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+
+    table.cell(t_macro, 0, 2, "Value", bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 1, 2, f_fmt_raw(bond_10y), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 2, 2, f_fmt_raw(bond_2y), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 3, 2, f_fmt_raw(interbank_rate), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 4, 2, f_fmt_raw(policy_rate), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_macro, 0, 4, "Feature", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_macro, 1, 4, "Liquidity", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_macro, 2, 4, "10Y-2Y", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_macro, 3, 4, "VN-US10Y", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_macro, 4, 4, "10Y-Policy", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+
+    table.cell(t_macro, 0, 5, "Now | limit", bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 1, 5, f_fmt_raw(liquidity_stress) + " | " + f_fmt_raw(stress_threshold), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 2, 5, f_fmt_raw(curve_10y_2y) + " | " + f_fmt_raw(curve_threshold), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 3, 5, f_fmt_raw(vn_us_10y_gap) + " | " + f_fmt_raw(intl_threshold), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 4, 5, f_fmt_raw(long_policy_gap) + " | " + f_fmt_raw(spread_threshold), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_macro, 0, 6, "Flag", bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 1, 6, stress_high ? "HIGH" : "OK", bgcolor=color.new(stress_high ? color.red : color.green, 75), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 2, 6, curve_low ? "LOW" : "OK", bgcolor=color.new(curve_low ? color.red : color.green, 75), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 3, 6, intl_low ? "LOW" : "OK", bgcolor=color.new(intl_low ? color.red : color.green, 75), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 4, 6, long_policy_low ? "LOW" : "OK", bgcolor=color.new(long_policy_low ? color.red : color.green, 75), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_macro, 0, 8, "Layers", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_macro, 1, 8, "Funding " + f_fmt_score(layer_funding), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 2, 8, "Domestic " + f_fmt_score(layer_domestic), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 3, 8, "External " + f_fmt_score(layer_external), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 4, 8, "Constraint " + f_fmt_score(constraint_index), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_macro, 0, 9, "Quality", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_macro, 1, 9, data_quality_txt + " " + f_fmt_score(data_quality_score), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 2, 9, "Conf " + structural_conf_txt + " " + f_fmt_score(structural_confidence) + confidence_cap_txt, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 3, 9, "Strength " + f_fmt_score(signal_strength), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 4, 9, "Impulse " + impulse_txt, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_macro, 0, 10, "Constraint zone", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.merge_cells(t_macro, 1, 10, 4, 10)
+    table.cell(t_macro, 1, 10, constraint_zone + " — policy-space index, not an SBV forecast", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_macro, 0, 11, "Takeaway", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.merge_cells(t_macro, 1, 11, 4, 11)
+    table.cell(t_macro, 1, 11, takeaway, bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+
+// =====================================================================
+// 16) RISK / EVIDENCE PANEL
+// =====================================================================
+if barstate.islast and show_risk
+    if na(t_risk)
+        t_risk := table.new(position.top_right, 8, 10, bgcolor=color.new(color.black, 18), border_width=2, border_color=color.new(color.white, 20))
+        table.merge_cells(t_risk, 0, 0, 7, 0)
+
+    table.cell(t_risk, 0, 0, "EVIDENCE v6.0.1 | " + f_bucket_label(bucket_now) + " | " + macro_regime + " | DQ " + data_quality_txt,
+        bgcolor=color.new(color.blue, 0), text_color=color.white, text_size=size.small)
+
+    table.cell(t_risk, 0, 1, "Signal", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 1, 1, "Risk", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 2, 1, "Impulse20", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 3, 1, "Persistence", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 4, 1, "Concord", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 5, 1, "Conf", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 6, 1, "Constraint", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 7, 1, "Bias20", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+
+    table.cell(t_risk, 0, 2, "Now", bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 1, 2, f_fmt_score(risk_pct), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 2, 2, f_fmt_raw(risk_impulse), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 3, 2, f_fmt_score(persistence_score), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 4, 2, f_fmt_score(concordance_score), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 5, 2, structural_conf_txt + " " + f_fmt_score(structural_confidence) + confidence_cap_txt, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 6, 2, constraint_zone, bgcolor=color.new(constraint_index >= 70 ? color.red : constraint_index <= 30 ? color.green : color.orange, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 7, 2, tactical_bias, bgcolor=color.new(tactical_bias == "DEFENSIVE" ? color.red : tactical_bias == "RISK-ON" ? color.green : color.orange, 80), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_risk, 0, 4, "H", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 1, 4, "Regime avg", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 2, 4, "Other avg", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 3, 4, "Effect", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 4, 4, "t≈", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 5, 4, "N reg/oth", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 6, 4, "Pre/Post", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 7, 4, "Grade", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+
+    table.cell(t_risk, 0, 5, "5D", bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 1, 5, f_fmt_pct_simple(cMean5, cN5), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 2, 5, f_fmt_pct_simple(oMean5, oN5), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 3, 5, f_fmt_pct_simple(effect5, math.min(cN5, oN5)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 4, 5, f_fmt_t(t5, cN5, oN5), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 5, 5, f_fmt_n(cN5) + "/" + f_fmt_n(oN5), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 6, 5, split5, bgcolor=color.new(split5 == "MIXED" ? color.red : color.black, 70), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 7, 5, "E" + grade5, bgcolor=color.new(f_grade_color(grade5), 75), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_risk, 0, 6, "20D", bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 1, 6, f_fmt_pct_simple(cMean20, cN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 2, 6, f_fmt_pct_simple(oMean20, oN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 3, 6, f_fmt_pct_simple(effect20, math.min(cN20, oN20)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 4, 6, f_fmt_t(t20, cN20, oN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 5, 6, f_fmt_n(cN20) + "/" + f_fmt_n(oN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 6, 6, split20, bgcolor=color.new(split20 == "MIXED" ? color.red : color.black, 70), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 7, 6, "E" + grade20, bgcolor=color.new(f_grade_color(grade20), 75), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_risk, 0, 7, "60D", bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 1, 7, f_fmt_pct_simple(cMean60, cN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 2, 7, f_fmt_pct_simple(oMean60, oN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 3, 7, f_fmt_pct_simple(effect60, math.min(cN60, oN60)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 4, 7, f_fmt_t(t60, cN60, oN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 5, 7, f_fmt_n(cN60) + "/" + f_fmt_n(oN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 6, 7, split60, bgcolor=color.new(split60 == "MIXED" ? color.red : color.black, 70), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 7, 7, "E" + grade60, bgcolor=color.new(f_grade_color(grade60), 75), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_risk, 0, 8, "Risk", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 1, 8, "Win5 " + f_fmt_win(win5, cN5), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 2, 8, "DD5 " + f_fmt_pct_raw(cDD5, cN5), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 3, 8, "Win20 " + f_fmt_win(win20, cN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 4, 8, "DD20 " + f_fmt_pct_raw(cDD20, cN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 5, 8, "Win60 " + f_fmt_win(win60, cN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 6, 8, "DD60 " + f_fmt_pct_raw(cDD60, cN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 7, 8, "t is approximate", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_risk, 0, 9, "Takeaway", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.merge_cells(t_risk, 1, 9, 7, 9)
+    table.cell(t_risk, 1, 9, takeaway, bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+
+// =====================================================================
+// 17) EQUITY PANEL — UNCERTAINTY-AWARE MARKET AND SECTOR EVIDENCE
+// =====================================================================
+if barstate.islast and show_eq
+    if na(t_eq)
+        t_eq := table.new(position.top_right, 8, 24, bgcolor=color.new(color.black, 15), border_width=2, border_color=color.new(color.white, 20))
+        table.merge_cells(t_eq, 0, 0, 7, 0)
+
+    table.cell(t_eq, 0, 0, "EQUITY v6.0.1 | " + f_bucket_label(bucket_now) + " | " + macro_regime + " | 20D " + tactical_bias + " E" + grade20,
+        bgcolor=color.new(color.blue, 0), text_color=color.white, text_size=size.small)
+
+    table.merge_cells(t_eq, 0, 1, 7, 1)
+    table.cell(t_eq, 0, 1, "Markets — non-overlapping 20D outcomes conditioned on entry regime", bgcolor=color.new(color.white, 8), text_color=color.black, text_size=size.tiny)
+
+    table.cell(t_eq, 0, 2, "Market", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 1, 2, "GeoAvg20", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 2, 2, "SE(log)", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 3, 2, "Win", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 4, 2, "AvgDD", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 5, 2, "N", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 6, 2, "N-grade", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 7, 2, "Bias", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+
+    for m = 0 to 5
+        int row = 3 + m
+        int idxM = m * 5 + bucket_idx
+        float ms = risk_valid ? array.get(mSum, idxM) : na
+        float mq = risk_valid ? array.get(mSq, idxM) : na
+        float mn = risk_valid ? array.get(mCnt, idxM) : na
+        float mw = risk_valid ? array.get(mWin, idxM) : na
+        float md = risk_valid ? f_mean(array.get(mDDSum, idxM), array.get(mDDCnt, idxM)) : na
+        float mm = f_mean(ms, mn)
+        float mse = f_se(ms, mq, mn)
+        string mbias = m == 0 ? tactical_bias : "--"
+        table.cell(t_eq, 0, row, array.get(market_name, m), bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
+        table.cell(t_eq, 1, row, f_fmt_pct_simple(mm, mn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+        table.cell(t_eq, 2, row, f_fmt_pct_raw(mse, mn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+        table.cell(t_eq, 3, row, f_fmt_win(f_winrate(mw, mn), mn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+        table.cell(t_eq, 4, row, f_fmt_pct_raw(md, mn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+        table.cell(t_eq, 5, row, f_fmt_n(mn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+        table.cell(t_eq, 6, row, f_n_label(mn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+        table.cell(t_eq, 7, row, mbias, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+
+    table.merge_cells(t_eq, 0, 10, 7, 10)
+    table.cell(t_eq, 0, 10, "VNINDEX evidence — current regime versus all other regimes", bgcolor=color.new(color.orange, 10), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_eq, 0, 11, "H", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 1, 11, "Effect", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 2, 11, "95% LCB", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 3, 11, "95% UCB", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 4, 11, "t≈", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 5, 11, "N reg/oth", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 6, 11, "Pre/Post", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 7, 11, "Grade", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+
+    table.cell(t_eq, 0, 12, "5D", bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 1, 12, f_fmt_pct_simple(effect5, math.min(cN5, oN5)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 2, 12, f_fmt_pct_simple(lcb5, math.min(cN5, oN5)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 3, 12, f_fmt_pct_simple(ucb5, math.min(cN5, oN5)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 4, 12, f_fmt_t(t5, cN5, oN5), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 5, 12, f_fmt_n(cN5) + "/" + f_fmt_n(oN5), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 6, 12, split5, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 7, 12, "E" + grade5, bgcolor=color.new(f_grade_color(grade5), 75), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_eq, 0, 13, "20D", bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 1, 13, f_fmt_pct_simple(effect20, math.min(cN20, oN20)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 2, 13, f_fmt_pct_simple(lcb20, math.min(cN20, oN20)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 3, 13, f_fmt_pct_simple(ucb20, math.min(cN20, oN20)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 4, 13, f_fmt_t(t20, cN20, oN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 5, 13, f_fmt_n(cN20) + "/" + f_fmt_n(oN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 6, 13, split20, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 7, 13, "E" + grade20, bgcolor=color.new(f_grade_color(grade20), 75), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_eq, 0, 14, "60D", bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 1, 14, f_fmt_pct_simple(effect60, math.min(cN60, oN60)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 2, 14, f_fmt_pct_simple(lcb60, math.min(cN60, oN60)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 3, 14, f_fmt_pct_simple(ucb60, math.min(cN60, oN60)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 4, 14, f_fmt_t(t60, cN60, oN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 5, 14, f_fmt_n(cN60) + "/" + f_fmt_n(oN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 6, 14, split60, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_eq, 7, 14, "E" + grade60, bgcolor=color.new(f_grade_color(grade60), 75), text_color=color.white, text_size=size.tiny)
+
+    // Sector ranking with shrinkage and uncertainty-aware scores.
+    float[] secMean = array.new_float(11, na)
+    float[] secSE = array.new_float(11, na)
+    float[] secShr = array.new_float(11, na)
+    float[] secLeadScore = array.new_float(11, na)
+    float[] secLagScore = array.new_float(11, na)
+    float[] secN = array.new_float(11, na)
+
+    for s = 0 to 10
+        int idxS = s * 5 + bucket_idx
+        float ss = risk_valid ? array.get(sSum, idxS) : na
+        float sq = risk_valid ? array.get(sSq, idxS) : na
+        float nn = risk_valid ? array.get(sCnt, idxS) : na
+        float mm = f_mean(ss, nn)
+        float se = f_se(ss, sq, nn)
+        float shrink = not na(nn) ? nn / (nn + SHRINK_K) : na
+        float shr = not na(mm) and not na(shrink) ? mm * shrink : na
+        float lead = nn >= MIN_N_RANK and not na(se) ? shr - Z_SECTOR * se : na
+        float lag  = nn >= MIN_N_RANK and not na(se) ? shr + Z_SECTOR * se : na
+        array.set(secMean, s, mm)
+        array.set(secSE, s, se)
+        array.set(secShr, s, shr)
+        array.set(secLeadScore, s, lead)
+        array.set(secLagScore, s, lag)
+        array.set(secN, s, nn)
+
+    int[] topIdx = array.new_int(3, -1)
+    int[] botIdx = array.new_int(3, -1)
+    bool[] used = array.new_bool(11, false)
+
+    for k = 0 to 2
+        float best = na
+        int bestId = -1
+        for s = 0 to 10
+            float score = array.get(secLeadScore, s)
+            if not array.get(used, s) and not na(score)
+                if bestId == -1 or score > best
+                    best := score
+                    bestId := s
+        array.set(topIdx, k, bestId)
+        if bestId != -1
+            array.set(used, bestId, true)
+
+    for k = 0 to 2
+        float worst = na
+        int worstId = -1
+        for s = 0 to 10
+            float score = array.get(secLagScore, s)
+            if not array.get(used, s) and not na(score)
+                if worstId == -1 or score < worst
+                    worst := score
+                    worstId := s
+        array.set(botIdx, k, worstId)
+        if worstId != -1
+            array.set(used, worstId, true)
+
+    table.merge_cells(t_eq, 0, 16, 7, 16)
+    table.cell(t_eq, 0, 16, "Sectors — shrunk RR + Bonferroni-style 90% family-wise score; N >= " + str.tostring(MIN_N_RANK),
+        bgcolor=color.new(color.teal, 10), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_eq, 0, 17, "Rank", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 1, 17, "Sector", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 2, 17, "MeanRR", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 3, 17, "ShrRR", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 4, 17, "SE", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 5, 17, "FW bound", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 6, 17, "N", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 7, 17, "Side", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+
+    for k = 0 to 2
+        int row = 18 + k
+        int sId = array.get(topIdx, k)
+        if sId != -1
+            float nn = array.get(secN, sId)
+            table.cell(t_eq, 0, row, "T" + str.tostring(k + 1), bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
+            table.cell(t_eq, 1, row, array.get(sector_name, sId), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+            table.cell(t_eq, 2, row, f_fmt_pct_simple(array.get(secMean, sId), nn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+            table.cell(t_eq, 3, row, f_fmt_pct_simple(array.get(secShr, sId), nn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+            table.cell(t_eq, 4, row, f_fmt_pct_raw(array.get(secSE, sId), nn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+            table.cell(t_eq, 5, row, f_fmt_pct_raw(array.get(secLeadScore, sId), nn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+            table.cell(t_eq, 6, row, f_fmt_n(nn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+            string side = f_sector_top_label(array.get(secShr, sId), array.get(secLeadScore, sId))
+            table.cell(t_eq, 7, row, side, bgcolor=color.new(f_sector_label_color(side), 75), text_color=color.white, text_size=size.tiny)
+
+    for k = 0 to 2
+        int row = 21 + k
+        int sId = array.get(botIdx, k)
+        if sId != -1
+            float nn = array.get(secN, sId)
+            table.cell(t_eq, 0, row, "B" + str.tostring(k + 1), bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
+            table.cell(t_eq, 1, row, array.get(sector_name, sId), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+            table.cell(t_eq, 2, row, f_fmt_pct_simple(array.get(secMean, sId), nn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+            table.cell(t_eq, 3, row, f_fmt_pct_simple(array.get(secShr, sId), nn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+            table.cell(t_eq, 4, row, f_fmt_pct_raw(array.get(secSE, sId), nn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+            table.cell(t_eq, 5, row, f_fmt_pct_raw(array.get(secLagScore, sId), nn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+            table.cell(t_eq, 6, row, f_fmt_n(nn), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+            string side = f_sector_bottom_label(array.get(secShr, sId), array.get(secLagScore, sId))
+            table.cell(t_eq, 7, row, side, bgcolor=color.new(f_sector_label_color(side), 75), text_color=color.white, text_size=size.tiny)
+
+    // Transition table with Jeffreys smoothing.
+    if na(t_tr)
+        t_tr := table.new(position.bottom_left, 4, 7, bgcolor=color.new(color.black, 18), border_width=2, border_color=color.new(color.white, 20))
+        table.merge_cells(t_tr, 0, 0, 3, 0)
+
+    float rowTotal = 0.0
+    float lowerCnt = 0.0
+    float sameCnt  = 0.0
+    float higherCnt= 0.0
+    float rowRet   = 0.0
+    float rowWins  = 0.0
+
+    if not na(bucket_now)
+        for dest = 0 to 4
+            float ntr = array.get(trCnt, bucket_now * 5 + dest)
+            rowTotal += ntr
+            rowRet   += array.get(trRet, bucket_now * 5 + dest)
+            rowWins  += array.get(trWin, bucket_now * 5 + dest)
+            if dest < bucket_now
+                lowerCnt += ntr
+            else if dest == bucket_now
+                sameCnt += ntr
+            else
+                higherCnt += ntr
+
+    float alpha = 0.5
+    float priorStates = 5.0
+    float denom = rowTotal + alpha * priorStates
+    float lowerStates = not na(bucket_now) ? float(bucket_now) : 0.0
+    float higherStates = not na(bucket_now) ? float(4 - bucket_now) : 0.0
+    float pLower = denom > 0 ? (lowerCnt + alpha * lowerStates) / denom * 100.0 : na
+    float pSame  = denom > 0 ? (sameCnt + alpha) / denom * 100.0 : na
+    float pHigher= denom > 0 ? (higherCnt + alpha * higherStates) / denom * 100.0 : na
+    float trAvg  = rowTotal > 0 ? rowRet / rowTotal : na
+    float trWinP = rowTotal > 0 ? rowWins / rowTotal * 100.0 : na
+
+    table.cell(t_tr, 0, 0, "20D regime destination probabilities | From " + f_bucket_label(bucket_now) + " | Avg " + f_fmt_pct_simple(trAvg, rowTotal) + " | Win " + f_fmt_win(trWinP, rowTotal),
+        bgcolor=color.new(color.orange, 0), text_color=color.white, text_size=size.tiny)
+    table.cell(t_tr, 0, 1, "Direction", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_tr, 1, 1, "Smoothed %", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_tr, 2, 1, "Raw N", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_tr, 3, 1, "Meaning", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+
+    table.cell(t_tr, 0, 2, "Lower risk", bgcolor=color.new(color.green, 20), text_color=color.white, text_size=size.tiny)
+    table.cell(t_tr, 1, 2, na(pLower) ? "--" : str.tostring(pLower, "#.#") + "%", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_tr, 2, 2, f_fmt_n(lowerCnt), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_tr, 3, 2, "Improve", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_tr, 0, 3, "Same risk", bgcolor=color.new(color.gray, 20), text_color=color.white, text_size=size.tiny)
+    table.cell(t_tr, 1, 3, na(pSame) ? "--" : str.tostring(pSame, "#.#") + "%", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_tr, 2, 3, f_fmt_n(sameCnt), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_tr, 3, 3, "Persist", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_tr, 0, 4, "Higher risk", bgcolor=color.new(color.red, 20), text_color=color.white, text_size=size.tiny)
+    table.cell(t_tr, 1, 4, na(pHigher) ? "--" : str.tostring(pHigher, "#.#") + "%", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_tr, 2, 4, f_fmt_n(higherCnt), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_tr, 3, 4, "Worsen", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_tr, 0, 5, "Prior", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.merge_cells(t_tr, 1, 5, 3, 5)
+    table.cell(t_tr, 1, 5, "Jeffreys α=0.5 per destination state", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+
+    table.cell(t_tr, 0, 6, "Takeaway", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.merge_cells(t_tr, 1, 6, 3, 6)
+    table.cell(t_tr, 1, 6, takeaway, bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.tiny)
+
+// =====================================================================
+// 18) ALERTS — QUALITY-GATED
+// =====================================================================
+bool liquidity_crisis = risk_valid and stress_high and curve_low and intl_low
+bool risk_extreme      = risk_valid and risk_pct >= 80
+bool quality_ok        = data_quality_score >= 70 and structural_confidence >= 55
+bool evidence_bad20    = evidence20_confirmed and not na(effect20) and effect20 < 0
+bool evidence_good20   = evidence20_confirmed and not na(effect20) and effect20 > 0
+
+alertcondition(risk_extreme and quality_ok, title="v6.0.1: Extreme Risk / Calibrated Quality Confirmed", message="MacroAcademic v6.0.1: extreme macro risk with acceptable data and calibrated structural confidence.")
+alertcondition(liquidity_crisis and quality_ok, title="v6.0.1: Liquidity-Curve-External Stress", message="MacroAcademic v6.0.1: liquidity, curve and external stress are jointly adverse.")
+alertcondition(risk_extreme and evidence_bad20 and quality_ok, title="v6.0.1: Extreme Risk + Negative 20D Evidence", message="MacroAcademic v6.0.1: extreme-risk regime with negative 20D evidence versus other regimes.")
+alertcondition(evidence_good20 and quality_ok, title="v6.0.1: Positive 20D Regime Evidence", message="MacroAcademic v6.0.1: current regime has positive 20D evidence versus other regimes.")

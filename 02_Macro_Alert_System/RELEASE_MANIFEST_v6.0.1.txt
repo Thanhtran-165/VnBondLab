@@ -1,0 +1,13 @@
+Macro Alert System v6.0.1 — Frozen Production Research Release
+Acceptance date: 2026-07-15
+Status: ACCEPTED / FROZEN FOR REPORTING USE
+
+Files:
+- Macro_Alert_System_v6_0_1_Academic_Calibration_Patch.pine
+- CHANGELOG_v6_0_1_Academic_Calibration_Patch.md
+- README_Macro_Alert_System_v6_0_1.md
+
+SHA-256:
+054278fbb87168f275587d3220358518498fa24509c4ffc83c9bc33787f8d749  /mnt/data/Macro_Alert_System_v6_0_1_Academic_Calibration_Patch.pine
+c6ce7d9545bcf2fbf2410ac4cdc593dc0f63644eecedde8368d5f74c2005ab93  /mnt/data/CHANGELOG_v6_0_1_Academic_Calibration_Patch.md
+d0b5cd8ced0c32c20cd27e4d32955d182889a89354430d55e65c90be7594128b  /mnt/data/README_Macro_Alert_System_v6_0_1.md

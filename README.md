@@ -44,7 +44,7 @@ Phiên bản: v3.2.1 | Tác giả: MacroAcademic
 ### 🔔 02_Macro_Alert_System
 **Hệ thống cảnh báo vĩ mô toàn diện**
 
-Phiên bản: v5.0.1 | Tác giả: Macro Research Team
+Phiên bản: v6.0.1 | Tác giả: Macro Research Team
 
 **Mục đích:** Hệ thống cảnh báo rủi ro vĩ mô với phân tích 4 trụ cột:
 - Căng thẳng thanh khoản (Interbank - Policy Rate)
@@ -64,7 +64,7 @@ Phiên bản: v5.0.1 | Tác giả: Macro Research Team
 - Bạn cần tìm ngành mạnh/yếu theo chu kỳ kinh tế
 
 **File chính:**
-- `Macro_Alert_System_v5.0.1.pine`
+- `Macro_Alert_System_v6.0.1.pine`
 
 📖 **Xem chi tiết:** [README Macro Alert System](./02_Macro_Alert_System/)
 
@@ -336,7 +336,7 @@ Tất cả các dự án đều được xây dựng với các chuẩn mực h�
 
 ### Sub-projects:
 - **01_MacroAcademic_Engine:** v3.2.1 (Semantic Clarity Patch)
-- **02_Macro_Alert_System:** v5.0.1 (Validated Regime Engine)
+- **02_Macro_Alert_System:** v6.0.1 (Academic Calibration Patch — Production Research Version)
 - **03_Indices_Research_Map:** v2.0.1 (Clean Fixed Build)
 - **04_YieldCurveLab:** v2.3.0 (Horizon Separation & Sample Power)
 - **05_Bond_Transmission_Monitor:** v6.0.1 (Interpretation Upgrade)
