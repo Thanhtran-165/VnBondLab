@@ -99,27 +99,31 @@ Phiên bản: v2.0 | Tác giả: Macro Research Team
 ### 💰 04_YieldCurveLab
 **Laboratory nghiên cứu đường cong lợi suất trái phiếu**
 
-Phiên bản: v1.8.3 | Tác giả: VnBondLab
+Phiên bản: v2.3.0 | Tác giả: VnBondLab
 
-**Mục đích:** Phân tích sâu đường cong lợi suất Việt Nam (1Y/2Y/3Y/5Y/7Y/10Y)
+**Mục đích:** Theo dõi trạng thái đường cong lợi suất Việt Nam (1Y/2Y/3Y/5Y/7Y/10Y) và kiểm định mối quan hệ giữa các regime lãi suất với outcome của VNINDEX.
 
-**3 khối phân tích chính:**
-1. **Shape & Regime:** Level, Slope, Curve, Classification (YC0-YC4)
-2. **Quality & Distortion:** Đánh giá độ "khỏe" của dữ liệu (HIGHQ/MEDQ/LOWQ)
-3. **Research vs VNINDEX:** Tương quan, Beta, R² giữa Stress và thị trường cổ phiếu
+**Điểm mới v2.3.0 — Horizon Separation & Sample Power:**
+1. **Macro State Engine:** Level, Slope, Curvature → Curve Stress → YC Regime (YC0-YC4)
+2. **Horizon Separation:** Tách Tactical 1W và Strategic 4W với outcome không chồng lấn
+3. **Episode-Aware Sampling:** Lấy mẫu theo episode để hạn chế pseudo-replication
+4. **Development/Validation:** Directional evidence chỉ công nhận khi cả hai cùng dấu + hard gate
+5. **Adaptive Sample Power:** Tự chọn STANDARD (52w/52w) hoặc HIGH (104w/104w)
+6. **Decision Engine:** Tactical Bias, Strategic Bias, Combined Stance với hard gate
 
-**3 Panel:**
-- Panel 1: Shape Dashboard (tổng quan YC)
-- Panel 2: Grid (bảng lưới theo kỳ hạn)
-- Panel 3: Diagnostics + Research (thống kê học thuật)
+**4 Panel:**
+- Panel 1: Macro + Dual Horizon (tổng quan)
+- Panel 2: Tactical 1W Validation
+- Panel 3: Strategic 4W Validation
+- Panel 4: Horizon + Power Diagnostics
 
 **Sử dụng khi:**
-- Bạn là bond trader hoặc quan tâm đến thị trường trái phiếu
-- Bạn muốn dự báo rủi ro hệ thống từ YC inversion
-- Bạn cần nghiên cứu mối quan hệ bond → equity
+- Bạn cần theo dõi trạng thái đường cong lợi suất VN
+- Bạn muốn kiểm định outcome VNINDEX theo regime (1W / 4W)
+- Bạn cần risk-context dashboard cho quyết định đầu tư
 
 **File chính:**
-- `VN_YieldCurveLab_v1.8.3.pine`
+- `VN_YieldCurveLab_v2.3.0.pine`
 
 📖 **Xem chi tiết:** [README YieldCurveLab](./04_YieldCurveLab/)
 
@@ -254,7 +258,7 @@ Phiên bản: v6.0.1 | Tác giả: MacroAcademic Team
 |----------|------------------------|----------------------|------------------------|------------------|----------------------|
 | **Phạm vi** | Kinh tế vĩ mô | Cảnh báo vĩ mô | Mapping vĩ mô → CK | Trái phiếu VN | Truyền dẫn nước ngoài |
 | **Input chính** | CPI, GDP, Rates, FX, Oil | Macro + Indices + Sectors | Macro + 6 indices + 11 sectors | 1Y-10Y yields | Global bonds + FX |
-| **Output** | Risk Score (0-100) | 4 Panel cảnh báo | AvgR, Win%, DD by bucket | Stress, Correlation | Impact Score, R² |
+| **Output** | Risk Score (0-100) | 4 Panel cảnh báo | AvgR, Win%, DD by bucket | Curve Stress, Tactical/Strategic Bias | Impact Score, R² |
 | **Số panel** | 7 | 4 | 1 | 3 | 6 |
 | **User case** | Asset allocation | Cảnh báo rủi ro | Chọn indices/sectors | Bond trading | Bond timing |
 | **Độ phức tạp** | Trung bình - Cao | Trung bình | Trung bình | Cao (Academic) | Cao (Academic) |
@@ -334,7 +338,7 @@ Tất cả các dự án đều được xây dựng với các chuẩn mực h�
 - **01_MacroAcademic_Engine:** v2.1 (Interpretation Upgrade)
 - **02_Macro_Alert_System:** v5.0.1 (Validated Regime Engine)
 - **03_Indices_Research_Map:** v2.0.1 (Clean Fixed Build)
-- **04_YieldCurveLab:** v1.8.3 (Daily Dashboard + Split Research)
+- **04_YieldCurveLab:** v2.3.0 (Horizon Separation & Sample Power)
 - **05_Bond_Transmission_Monitor:** v6.0.1 (Interpretation Upgrade)
 
 ---

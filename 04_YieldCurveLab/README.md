@@ -1,239 +1,535 @@
-# VN YieldCurveLab — README (v1.8.3)
+# VN YieldCurveLab v2.3.0
 
-## 1) Mục tiêu & phạm vi
+**Horizon Separation & Sample Power**
 
-**VN YieldCurveLab** là một dashboard nghiên cứu đường cong lợi suất Việt Nam (1Y/2Y/3Y/5Y/7Y/10Y) + **Interbank (VNINBR)** + **Policy rate (VNINTR)**, tập trung 3 lớp:
+VN YieldCurveLab là chỉ báo nghiên cứu vĩ mô trên TradingView, được thiết kế để theo dõi trạng thái đường cong lợi suất Việt Nam và kiểm định mối quan hệ giữa các regime lãi suất với outcome của VNINDEX.
 
-1. **Shape/Regime**: Level–Slope–Curve và phân loại chế độ YC (YC0…YC4)
-2. **Quality/Distortion**: đo “độ méo” theo dispersion của z-score các kỳ hạn → gán nhãn HIGHQ/MEDQ/LOWQ
-3. **Research vs VNINDEX** (Panel 3): tương quan/cov/beta giữa **Stress** (raw/adjusted) và **log-return VNINDEX**, có:
+Phiên bản **v2.3.0** là bản tái thiết kế hoàn chỉnh theo hướng:
 
-* **EffN (effective sample)**: kiểm soát độ đủ mẫu
-* **Regime filter**: nghiên cứu theo chế độ (YC4/INVERTED/Stress High…)
-* **BestLag (3 lags)** + **Lag Stability**: kiểm tra độ ổn định của “lag tốt nhất”
+- tách **Macro State** khỏi **Predictive Evidence**;
+- tách riêng horizon **Tactical 1W** và **Strategic 4W**;
+- sử dụng outcome không chồng lấn;
+- kiểm định Development/Validation;
+- lấy mẫu theo episode để hạn chế pseudo-replication;
+- chỉ phát directional bias khi toàn bộ hard gate được vượt qua.
 
-> Script được thiết kế cho **Daily (1D)**: dữ liệu đều được `request.security(..., "D", ...)` để giảm nhiễu và đồng nhất.
+> **Trạng thái phát hành:** Research Release Candidate / Production Monitoring Ready  
+> **Không phải:** hệ thống giao dịch tự động, mô hình nhân quả hoặc cam kết dự báo VNINDEX。
 
 ---
 
-## 2) Cấu trúc Panel
+## 1. Mục tiêu
 
-### Panel 1 — Shape Dashboard
+VN YieldCurveLab trả lời bốn câu hỏi riêng biệt:
+
+1. Đường cong lợi suất Việt Nam hiện đang ở trạng thái nào?
+2. Mức độ stress hiện tại cao hay thấp so với lịch sử?
+3. Sau các regime tương tự, VNINDEX từng phản ứng thế nào ở horizon 1 tuần và 4 tuần?
+4. Bằng chứng hiện tại có đủ mạnh để hình thành Tactical Bias hoặc Strategic bias hay không?
+
+Chỉ báo chủ động cho phép kết quả:
+
+```text
+NO SIGNAL
+NEUTRAL
+INCONCLUSIVE
+EPISODE N LOW
+```
+
+Đây không phải lỗi. Đó là output hợp lệ khi dữ liệu chưa đủ để chứng minh directional edge.
+
+---
+
+## 2. Thành phần dữ liệu
+
+### Yield curve
+
+| Kỳ hạn | TradingView symbol |
+|---|---|
+| 1Y | `TVC:VN01Y` |
+| 2Y | `TVC:VN02Y` |
+| 3Y | `TVC:VN03Y` |
+| 5Y | `TVC:VN05Y` |
+| 7Y | `TVC:VN07Y` |
+| 10Y | `TVC:VN10Y` |
+
+### Thanh khoản và chính sách
+
+| Biến | Symbol |
+|---|---|
+| Interbank rate | `VNINBR` |
+| Policy rate | `VNINTR` |
+
+### Equity outcome
+
+| Biến | Symbol |
+|---|---|
+| VNINDEX | `HOSE:VNINDEX` |
+
+VNINDEX được request trực tiếp bên trong script. Model không phụ thuộc vào metadata ticker của chart hiện tại.
+
+---
+
+## 3. Macro State Engine
+
+### Level
+
+```text
+Level = (2Y + 5Y + 10Y) / 3
+```
+
+Đại diện cho mặt bằng lợi suất chung.
+
+### Slope
+
+```text
+Slope = 10Y − 2Y
+```
+
+Đại diện cho độ dốc của đường cong.
+
+### Curvature
+
+```text
+Curvature = 2 × 5Y − 2Y − 10Y
+```
+
+Đại diện cho hình dạng phần giữa đường cong.
+
+### Curve Stress
+
+```text
+Curve Stress =
+0.45 × Level Rank
++ 0.45 × Slope Risk
++ 0.10 × Curvature Risk
+```
+
+Các thành phần được chuẩn hóa bằng rolling percentile.
+
+> Percentile chỉ là rolling rank normalization, không đồng nghĩa chuỗi đã trở nên stationary.
+
+---
+
+## 4. Yield-Curve Regime
+
+| Regime | Diễn giải |
+|---|---|
+| `YC0` | Neutral / Mixed |
+| `YC1` | Easing mature |
+| `YC2` | Early easing |
+| `YC3` | Late tightening |
+| `YC4` | High level + non-steep / inverted |
+
+Ví dụ:
+
+```text
+Level HIGH
+Slope LOW_SLOPE
+→ YC4
+```
+
+YC4 thể hiện mặt bằng lợi suất cao trong khi đường cong không còn đủ dốc để được xem là trạng thái thuận lợi.
+
+---
+
+## 5. Data Quality
+
+V2.3 tách chất lượng dữ liệu khỏi tín hiệu kinh tế.
+
+Quality không còn được nhân trực tiếp vào Curve Stress.
+
+Bảng coverage gồm:
+
+```text
+C / V / F / L
+```
+
+Trong đó:
+
+- `C`: Core curve coverage — 2Y, 5Y, 10Y;
+- `V`: VNINDEX coverage;
+- `F`: Full curve coverage — 1Y đến 10Y;
+- `L`: Liquidity coverage — interbank và policy rate.
+
+Model readiness chủ yếu dựa trên core curve, VNINDEX và freshness. Liquidity coverage thấp sẽ được công khai nhưng không tự động xóa bỏ tín hiệu curve.
+
+---
+
+## 6. Horizon Separation
+
+### Tactical Model — 1W
+
+Mục tiêu:
+
+- đo phản ứng ngắn hạn;
+- nhận diện relief rally;
+- kiểm tra phản ứng sau regime transition;
+- hỗ trợ Tactical Bias.
+
+Outcome:
+
+```text
+VNINDEX close tuần t+1 / close tuần t
+```
+
+Mẫu tuần không chồng lấn.
+
+### Strategic Model — 4W
+
+Mục tiêu:
+
+- đo lực cản định giá;
+- kiểm tra truyền dẫn vĩ mô chậm hơn;
+- hỗ trợ Strategic Bias.
+
+Outcome:
+
+```text
+VNINDEX close tuần t+4 / close tuần t
+```
+
+Strategic engine dùng cooldown 4 tuần để hạn chế outcome overlap.
+
+---
+
+## 7. Adaptive Sample Power
+
+V2.3 tự động chọn chế độ sample:
+
+```text
+STANDARD POWER
+52 tuần Development
+52 tuần Validation
+```
+
+Khi lịch sử đủ dài:
+
+```text
+HIGH POWER
+104 tuần Development
+104 tuần Validation
+```
+
+Sample Power trả lời:
+
+> Tổng chiều dài lịch sử có đủ hay không?
+
+Nó không trả lời:
+
+> Có đủ episode độc lập trong regime hiện tại hay không?
+
+Vì vậy hoàn toàn có thể xuất hiện:
+
+```text
+POWER HIGH
+READINESS 100
+PREDICTIVE EVIDENCE 0
+EPISODE N LOW
+```
+
+Đây là kết quả hợp lệ.
+
+---
+
+## 8. Episode-Aware Sampling
+
+Các tuần nằm liên tiếp trong cùng một regime không được xem là các episode hoàn toàn độc lập.
+
+Ví dụ:
+
+```text
+Stress HIGH kéo dài 12 tuần
+```
+
+Weekly descriptive có thể chứa 12 outcome, nhưng episode engine chỉ coi đây là một episode HIGH.
+
+V2.3 sử dụng:
+
+- regime-entry sampling;
+- Tactical cooldown 1 tuần;
+- Strategic cooldown 4 tuần;
+- state và complement dùng chung cooldown clock.
+
+Mục tiêu là hạn chế pseudo-replication do regime persistence.
+
+---
+
+## 9. Development và Validation
+
+Mỗi horizon được chia thành:
+
+```text
+Development sample
+Validation sample
+```
+
+Directional evidence chỉ được công nhận khi:
+
+1. Development và Validation cùng dấu;
+2. effect vượt minimum economic threshold;
+3. Validation có đủ episode;
+4. `|Welch t-stat| ≥ 1.96`;
+5. CI 95% của state-minus-complement không chứa 0;
+6. downside evidence nhất quán;
+7. dữ liệu đạt gate;
+8. daily bar đã được xác nhận.
+
+Nếu Development và Validation trái dấu:
+
+```text
+DIRECTION UNSTABLE
+```
+
+và directional decision bị khóa.
+
+---
+
+## 10. Readiness và Predictive Evidence
+
+### Model Readiness
+
+Đánh giá:
+
+- data coverage;
+- history length;
+- freshness;
+- engine availability;
+- sample power.
+
+### Predictive Evidence
+
+đánh giá:
+
+- episode sample adequacy;
+- effect size;
+- sign consistency;
+- Welch t-stat;
+- confidence interval;
+- downside consistency.
+
+> Predictive Evidence không phải xác suất mô hình đúng.
+
+---
+
+## 11. Decision Engine
+
+### Tactical Bias
+
+Dựa trên validated Tactical 1W model.
+
+Các trạng thái có thể gồm:
+
+```text
+DEFENSIVE
+CAUTIOUS
+NEUTRAL
+CONSTRUCTIVE
+NO SIGNAL
+```
+
+### Strategic Bias
+
+Dựa trên validated Strategic 4W model.
+
+### Combined Stance
+
+Strategic bias có quyền ưu tiên. Khi hai horizon đối nghịch:
+
+```text
+MIXED
+```
+
+Model không ép hai horizon thành một tín hiệu duy nhất.
+
+---
+
+## 12. Các panel
+
+### Panel 1 — Macro + Dual Horizon
 
 Hiển thị:
 
-* **LEVEL** = (2Y + 5Y + 10Y) / 3
-* **SLOPE** = 10Y − 2Y
-* **CURVE** = 2·5Y − 2Y − 10Y
-* **YC Regime**: YC1…YC4 dựa trên percentile của Level và trạng thái Slope
-* **STRESS**: chỉ số 0–100 (raw) và **Stress_ADJ** (điều chỉnh theo quality)
-* **QUALITY**: HIGHQ/MEDQ/LOWQ + **MOVE FOCUS** (short/belly/long)
+- Level, Slope, Curvature;
+- YC Regime;
+- Curve Stress;
+- Liquidity Gap;
+- Data Quality;
+- Sample Power;
+- Tactical Evidence;
+- Strategic Evidence;
+- Combined Stance.
 
-### Panel 2 — Grid
+### Panel 2 — Tactical 1W Validation
 
-Bảng lưới theo kỳ hạn:
+Hiển thị:
 
-* **Z STATE**: CHEAP/FAIR/RICH (z-score robust)
-* **MOVE**: UP/DN theo chênh lệch `len_change` ngày
-* **STRUCT/QUAL/FOCUS**
+- Development episode N;
+- Validation episode N;
+- State mean;
+- Complement mean;
+- Difference;
+- Hit-down difference;
+- Welch t-stat;
+- CI 95%;
+- hard gate;
+- Tactical Bias.
 
-### Panel 3 — Diagnostics + Research
+### Panel 3 — Strategic 4W Validation
 
-* Diagnostic: stress, momentum, z-score
-* Research (ALL / OKQ / FILTER):
+Tương tự Panel 2 nhưng dành cho horizon 4 tuần.
 
-  * **Corr** (t0) raw/adj
-  * **Beta** (OLS slope x→y)
-  * **R2**
-  * **BestLag** trong {lag1, lag2, lag3}
-  * **EffN** và **Ratio** (độ đủ mẫu)
-  * **Lag Stability** (% ổn định bestlag trong `len_lag_stab` ngày)
+### Panel 4 — Horizon + Power Diagnostics
 
----
+Hiển thị:
 
-## 3) Ý nghĩa các khối chính
-
-### 3.1 Robust Z-score (winsorized)
-
-Dùng mean/std + clip outliers để giảm ảnh hưởng điểm cực trị:
-
-* Phù hợp khi dữ liệu yield có “spike” do lỗi/đứt chuỗi.
-
-### 3.2 Percentile rank
-
-Dùng `ta.percentrank` để định nghĩa LOW/MID/HIGH cho Level/Slope/Curve.
-Ưu điểm: **phi tham số** (không giả định phân phối chuẩn).
-
-### 3.3 Quality/Distortion
-
-* Tính z-score cho 6 kỳ hạn → lấy **độ phân tán** quanh mean z-score
-* Distortion cao → **LOWQ**: đường cong “méo” hoặc dữ liệu nhiễu/không đồng bộ
-* **Stress_ADJ = Stress * (Quality/100)** nhằm “trừ điểm” cho giai đoạn dữ liệu kém.
-
-### 3.4 Research vs VNINDEX
-
-* VNINDEX return: **log return** `log(close/close[1])`
-* Có tùy chọn **winsorize return** (clip theo stdev) để giảm outlier.
-* Tính:
-
-  * `corr = correlation(stress, return, len_research)`
-  * `beta = cov(stress, return)/var(stress)`
-  * `r2 = corr^2`
-* 3 chế độ:
-
-  * **ALL**: toàn bộ mẫu hợp lệ
-  * **OKQ**: chỉ tính khi quality != LOWQ
-  * **FILTER**: chỉ tính khi thỏa `reg_filter`
+- LOW / MID / HIGH theo hai horizon;
+- episode N;
+- descriptive sample;
+- sample-power mode;
+- data coverage;
+- structure diagnostics.
 
 ---
 
-## 4) Cách sử dụng nhanh (Workflow)
+## 13. Cách cài đặt
 
-1. Mở chart bất kỳ, **khuyến nghị timeframe = 1D**
-2. Add indicator → chọn Panel:
+1. Mở TradingView.
+2. Mở **Pine Editor**.
+3. Tạo indicator mới.
+4. Xóa code mặc định.
+5. Paste toàn bộ file `VN_YieldCurveLab_v2.3.0.pine`.
+6. Nhấn **Save**.
+7. Nhấn **Add to chart**.
+8. Chạy trên chart `1D`.
 
-   * Panel 1 để đọc regime nhanh
-   * Panel 2 để xem “độ đắt/rẻ” theo kỳ hạn
-   * Panel 3 để xem nghiên cứu/độ đủ mẫu
-3. Nếu Panel 3 báo **VNINDEX ticker invalid/NA**:
-
-   * đổi `VNINDEX (research)` thành đúng mã bạn dùng (thường: `HOSE:VNINDEX`)
-4. Bật/tắt:
-
-   * `Show Stress overlay`
-   * `Show Stress_ADJ overlay`
-   * `Event Tags` (nhãn biến cố)
+Model request VNINDEX trực tiếp, nhưng timeframe chart vẫn phải là `1D` để bảo đảm rolling daily statistics và sampling clock vận hành đúng.
 
 ---
 
-## 5) “Academic Guideline” — Hướng dẫn học thuật & diễn giải
+## 14. Cách đọc nhanh
 
-### A) Nguyên tắc 1: Không kết luận khi LOWQ
+### Trường hợp 1
 
-* Nếu **quality_label = LOWQ**, coi đó là **giai đoạn nhiễu**:
+```text
+Curve Stress HIGH
+Tactical NEUTRAL
+Strategic CAUTIOUS
+```
 
-  * Stress raw có thể “đúng số” nhưng **không đáng tin để diễn giải cấu trúc**
-  * Ưu tiên dùng **Stress_ADJ**, hoặc chuyển sang **OKQ research**
+Diễn giải:
 
-### B) Nguyên tắc 2: EffN ≥ ngưỡng trước khi tin Corr/Beta
+> Stress vĩ mô cao, chưa có edge ngắn hạn rõ ràng, nhưng horizon 4 tuần có dấu hiệu bất lợi đã được xác nhận.
 
-* **EffN** là số quan sát hợp lệ trong cửa sổ `len_research`
-* Dùng `min_eff_ratio` (mặc định 70%) để tránh “ảo giác thống kê” do thiếu dữ liệu.
-* Nếu **READY = WAIT/LOW N** → chỉ xem như tín hiệu tham khảo.
+### Trường hợp 2
 
-### C) Nguyên tắc 3: Corr ≠ Causality
+```text
+Readiness 100
+Evidence 0
+Episode N Low
+```
 
-* Correlation chỉ là đồng biến/ nghịch biến, không khẳng định nguyên nhân.
-* Với macro: có thể xảy ra **đảo chiều quan hệ** theo chu kỳ (regime dependence).
+Diễn giải:
 
-### D) Nguyên tắc 4: Multiple-testing risk (BestLag)
+> Engine có đủ dữ liệu tổng thể để vận hành, nhưng số episode độc lập trong regime hiện tại chưa đủ để kết luận.
 
-* Chọn BestLag trong 3 lag là một dạng “tối ưu hoá” → tăng rủi ro overfit.
-* Vì vậy script thêm:
+### Trường hợp 3
 
-  * **Lag Stability**: nếu stability thấp, bestlag chỉ là nhiễu.
-* Quy tắc dùng:
+```text
+Macro Stress HIGH
+Combined Stance NEUTRAL
+```
 
-  * BestLag **chỉ đáng xem** khi:
+Diễn giải:
 
-    * READY = true
-    * |bestCorr| đủ lớn (tự đặt chuẩn)
-    * Lag Stability cao (ví dụ >60–70%)
+> Trạng thái vĩ mô căng, nhưng outcome validation chưa đủ mạnh để phát directional bias.
 
-### E) Nguyên tắc 5: Regime-conditioned inference
-
-* Macro thường **phi tuyến**: quan hệ stress→equity khác nhau giữa YC4 vs YC1.
-* Khuyến nghị:
-
-  * So sánh **ALL vs FILTER(YC4)**, **ALL vs FILTER(STRESS_HIGH)**
-  * Nếu dấu corr đổi khi đổi regime → đó là dấu hiệu **regime dependence** (quan trọng hơn một con số corr tổng).
-
-### F) Nguyên tắc 6: Robustness checklist (tối thiểu)
-
-Khi bạn thấy một kết luận “có vẻ đúng”, hãy check:
-
-1. Có LOWQ không?
-2. EffN đủ không?
-3. Corr/beta có ổn định qua thời gian không? (đổi `len_research`)
-4. Kết quả có giữ được trong OKQ không?
-5. Có bị “ăn may” do lag search không? (Lag Stability)
+`NEUTRAL` không có nghĩa macro trung tính.
 
 ---
 
-## 6) Giải thích nhãn YC Regime (gợi ý diễn giải)
+## 15. Alert
 
-* **YC4**: “Tight” (level cao + slope phẳng/đảo) → thường rủi ro chu kỳ cao hơn
-* **YC3**: “Late tightening” (level cao + slope dốc)
-* **YC2**: “Early easing” (level thấp + slope dốc)
-* **YC1**: “Easing mature” (level thấp)
-* **YC0**: trung tính / mixed
+Alert chỉ nên được sử dụng trên bar ngày đã xác nhận.
 
-> Đây là heuristic theo phân phối (percentile), không phải mô hình kinh tế cấu trúc.
+Các alert định hướng chỉ được phép phát sau khi:
 
----
+- hard gate vượt qua;
+- bias thay đổi;
+- daily bar đóng.
 
-## 7) Tham số quan trọng nên chỉnh
-
-* `len_stats` (robust stats): 120–252 ngày tuỳ “chu kỳ” bạn muốn
-* `len_research`: 120–250 ngày để nghiên cứu tương quan
-* `min_eff_ratio`: 0.7–0.9 nếu bạn muốn nghiêm ngặt hơn
-* `lag1/lag2/lag3`: nên đại diện **ngắn / trung / dài** (1,5,20) là hợp lý
-* `len_lag_stab`: 60–120 ngày để đánh giá ổn định bestlag
-* `reg_filter`: dùng để test “regime dependence”
+Không sử dụng provisional intraday state như tín hiệu xác nhận.
 
 ---
 
-## 8) Giới hạn & lưu ý của TradingView/Pine
+## 16. Hạn chế
 
-* Pine không thuận tiện cho kiểm định thống kê nâng cao (p-value, HAC, bootstrap) với hiệu năng tốt.
-* `request.security` nhiều series + bảng + labels có thể nặng. Nếu lag/đơ:
+V2.3 không phải:
 
-  * tắt `Event Tags`
-  * tắt `Panel 2/3: show yield time-series`
-  * giảm `max_labels_count` (nếu bạn custom)
-* Dữ liệu TVC/tickers có thể đổi chuẩn; script đã có cảnh báo VNINDEX NA.
+- causal model;
+- machine-learning model;
+- hệ thống trading tự động;
+- công cụ position sizing;
+- cam kết dự báo VNINDEX;
+- bằng chứng rằng yield curve luôn dẫn dắt thị trường cổ phiếu.
 
----
+Các hạn chế chính:
 
-## 9) Changelog tóm tắt (v1.8.3)
-
-**v1.8.3 — Daily Dashboard + Split Research**
-* Tách dashboard hằng ngày và khối research chuyên sâu
-* Cải tiến hiển thị và chẩn đoán đường cong lợi suất
-
-* Fix các lỗi phổ biến: “end of line without line continuation”, type `na` trong function, label API
-* Thêm **Stress_ADJ**
-* Research: **EffN**, **Regime filter**, **BestLag**, **Lag Stability**, màu nền Corr theo strength
-* Không dùng `ta.covariance` (đã tự viết cov/var TV-safe)
+- số episode độc lập có thể rất thấp;
+- dữ liệu yield Việt Nam trên TradingView có độ dài hữu hạn;
+- liquidity coverage có thể thưa;
+- regime persistence làm effective sample nhỏ hơn weekly N;
+- statistical edge có thể thay đổi theo chu kỳ;
+- một kết quả validated trong sample hiện tại vẫn có thể suy yếu về sau.
 
 ---
 
-## 10) Đánh giá “đã tạm ổn chưa?”
+## 17. Nguyên tắc sử dụng
 
-Theo tiêu chí học thuật thực dụng trong TradingView: **đã đạt mức có thể “tạm dừng”** để sử dụng nghiên cứu/quan sát một thời gian, vì:
+VN YieldCurveLab nên được dùng như:
 
-* Có robust + percentile (phi tham số)
-* Có quality gating
-* Có EffN (sample adequacy)
-* Có kiểm soát overfit thô (bestlag + stability)
-* Có regime-conditioned analysis
+```text
+Macro monitoring
+Regime classification
+Risk-context dashboard
+Validated decision support
+```
 
-**Nâng cấp tiếp theo chỉ nên làm khi bạn đã “quan sát live” 2–4 tuần** và ghi lại: khi nào sai, sai vì ticker/quality/regime, hay do định nghĩa stress.
+Không nên dùng như:
 
----
-
-# Research Interpretation Guide (ngắn gọn để dùng hàng ngày)
-
-1. **Xem Panel 1**: YC regime + Stress (raw/adj) + Quality
-2. Nếu **LOWQ** → tránh kết luận; ưu tiên Stress_ADJ và OKQ research
-3. **Panel 3**:
-
-   * READY? EffN đủ?
-   * Corr dấu gì? mạnh không?
-   * BestLag có ổn định không?
-4. Bật `reg_filter` (YC4 hoặc STRESS_HIGH) để xem quan hệ có “đổi chế độ” không
-5. Nếu kết quả chỉ đúng ở 1 filter và lag stability thấp → coi là **nhiễu/overfit**
+```text
+Standalone buy/sell signal
+Guaranteed market forecast
+Replacement for portfolio risk management
+```
 
 ---
 
+## 18. Trạng thái phát hành
 
+| Hạng mục | Trạng thái |
+|---|---|
+| Pine compile/runtime | PASS |
+| Host-independent VNINDEX source | PASS |
+| Macro State Engine | PASS |
+| Data Quality gating | PASS |
+| Tactical 1W separation | PASS |
+| Strategic 4W separation | PASS |
+| Non-overlap control | PASS |
+| Episode-aware sampling | PASS |
+| Development/Validation | PASS |
+| Adaptive Sample Power | PASS |
+| Readiness/Evidence separation | PASS |
+| Predictive edge | Chưa mặc định được xác nhận |
+
+### Định vị chính thức
+
+> **VN YieldCurveLab v2.3.0 là hệ thống theo dõi trạng thái đường cong lợi suất và kiểm định outcome VNINDEX theo hai horizon, sử dụng episode-aware sampling, Development/Validation và hard decision gates.**
+
+---
+
+## 19. Disclaimer
+
+Chỉ báo được cung cấp cho mục đích nghiên cứu và hỗ trợ quyết định.
+
+Không phải khuyến nghị mua, bán hoặc nắm giữ bất kỳ tài sản nào. Kết quả lịch sử không bảo đảm kết quả tương lai. Người sử dụng chịu trách nhiệm đối với mọi quyết định đầu tư dựa trên dữ liệu, mô hình hoặc diễn giải từ chỉ báo này.
