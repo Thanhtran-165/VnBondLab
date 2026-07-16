@@ -1,0 +1,19 @@
+Macro Alert System v7.0.0 — Academic Robustness
+Status: ACCEPTED (Static Validation) — pending TradingView compile
+Date: 2026-07-16
+
+Files:
+- Macro_Alert_System_v7.0.0.pine
+- README.md (Review & Academic Methodology)
+
+SHA-256 (Pine Script):
+02906eab87a457d675b7e87cb21f75eca7dc4d133d44a76d7e3624940f934918
+
+Static validation (1.509 dòng Pine v6):
+- Parens/brackets/braces balance: PASS
+- User-defined function arity: PASS
+- No dead variables/configs: PASS
+- Fixed table dimensions: PASS
+- Drawdown clamp (no positive drawdown): PASS
+- lookahead_off on all requests: PASS
+- Invalid-symbol returns NA: PASS

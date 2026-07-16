@@ -1,6 +1,6 @@
 //@version=6
-indicator("Macro Alert System v6.0.1 — Academic Calibration Patch",
-     shorttitle="MacroAcademic v6.0.1",
+indicator("Macro Alert System v7.0.0 — Academic Robustness",
+     shorttitle="MacroAcademic v7.0.0",
      overlay=false,
      max_labels_count=200,
      max_lines_count=200,
@@ -8,38 +8,33 @@ indicator("Macro Alert System v6.0.1 — Academic Calibration Patch",
      dynamic_requests=false)
 
 // =====================================================================
-// v6.0.1 ACADEMIC CALIBRATION PATCH
+// v7.0.0 ACADEMIC ROBUSTNESS UPGRADE
 // ---------------------------------------------------------------------
-// Calibration changes over v6.0.0
-// A) Evidence grades require interval exclusion plus directionally stable
-//    pre/post evidence. C+ is reserved for stable directional evidence
-//    that remains statistically inconclusive.
-// B) Structural confidence is capped when cross-layer concordance is low.
-// C) Sector labels separate confirmed, provisional, and rank-only status.
-// D) Regime and policy-space language is descriptive rather than a causal
-//    policy forecast or an unvalidated cycle-stage assertion.
-// E) Plot values are removed from the status line to suppress inactive
-//    panel placeholders while remaining visible in pane/scale/Data Window.
+// Major methodological changes over v6.0.1
+// A) Composite regimes are calibrated on the empirical distribution of the
+//    latent multi-layer score. This avoids treating a weighted average of
+//    component percentiles as if it were itself uniformly distributed.
+// B) Current data quality includes source freshness. Historical evidence is
+//    graded with the average quality observed AT SIGNAL ENTRY, not with the
+//    quality of today's data.
+// C) Predictive evidence reports Welch-Satterthwaite degrees of freedom and
+//    Hedges' g, applies a three-horizon family-wise error guard, and requires
+//    an economically material effect before assigning a high grade.
+// D) Structural stability checks both pre/post direction and an approximate
+//    break statistic. Stable sign with a statistically large shift is labeled
+//    SHIFT rather than stable evidence.
+// E) Five staggered non-overlapping phase cohorts provide a phase-sensitivity
+//    diagnostic. Phase agreement is a robustness requirement, not an extra
+//    source of independent observations.
+// F) Model reliability includes cross-layer concordance, state persistence,
+//    data quality, and specification robustness versus an equal-weight model.
+//    It is explicitly a heuristic reliability score, not a probability.
+// G) Horizon drawdowns are clamped at zero by definition; a path with no loss
+//    can no longer produce a positive "drawdown".
 // ---------------------------------------------------------------------
-// Design principles
-// 1) Separate signal level, signal strength, data quality, structural
-//    confidence, and predictive evidence. No component is called
-//    "confidence" merely because it is extreme.
-// 2) Missing-aware layer aggregation. The model never silently replaces
-//    missing macro data with a neutral regime.
-// 3) Non-overlapping forward windows for approximate independence.
-// 4) Exact horizon drawdowns: 5D uses 6 bars, 20D uses 21 bars,
-//    and 60D uses 61 bars, including entry and evaluation dates.
-// 5) Current-regime evidence is compared with all OTHER regimes, not with
-//    an unconditional mean that mechanically contains the current regime.
-// 6) Sample variance, standard error, approximate Welch statistic,
-//    confidence interval, and pre/post-2020 structural split.
-// 7) Sector rankings use reliability shrinkage plus a Bonferroni-style
-//    family-wise uncertainty guard instead of raw means alone.
-// 8) Transition probabilities use Jeffreys smoothing and correct economic
-//    direction labels: lower risk = improve; higher risk = worsen.
-// ---------------------------------------------------------------------
-// Statistical outputs are descriptive evidence, not causal estimates.
+// Statistical outputs remain descriptive associations, not causal estimates
+// or policy forecasts. All forward evidence is conditioned on information
+// available at the entry observation and uses lookahead_off requests.
 // =====================================================================
 
 // =====================
@@ -65,26 +60,39 @@ int PCTL_LB       = 504
 int P_STRESS_HI   = 85
 int P_LOW_BAD     = 15
 int IMPULSE_H     = 20
-int PERSIST_H     = 5
 int MIN_COMPONENT = 4
 int MIN_LAYER     = 2
 
-bool USE_LOG_RET    = true
-bool USE_NONOVERLAP = true
 int H1 = 5
 int H2 = 20
 int H3 = 60
+int PHASES = 5
+bool USE_LOG_RET = true
 
 int MIN_N_SHOW = 12
 int MIN_N_OK   = 30
 int MIN_N_RANK = 12
 float SHRINK_K = 20.0
-float Z95      = 1.96
-float Z90      = 1.645
-float Z_SECTOR = 2.61  // Bonferroni-style 90% family-wise guard for 11 sectors.
+
+// Two-sided normal critical values. The horizon values use a Bonferroni
+// family-wise guard across the three displayed horizons.
+float Z95         = 1.96
+float Z_FWER95    = 2.394
+float Z_FWER90    = 2.128
+float Z_SECTOR    = 2.61  // 90% family-wise guard across 11 sectors.
+
+// Economic-materiality floors in log-return units.
+float MIN_EFFECT_5  = 0.005
+float MIN_EFFECT_20 = 0.010
+float MIN_EFFECT_60 = 0.020
 
 // Structural robustness split: pre-2020 vs 2020 onward.
 int STRUCTURAL_SPLIT_TS = timestamp("GMT+7", 2020, 1, 1, 0, 0)
+
+// Freshness tolerances. Scores decay linearly to zero at 3x the tolerance.
+float FRESH_FAST_DAYS   = 5.0
+float FRESH_POLICY_DAYS = 14.0
+float MS_PER_DAY        = 86400000.0
 
 // Data-error guard only. It rejects impossible/corrupted index observations;
 // it is not intended as economic winsorization.
@@ -140,6 +148,23 @@ f_wavg3(float a, float wa, float b, float wb, float c, float wc) =>
         w += wc
     w > 0 ? s / w : na
 
+f_wavg4(float a, float wa, float b, float wb, float c, float wc, float d, float wd) =>
+    float s = 0.0
+    float w = 0.0
+    if not na(a)
+        s += a * wa
+        w += wa
+    if not na(b)
+        s += b * wb
+        w += wb
+    if not na(c)
+        s += c * wc
+        w += wc
+    if not na(d)
+        s += d * wd
+        w += wd
+    w > 0 ? s / w : na
+
 f_count3(float a, float b, float c) =>
     float n = 0.0
     n += not na(a) ? 1.0 : 0.0
@@ -159,6 +184,28 @@ f_count6(float a, float b, float c, float d, float e, float f) =>
 
 f_last_completed(float srcCur, float srcPrev) =>
     timeframe.isintraday ? srcPrev : (barstate.isconfirmed ? srcCur : srcPrev)
+
+f_last_completed_int(int srcCur, int srcPrev) =>
+    timeframe.isintraday ? srcPrev : (barstate.isconfirmed ? srcCur : srcPrev)
+
+f_freshness_score(int sourceTime, float maxAgeDays) =>
+    float out = na
+    if not na(sourceTime)
+        float ageDays = math.max(0.0, (float(time) - float(sourceTime)) / MS_PER_DAY)
+        out := f_clamp100(150.0 - 50.0 * ageDays / maxAgeDays)
+    out
+
+// Five evenly spaced phase cohorts. Each cohort is internally non-overlapping.
+// Cohorts are used as a sensitivity diagnostic; they are not pooled as if
+// independent. Returns -1 on observations outside the five selected phases.
+f_phase_slot(int moduloValue, int horizon) =>
+    int step = int(horizon / PHASES)
+    int slot = -1
+    if step > 0 and moduloValue % step == 0
+        int candidate = int(moduloValue / step)
+        if candidate >= 0 and candidate < PHASES
+            slot := candidate
+    slot
 
 f_return(float currentValue, float entryValue) =>
     float out = na
@@ -197,6 +244,11 @@ f_update_stats(float[] sumArr, float[] sumSqArr, float[] cntArr, float[] winArr,
         if ret > 0
             array.set(winArr, idx, array.get(winArr, idx) + 1.0)
 
+f_update_quality(float[] qSumArr, float[] qCntArr, int idx, float q, float ret) =>
+    if not na(ret) and not na(q)
+        array.set(qSumArr, idx, array.get(qSumArr, idx) + q)
+        array.set(qCntArr, idx, array.get(qCntArr, idx) + 1.0)
+
 f_update_sum_sq_n(float[] sumArr, float[] sumSqArr, float[] cntArr, int idx, float x) =>
     if not na(x)
         array.set(sumArr,   idx, array.get(sumArr, idx)   + x)
@@ -208,7 +260,19 @@ f_update_dd(float[] sumArr, float[] cntArr, int idx, float dd) =>
         array.set(sumArr, idx, array.get(sumArr, idx) + dd)
         array.set(cntArr, idx, array.get(cntArr, idx) + 1.0)
 
+// Cornish-Fisher expansion for a two-sided Student-t critical value.
+// This avoids using a normal critical value when Welch degrees of freedom are low.
+f_tcrit_approx(float z, float df) =>
+    float out = na
+    if not na(df) and df > 2
+        float invDf = 1.0 / df
+        out := z + (math.pow(z, 3) + z) * invDf / 4.0 +
+               (5.0 * math.pow(z, 5) + 16.0 * math.pow(z, 3) + 3.0 * z) * invDf * invDf / 96.0
+    out
+
 // Current regime vs all other regimes. The groups are disjoint.
+// Returns means, difference, Welch SE/t/df, Hedges' g, family-wise 95% bounds,
+// and the sample size of the complement group.
 f_effect_stats(float cSum, float cSq, float cN, float totalSum, float totalSq, float totalN) =>
     float oSum = totalSum - cSum
     float oSq  = totalSq  - cSq
@@ -218,41 +282,87 @@ f_effect_stats(float cSum, float cSq, float cN, float totalSum, float totalSq, f
     float cVar  = f_sample_var(cSum, cSq, cN)
     float oVar  = f_sample_var(oSum, oSq, oN)
     float diff  = not na(cMean) and not na(oMean) ? cMean - oMean : na
-    float se    = not na(cVar) and not na(oVar) and cN > 0 and oN > 0 ? math.sqrt(cVar / cN + oVar / oN) : na
+    float a     = not na(cVar) and cN > 0 ? cVar / cN : na
+    float b     = not na(oVar) and oN > 0 ? oVar / oN : na
+    float se    = not na(a) and not na(b) ? math.sqrt(a + b) : na
     float t     = not na(diff) and not na(se) and se > 0 ? diff / se : na
-    float lcb   = not na(diff) and not na(se) ? diff - Z95 * se : na
-    float ucb   = not na(diff) and not na(se) ? diff + Z95 * se : na
-    [cMean, oMean, diff, se, t, lcb, ucb, oN]
+    float dfDen = not na(a) and not na(b) and cN > 1 and oN > 1 ? a * a / (cN - 1.0) + b * b / (oN - 1.0) : na
+    float df    = not na(a) and not na(b) and not na(dfDen) and dfDen > 0 ? math.pow(a + b, 2) / dfDen : na
+    float pooledVar = not na(cVar) and not na(oVar) and cN > 1 and oN > 1 ? ((cN - 1.0) * cVar + (oN - 1.0) * oVar) / (cN + oN - 2.0) : na
+    float d = not na(diff) and not na(pooledVar) and pooledVar > 0 ? diff / math.sqrt(pooledVar) : na
+    float j = cN + oN > 3 ? 1.0 - 3.0 / (4.0 * (cN + oN) - 9.0) : na
+    float g = not na(d) and not na(j) ? d * j : na
+    float crit95 = f_tcrit_approx(Z_FWER95, df)
+    float lcb = not na(diff) and not na(se) and not na(crit95) ? diff - crit95 * se : na
+    float ucb = not na(diff) and not na(se) and not na(crit95) ? diff + crit95 * se : na
+    [cMean, oMean, diff, se, t, df, g, lcb, ucb, oN]
 
-f_split_label(float preEffect, float postEffect, float preN, float postN) =>
+f_split_label(float preEffect, float postEffect, float preSE, float postSE,
+              float preCN, float preON, float postCN, float postON) =>
     string out = "NA"
-    bool enough = not na(preEffect) and not na(postEffect) and preN >= MIN_N_SHOW and postN >= MIN_N_SHOW
+    bool enough = not na(preEffect) and not na(postEffect) and not na(preSE) and not na(postSE) and
+                  preCN >= MIN_N_SHOW and preON >= MIN_N_SHOW and postCN >= MIN_N_SHOW and postON >= MIN_N_SHOW
     if enough
-        out := preEffect > 0 and postEffect > 0 ? "STABLE+" :
-               preEffect < 0 and postEffect < 0 ? "STABLE-" : "MIXED"
+        bool samePos = preEffect > 0 and postEffect > 0
+        bool sameNeg = preEffect < 0 and postEffect < 0
+        float breakSE = math.sqrt(preSE * preSE + postSE * postSE)
+        float breakZ = breakSE > 0 ? math.abs(preEffect - postEffect) / breakSE : na
+        bool structuralShift = not na(breakZ) and breakZ > Z95
+        out := samePos ? (structuralShift ? "SHIFT+" : "STABLE+") :
+               sameNeg ? (structuralShift ? "SHIFT-" : "STABLE-") : "MIXED"
     out
 
-f_evidence_grade(float nC, float nO, float effect, float effectSE, string splitLabel, float dataQ) =>
-    string g = "D"
-    bool valid = not na(nC) and not na(nO) and not na(effect) and not na(effectSE) and effectSE > 0
+f_evidence_grade(float nC, float nO, float effect, float effectSE, float welchDF, float hedgesG,
+                 string splitLabel, float sampleQ, float phaseAgreement, float minAbsEffect) =>
+    string grade = "D"
+    bool valid = not na(nC) and not na(nO) and not na(effect) and not na(effectSE) and effectSE > 0 and not na(hedgesG)
     if valid and nC >= MIN_N_SHOW and nO >= MIN_N_SHOW
-        float tStat = effect / effectSE
-        float lcb95 = effect - Z95 * effectSE
-        float ucb95 = effect + Z95 * effectSE
-        float lcb90 = effect - Z90 * effectSE
-        float ucb90 = effect + Z90 * effectSE
-        bool ci95ExcludesZero = lcb95 > 0 or ucb95 < 0
-        bool ci90ExcludesZero = lcb90 > 0 or ucb90 < 0
+        float crit95 = f_tcrit_approx(Z_FWER95, welchDF)
+        float crit90 = f_tcrit_approx(Z_FWER90, welchDF)
+        float lcb95 = not na(crit95) ? effect - crit95 * effectSE : na
+        float ucb95 = not na(crit95) ? effect + crit95 * effectSE : na
+        float lcb90 = not na(crit90) ? effect - crit90 * effectSE : na
+        float ucb90 = not na(crit90) ? effect + crit90 * effectSE : na
+        bool ci95ExcludesZero = not na(lcb95) and not na(ucb95) and (lcb95 > 0 or ucb95 < 0)
+        bool ci90ExcludesZero = not na(lcb90) and not na(ucb90) and (lcb90 > 0 or ucb90 < 0)
         bool stableDirection = (effect > 0 and splitLabel == "STABLE+") or (effect < 0 and splitLabel == "STABLE-")
-        if nC >= 30 and nO >= 30 and dataQ >= 85 and stableDirection and ci95ExcludesZero
-            g := "A"
-        else if nC >= 20 and nO >= 20 and dataQ >= 70 and stableDirection and ci90ExcludesZero
-            g := "B"
-        else if dataQ >= 70 and stableDirection and math.abs(tStat) >= 0.75
-            g := "C+"
+        bool material = math.abs(effect) >= minAbsEffect and math.abs(hedgesG) >= 0.20
+        bool phaseStrong = not na(phaseAgreement) and phaseAgreement >= 75
+        bool phaseModerate = not na(phaseAgreement) and phaseAgreement >= 50
+        if nC >= 30 and nO >= 30 and sampleQ >= 85 and stableDirection and material and phaseStrong and ci95ExcludesZero
+            grade := "A"
+        else if nC >= 20 and nO >= 20 and sampleQ >= 70 and stableDirection and material and phaseStrong and ci90ExcludesZero
+            grade := "B"
+        else if sampleQ >= 70 and stableDirection and material and phaseModerate
+            grade := "C+"
         else
-            g := "C"
-    g
+            grade := "C"
+    grade
+
+// Share of valid phase cohorts whose effect direction agrees with the primary
+// phase. This is a sensitivity measure, not an inferential probability.
+f_phase_agreement(float[] phaseCSum, float[] phaseCCnt, float[] phaseUSum, float[] phaseUCnt,
+                  int horizonSlot, int bucketId, float referenceEffect) =>
+    float valid = 0.0
+    float agree = 0.0
+    if not na(referenceEffect)
+        // Phase 0 is the primary estimator and is excluded to avoid
+        // mechanically counting the reference estimate as agreement.
+        for p = 1 to PHASES - 1
+            int cIdx = p * 15 + horizonSlot * 5 + bucketId
+            int uIdx = p * 3 + horizonSlot
+            float cN = array.get(phaseCCnt, cIdx)
+            float totalN = array.get(phaseUCnt, uIdx)
+            float oN = totalN - cN
+            if cN >= MIN_N_SHOW and oN >= MIN_N_SHOW
+                float cMean = f_mean(array.get(phaseCSum, cIdx), cN)
+                float oMean = f_mean(array.get(phaseUSum, uIdx) - array.get(phaseCSum, cIdx), oN)
+                float effect = not na(cMean) and not na(oMean) ? cMean - oMean : na
+                if not na(effect) and effect != 0
+                    valid += 1.0
+                    bool sameSign = (referenceEffect > 0 and effect > 0) or (referenceEffect < 0 and effect < 0)
+                    agree += sameSign ? 1.0 : 0.0
+    valid >= 3 ? agree / valid * 100.0 : na
 
 f_grade_color(string grade) =>
     grade == "A" ? color.green :
@@ -324,6 +434,12 @@ f_fmt_n(float n) =>
 f_fmt_t(float t, float nC, float nO) =>
     not na(t) and nC >= MIN_N_SHOW and nO >= MIN_N_SHOW ? str.tostring(t, "#.##") : "--"
 
+f_fmt_g(float g, float nC, float nO) =>
+    not na(g) and nC >= MIN_N_SHOW and nO >= MIN_N_SHOW ? str.tostring(g, "#.##") : "--"
+
+f_fmt_phase(float p) =>
+    na(p) ? "Alt--" : "Alt" + str.tostring(p, "#") + "%"
+
 f_kill_table(table t) =>
     if not na(t)
         table.delete(t)
@@ -333,7 +449,8 @@ f_update_market(float[] sumArr, float[] sqArr, float[] cntArr, float[] winArr,
                 int marketId, int bucketId, float nowValue, float entryValue, float horizonLow) =>
     int idx = marketId * 5 + bucketId
     float r = f_return(nowValue, entryValue)
-    float d = not na(horizonLow) and not na(entryValue) and entryValue > 0 ? horizonLow / entryValue - 1.0 : na
+    float dRaw = not na(horizonLow) and not na(entryValue) and entryValue > 0 ? horizonLow / entryValue - 1.0 : na
+    float d = not na(dRaw) ? math.min(dRaw, 0.0) : na
     f_update_stats(sumArr, sqArr, cntArr, winArr, idx, r)
     f_update_dd(ddSumArr, ddCntArr, idx, d)
 
@@ -344,15 +461,17 @@ f_update_sector(float[] sumArr, float[] sqArr, float[] cntArr, float[] winArr,
     f_update_stats(sumArr, sqArr, cntArr, winArr, idx, rr)
 
 // =====================================================================
-// 4) DAILY MACRO DATA — INVALID SYMBOLS RETURN NA, NOT RUNTIME ERRORS
+// 4) DAILY MACRO DATA — VALUES PLUS SOURCE TIMESTAMPS
 // =====================================================================
-[policy_raw, policy_prev] = request.security("VNINTR", TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
-[b2_raw,     b2_prev]     = request.security("VN02Y",  TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
-[b10_raw,    b10_prev]    = request.security("VN10Y",  TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
-[us10_raw,   us10_prev]   = request.security("US10Y",  TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
-[ib_raw,     ib_prev]     = request.security("VNINBR", TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
-[fx_raw,     fx_prev]     = request.security("USDVND", TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
-[fed_raw,    fed_prev]    = request.security("USINTR", TF_D, [close, close[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+// gaps_off is retained for continuity, but timestamp freshness is scored so a
+// carried-forward value cannot masquerade as fully current data.
+[policy_raw, policy_prev, policy_t0, policy_t1] = request.security("VNINTR", TF_D, [close, close[1], time, time[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[b2_raw,     b2_prev,     b2_t0,     b2_t1]     = request.security("VN02Y",  TF_D, [close, close[1], time, time[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[b10_raw,    b10_prev,    b10_t0,    b10_t1]    = request.security("VN10Y",  TF_D, [close, close[1], time, time[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[us10_raw,   us10_prev,   us10_t0,   us10_t1]   = request.security("US10Y",  TF_D, [close, close[1], time, time[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[ib_raw,     ib_prev,     ib_t0,     ib_t1]     = request.security("VNINBR", TF_D, [close, close[1], time, time[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[fx_raw,     fx_prev,     fx_t0,     fx_t1]     = request.security("USDVND", TF_D, [close, close[1], time, time[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
+[fed_raw,    fed_prev,    fed_t0,    fed_t1]    = request.security("USINTR", TF_D, [close, close[1], time, time[1]], barmerge.gaps_off, barmerge.lookahead_off, true)
 
 float policy_rate    = f_last_completed(policy_raw, policy_prev)
 float bond_2y        = f_last_completed(b2_raw, b2_prev)
@@ -362,8 +481,16 @@ float interbank_rate = f_last_completed(ib_raw, ib_prev)
 float fx_rate        = f_last_completed(fx_raw, fx_prev)
 float fed_policy     = f_last_completed(fed_raw, fed_prev)
 
+int policy_time    = f_last_completed_int(policy_t0, policy_t1)
+int b2_time        = f_last_completed_int(b2_t0, b2_t1)
+int b10_time       = f_last_completed_int(b10_t0, b10_t1)
+int us10_time      = f_last_completed_int(us10_t0, us10_t1)
+int interbank_time = f_last_completed_int(ib_t0, ib_t1)
+int fx_time        = f_last_completed_int(fx_t0, fx_t1)
+int fed_time       = f_last_completed_int(fed_t0, fed_t1)
+
 // =====================================================================
-// 5) OBSERVATION CLOCK
+// 5) OBSERVATION CLOCK AND STAGGERED PHASES
 // =====================================================================
 bool tf_ok   = timeframe.isintraday or timeframe.isdaily
 bool obs_new = tf_ok ? (timeframe.isintraday ? ta.change(time(TF_D)) != 0 : barstate.isconfirmed) : false
@@ -372,12 +499,17 @@ var int obs_count = 0
 if obs_new
     obs_count += 1
 
-bool upd5  = USE_NONOVERLAP ? (obs_new and obs_count % H1 == 0) : obs_new
-bool upd20 = USE_NONOVERLAP ? (obs_new and obs_count % H2 == 0) : obs_new
-bool upd60 = USE_NONOVERLAP ? (obs_new and obs_count % H3 == 0) : obs_new
+int phase_slot_5  = f_phase_slot(obs_count % H1, H1)
+int phase_slot_20 = f_phase_slot(obs_count % H2, H2)
+int phase_slot_60 = f_phase_slot(obs_count % H3, H3)
+
+// Phase zero is the primary non-overlapping estimator used in panels.
+bool upd5  = obs_new and phase_slot_5 == 0
+bool upd20 = obs_new and phase_slot_20 == 0
+bool upd60 = obs_new and phase_slot_60 == 0
 
 // =====================================================================
-// 6) MACRO FEATURES AND THEORY-INFORMED LAYERS
+// 6) MACRO FEATURES, DATA QUALITY, AND EMPIRICALLY CALIBRATED REGIMES
 // =====================================================================
 float liquidity_stress = interbank_rate - policy_rate
 float curve_10y_2y     = bond_10y - bond_2y
@@ -400,7 +532,7 @@ float intl_risk   = 100.0 - ta.percentrank(vn_us_10y_gap, PCTL_LB)
 float spread_risk = 100.0 - ta.percentrank(long_policy_gap, PCTL_LB)
 
 // FX pressure is economically one-sided for the level component:
-// USDVND appreciation (VND depreciation) adds pressure; VND appreciation does not.
+// USDVND appreciation (VND depreciation) adds pressure; appreciation does not.
 float fx_yoy          = ta.roc(fx_rate, 252)
 float fx_dep_yoy      = na(fx_yoy) ? na : math.max(fx_yoy, 0.0)
 float fx_ret_21       = ta.roc(fx_rate, 21)
@@ -412,7 +544,7 @@ float fx_pressure     = f_wavg2(fx_dep_risk, 0.65, fx_vol_risk, 0.35)
 float fed_gap         = fed_policy - policy_rate
 float fed_gap_risk    = ta.percentrank(fed_gap, PCTL_LB)
 
-// Layer aggregation reduces double counting among highly related spreads.
+// Layer aggregation reduces double counting among related spreads.
 float layer_funding   = stress_risk
 float layer_domestic  = f_wavg2(curve_risk, 0.60, spread_risk, 0.40)
 float layer_external  = f_wavg3(intl_risk, 0.35, fed_gap_risk, 0.25, fx_pressure, 0.40)
@@ -429,23 +561,67 @@ source_count += not na(interbank_rate) ? 1.0 : 0.0
 source_count += not na(fx_rate)        ? 1.0 : 0.0
 source_count += not na(fed_policy)     ? 1.0 : 0.0
 
+float fresh_policy = f_freshness_score(policy_time, FRESH_POLICY_DAYS)
+float fresh_b2     = f_freshness_score(b2_time, FRESH_FAST_DAYS)
+float fresh_b10    = f_freshness_score(b10_time, FRESH_FAST_DAYS)
+float fresh_us10   = f_freshness_score(us10_time, FRESH_FAST_DAYS)
+float fresh_ib     = f_freshness_score(interbank_time, FRESH_FAST_DAYS)
+float fresh_fx     = f_freshness_score(fx_time, FRESH_FAST_DAYS)
+float fresh_fed    = f_freshness_score(fed_time, FRESH_POLICY_DAYS)
+float freshness_sum = 0.0
+float freshness_n = 0.0
+if not na(fresh_policy)
+    freshness_sum += fresh_policy
+    freshness_n += 1.0
+if not na(fresh_b2)
+    freshness_sum += fresh_b2
+    freshness_n += 1.0
+if not na(fresh_b10)
+    freshness_sum += fresh_b10
+    freshness_n += 1.0
+if not na(fresh_us10)
+    freshness_sum += fresh_us10
+    freshness_n += 1.0
+if not na(fresh_ib)
+    freshness_sum += fresh_ib
+    freshness_n += 1.0
+if not na(fresh_fx)
+    freshness_sum += fresh_fx
+    freshness_n += 1.0
+if not na(fresh_fed)
+    freshness_sum += fresh_fed
+    freshness_n += 1.0
+float freshness_score = freshness_n > 0 ? freshness_sum / freshness_n : na
+
 float component_coverage = component_count / 6.0 * 100.0
 float source_coverage    = source_count / 7.0 * 100.0
-float data_quality_score = f_wavg2(component_coverage, 0.75, source_coverage, 0.25)
+float data_quality_score = f_wavg3(component_coverage, 0.50, source_coverage, 0.25, freshness_score, 0.25)
 string data_quality_txt  = f_quality_label(data_quality_score)
 
 bool risk_valid = component_count >= MIN_COMPONENT and layer_count >= MIN_LAYER
-float risk_pct = risk_valid ? f_wavg3(layer_funding, 0.40, layer_domestic, 0.35, layer_external, 0.25) : na
-int bucket_now = f_bucket_from_risk(risk_pct)
 
-// Policy-space constraint index. This is not a forecast of an SBV move.
-float constraint_index = risk_valid ? f_wavg3(layer_funding, 0.40, layer_domestic, 0.25, layer_external, 0.35) : na
+// The latent score preserves theory-informed weights. The published regime
+// score is its rolling empirical percentile, which has interpretable buckets.
+float latent_risk_weighted = risk_valid ? f_wavg3(layer_funding, 0.40, layer_domestic, 0.35, layer_external, 0.25) : na
+float latent_risk_equal    = risk_valid ? f_wavg3(layer_funding, 1.0, layer_domestic, 1.0, layer_external, 1.0) : na
+float weighted_rank = ta.percentrank(latent_risk_weighted, PCTL_LB)
+float equal_rank    = ta.percentrank(latent_risk_equal, PCTL_LB)
+float risk_pct      = risk_valid ? weighted_rank : na
+float risk_equal_pct= risk_valid ? equal_rank : na
+int bucket_now      = f_bucket_from_risk(risk_pct)
+
+float specification_gap   = not na(risk_pct) and not na(risk_equal_pct) ? math.abs(risk_pct - risk_equal_pct) : na
+float specification_score = not na(specification_gap) ? f_clamp100(100.0 - 2.0 * specification_gap) : na
+
+// Policy-space constraint index. This is descriptive, not a forecast.
+float constraint_latent = risk_valid ? f_wavg3(layer_funding, 0.40, layer_domestic, 0.25, layer_external, 0.35) : na
+float constraint_rank = ta.percentrank(constraint_latent, PCTL_LB)
+float constraint_index = risk_valid ? constraint_rank : na
 string constraint_zone = na(constraint_index) ? "NA" : constraint_index >= 70 ? "HIGH CONSTRAINTS" : constraint_index <= 30 ? "EASING SPACE" : "MODERATE CONSTRAINTS"
 
 // =====================================================================
-// 7) SIGNAL IMPULSE, PERSISTENCE, AND STRUCTURAL CONFIDENCE
+// 7) SIGNAL IMPULSE, PERSISTENCE, AND MODEL RELIABILITY
 // =====================================================================
-float risk_5ago  = ta.valuewhen(obs_new, risk_pct, 5)
 float risk_20ago = ta.valuewhen(obs_new, risk_pct, IMPULSE_H)
 float risk_impulse = not na(risk_pct) and not na(risk_20ago) ? risk_pct - risk_20ago : na
 
@@ -491,19 +667,17 @@ if not na(layer_external)
 float layer_dispersion = layer_n > 0 ? math.sqrt(layer_ss / layer_n) : na
 float concordance_score = not na(layer_dispersion) ? f_clamp100(100.0 - 2.0 * layer_dispersion) : na
 
-// Structural confidence deliberately excludes signal extremity.
-// Low concordance imposes a ceiling: complete and persistent data cannot
-// compensate for strong disagreement across the economic layers.
-float structural_confidence_raw = risk_valid ? f_wavg3(concordance_score, 0.45, persistence_score, 0.35, data_quality_score, 0.20) : na
-float structural_confidence = na(structural_confidence_raw) ? na :
-     concordance_score < 25 ? math.min(structural_confidence_raw, 44.0) :
-     concordance_score < 40 ? math.min(structural_confidence_raw, 59.0) : structural_confidence_raw
-bool confidence_capped      = not na(structural_confidence_raw) and not na(structural_confidence) and structural_confidence < structural_confidence_raw
-string confidence_cap_txt   = confidence_capped ? " CAP" : ""
-float signal_strength       = not na(risk_pct) ? math.abs(risk_pct - 50.0) * 2.0 : na
-string structural_conf_txt  = f_conf_label(structural_confidence)
-string impulse_txt          = f_impulse_label(risk_impulse)
-string macro_regime         = f_regime_label(risk_pct, risk_impulse)
+// Reliability is a bounded diagnostic score, not statistical confidence.
+float model_reliability_raw = risk_valid ? f_wavg4(concordance_score, 0.35, persistence_score, 0.25, data_quality_score, 0.20, specification_score, 0.20) : na
+float model_reliability = na(model_reliability_raw) ? na :
+     concordance_score < 25 or specification_score < 40 ? math.min(model_reliability_raw, 44.0) :
+     concordance_score < 40 or specification_score < 60 ? math.min(model_reliability_raw, 59.0) : model_reliability_raw
+bool reliability_capped    = not na(model_reliability_raw) and not na(model_reliability) and model_reliability < model_reliability_raw
+string reliability_cap_txt = reliability_capped ? " CAP" : ""
+float signal_strength      = not na(risk_pct) ? math.abs(risk_pct - 50.0) * 2.0 : na
+string reliability_txt     = f_conf_label(model_reliability)
+string impulse_txt         = f_impulse_label(risk_impulse)
+string macro_regime        = f_regime_label(risk_pct, risk_impulse)
 
 // =====================================================================
 // 8) PLOTS
@@ -519,7 +693,8 @@ plot(show_risk ? layer_funding         : na, title="Funding Layer",        color
 plot(show_risk ? layer_domestic        : na, title="Domestic Curve Layer", color=color.new(#FFA726, 0), linewidth=2, display=display.all - display.status_line)
 plot(show_risk ? layer_external        : na, title="External Layer",       color=color.new(#42A5F5, 0), linewidth=2, display=display.all - display.status_line)
 plot(show_risk ? constraint_index      : na, title="Constraint Index",     color=color.new(color.silver, 0), linewidth=2, display=display.all - display.status_line)
-plot(show_risk ? structural_confidence : na, title="Structural Confidence", color=color.new(color.lime, 0), linewidth=2, display=display.all - display.status_line)
+plot(show_risk ? model_reliability : na, title="Model Reliability", color=color.new(color.lime, 0), linewidth=2, display=display.all - display.status_line)
+plot(show_risk ? risk_equal_pct : na, title="Equal-weight Risk Robustness", color=color.new(color.fuchsia, 45), linewidth=1, display=display.all - display.status_line)
 plot(show_risk ? 80 : na, title="80", color=color.new(color.red, 75), display=display.all - display.status_line)
 plot(show_risk ? 60 : na, title="60", color=color.new(color.orange, 75), display=display.all - display.status_line)
 plot(show_risk ? 40 : na, title="40", color=color.new(color.yellow, 75), display=display.all - display.status_line)
@@ -593,6 +768,10 @@ int bucket_entry_60 = f_bucket_from_risk(risk_entry_60)
 int time_entry_5  = ta.valuewhen(obs_new, time, H1)
 int time_entry_20 = ta.valuewhen(obs_new, time, H2)
 int time_entry_60 = ta.valuewhen(obs_new, time, H3)
+
+float dq_entry_5  = ta.valuewhen(obs_new, data_quality_score, H1)
+float dq_entry_20 = ta.valuewhen(obs_new, data_quality_score, H2)
+float dq_entry_60 = ta.valuewhen(obs_new, data_quality_score, H3)
 
 float vni_now_vw  = ta.valuewhen(obs_new, mkt_vni, 0)
 float vni_5_vw    = ta.valuewhen(obs_new, mkt_vni, H1)
@@ -670,12 +849,22 @@ var float[] cCnt   = array.new_float(15, 0.0)
 var float[] cWin   = array.new_float(15, 0.0)
 var float[] cDDSum = array.new_float(15, 0.0)
 var float[] cDDCnt = array.new_float(15, 0.0)
+var float[] cQSum  = array.new_float(15, 0.0)
+var float[] cQCnt  = array.new_float(15, 0.0)
+
+// Five staggered phase cohorts: PHASES x 3 horizons x 5 regimes.
+var float[] phaseCSum = array.new_float(75, 0.0)
+var float[] phaseCCnt = array.new_float(75, 0.0)
+var float[] phaseUSum = array.new_float(15, 0.0)
+var float[] phaseUCnt = array.new_float(15, 0.0)
 
 // Total sample by horizon.
 var float[] uSum = array.new_float(3, 0.0)
 var float[] uSq  = array.new_float(3, 0.0)
 var float[] uCnt = array.new_float(3, 0.0)
 var float[] uWin = array.new_float(3, 0.0)
+var float[] uQSum = array.new_float(3, 0.0)
+var float[] uQCnt = array.new_float(3, 0.0)
 
 // Structural split: 2 periods x 3 horizons x 5 regimes.
 var float[] splitCSum = array.new_float(30, 0.0)
@@ -690,12 +879,43 @@ var string[] market_name = array.from("VNINDEX", "VN30", "VN100", "VNALLSHARE", 
 var string[] sector_name = array.from("VNFIN", "VNFINSELECT", "VNIND", "VNIT", "VNREAL", "VNCONS", "VNCOND", "VNENE", "VNMAT", "VNHEAL", "VNUTI")
 
 // =====================================================================
-// 12) UPDATE RULES — NON-OVERLAPPING FORWARD EVIDENCE
+// 12) UPDATE RULES — PRIMARY NON-OVERLAP + PHASE ROBUSTNESS
 // =====================================================================
+// Phase robustness arrays. Each selected phase is internally non-overlapping.
+if obs_new and phase_slot_5 >= 0 and not na(bucket_entry_5)
+    float phaseR5 = f_return(vni_now_vw, vni_5_vw)
+    if not na(phaseR5)
+        int phaseCIdx5 = phase_slot_5 * 15 + bucket_entry_5
+        int phaseUIdx5 = phase_slot_5 * 3
+        array.set(phaseCSum, phaseCIdx5, array.get(phaseCSum, phaseCIdx5) + phaseR5)
+        array.set(phaseCCnt, phaseCIdx5, array.get(phaseCCnt, phaseCIdx5) + 1.0)
+        array.set(phaseUSum, phaseUIdx5, array.get(phaseUSum, phaseUIdx5) + phaseR5)
+        array.set(phaseUCnt, phaseUIdx5, array.get(phaseUCnt, phaseUIdx5) + 1.0)
+
+if obs_new and phase_slot_20 >= 0 and not na(bucket_entry_20)
+    float phaseR20 = f_return(vni_now_vw, vni_20_vw)
+    if not na(phaseR20)
+        int phaseCIdx20 = phase_slot_20 * 15 + 5 + bucket_entry_20
+        int phaseUIdx20 = phase_slot_20 * 3 + 1
+        array.set(phaseCSum, phaseCIdx20, array.get(phaseCSum, phaseCIdx20) + phaseR20)
+        array.set(phaseCCnt, phaseCIdx20, array.get(phaseCCnt, phaseCIdx20) + 1.0)
+        array.set(phaseUSum, phaseUIdx20, array.get(phaseUSum, phaseUIdx20) + phaseR20)
+        array.set(phaseUCnt, phaseUIdx20, array.get(phaseUCnt, phaseUIdx20) + 1.0)
+
+if obs_new and phase_slot_60 >= 0 and not na(bucket_entry_60)
+    float phaseR60 = f_return(vni_now_vw, vni_60_vw)
+    if not na(phaseR60)
+        int phaseCIdx60 = phase_slot_60 * 15 + 10 + bucket_entry_60
+        int phaseUIdx60 = phase_slot_60 * 3 + 2
+        array.set(phaseCSum, phaseCIdx60, array.get(phaseCSum, phaseCIdx60) + phaseR60)
+        array.set(phaseCCnt, phaseCIdx60, array.get(phaseCCnt, phaseCIdx60) + 1.0)
+        array.set(phaseUSum, phaseUIdx60, array.get(phaseUSum, phaseUIdx60) + phaseR60)
+        array.set(phaseUCnt, phaseUIdx60, array.get(phaseUCnt, phaseUIdx60) + 1.0)
+
+// Primary 20D phase powers market, sector, and transition panels.
 if upd20 and not na(bucket_entry_20) and not na(bucket_now)
     float benchmark20 = f_return(vni_now_vw, vni_20_vw)
 
-    // Transition from the regime observed at entry to the regime after 20D.
     if not na(benchmark20)
         int trIdx = bucket_entry_20 * 5 + bucket_now
         array.set(trCnt, trIdx, array.get(trCnt, trIdx) + 1.0)
@@ -724,11 +944,14 @@ if upd20 and not na(bucket_entry_20) and not na(bucket_now)
 
 if upd5 and not na(bucket_entry_5)
     float r5 = f_return(vni_now_vw, vni_5_vw)
-    float d5 = not na(vni_l6_vw) and not na(vni_5_vw) and vni_5_vw > 0 ? vni_l6_vw / vni_5_vw - 1.0 : na
+    float d5Raw = not na(vni_l6_vw) and not na(vni_5_vw) and vni_5_vw > 0 ? vni_l6_vw / vni_5_vw - 1.0 : na
+    float d5 = not na(d5Raw) ? math.min(d5Raw, 0.0) : na
     int idx5 = bucket_entry_5
     f_update_stats(cSum, cSq, cCnt, cWin, idx5, r5)
     f_update_dd(cDDSum, cDDCnt, idx5, d5)
+    f_update_quality(cQSum, cQCnt, idx5, dq_entry_5, r5)
     f_update_stats(uSum, uSq, uCnt, uWin, 0, r5)
+    f_update_quality(uQSum, uQCnt, 0, dq_entry_5, r5)
     if not na(r5) and not na(time_entry_5)
         int splitSlot5 = time_entry_5 < STRUCTURAL_SPLIT_TS ? 0 : 1
         int splitCIdx5 = splitSlot5 * 15 + idx5
@@ -738,11 +961,14 @@ if upd5 and not na(bucket_entry_5)
 
 if upd20 and not na(bucket_entry_20)
     float r20 = f_return(vni_now_vw, vni_20_vw)
-    float d20 = not na(vni_l21_vw) and not na(vni_20_vw) and vni_20_vw > 0 ? vni_l21_vw / vni_20_vw - 1.0 : na
+    float d20Raw = not na(vni_l21_vw) and not na(vni_20_vw) and vni_20_vw > 0 ? vni_l21_vw / vni_20_vw - 1.0 : na
+    float d20 = not na(d20Raw) ? math.min(d20Raw, 0.0) : na
     int idx20 = 5 + bucket_entry_20
     f_update_stats(cSum, cSq, cCnt, cWin, idx20, r20)
     f_update_dd(cDDSum, cDDCnt, idx20, d20)
+    f_update_quality(cQSum, cQCnt, idx20, dq_entry_20, r20)
     f_update_stats(uSum, uSq, uCnt, uWin, 1, r20)
+    f_update_quality(uQSum, uQCnt, 1, dq_entry_20, r20)
     if not na(r20) and not na(time_entry_20)
         int splitSlot20 = time_entry_20 < STRUCTURAL_SPLIT_TS ? 0 : 1
         int splitCIdx20 = splitSlot20 * 15 + idx20
@@ -752,11 +978,14 @@ if upd20 and not na(bucket_entry_20)
 
 if upd60 and not na(bucket_entry_60)
     float r60 = f_return(vni_now_vw, vni_60_vw)
-    float d60 = not na(vni_l61_vw) and not na(vni_60_vw) and vni_60_vw > 0 ? vni_l61_vw / vni_60_vw - 1.0 : na
+    float d60Raw = not na(vni_l61_vw) and not na(vni_60_vw) and vni_60_vw > 0 ? vni_l61_vw / vni_60_vw - 1.0 : na
+    float d60 = not na(d60Raw) ? math.min(d60Raw, 0.0) : na
     int idx60 = 10 + bucket_entry_60
     f_update_stats(cSum, cSq, cCnt, cWin, idx60, r60)
     f_update_dd(cDDSum, cDDCnt, idx60, d60)
+    f_update_quality(cQSum, cQCnt, idx60, dq_entry_60, r60)
     f_update_stats(uSum, uSq, uCnt, uWin, 2, r60)
+    f_update_quality(uQSum, uQCnt, 2, dq_entry_60, r60)
     if not na(r60) and not na(time_entry_60)
         int splitSlot60 = time_entry_60 < STRUCTURAL_SPLIT_TS ? 0 : 1
         int splitCIdx60 = splitSlot60 * 15 + idx60
@@ -777,6 +1006,9 @@ float cSq5   = risk_valid ? array.get(cSq, idx5_now) : na
 float cN5    = risk_valid ? array.get(cCnt, idx5_now) : na
 float cW5    = risk_valid ? array.get(cWin, idx5_now) : na
 float cDD5   = risk_valid ? f_mean(array.get(cDDSum, idx5_now), array.get(cDDCnt, idx5_now)) : na
+float qC5    = risk_valid ? f_mean(array.get(cQSum, idx5_now), array.get(cQCnt, idx5_now)) : na
+float qO5    = risk_valid ? f_mean(array.get(uQSum, 0) - array.get(cQSum, idx5_now), array.get(uQCnt, 0) - array.get(cQCnt, idx5_now)) : na
+float q5     = not na(qC5) and not na(qO5) ? math.min(qC5, qO5) : na
 float win5   = f_winrate(cW5, cN5)
 
 float cSum20 = risk_valid ? array.get(cSum, idx20_now) : na
@@ -784,6 +1016,9 @@ float cSq20  = risk_valid ? array.get(cSq, idx20_now) : na
 float cN20   = risk_valid ? array.get(cCnt, idx20_now) : na
 float cW20   = risk_valid ? array.get(cWin, idx20_now) : na
 float cDD20  = risk_valid ? f_mean(array.get(cDDSum, idx20_now), array.get(cDDCnt, idx20_now)) : na
+float qC20   = risk_valid ? f_mean(array.get(cQSum, idx20_now), array.get(cQCnt, idx20_now)) : na
+float qO20   = risk_valid ? f_mean(array.get(uQSum, 1) - array.get(cQSum, idx20_now), array.get(uQCnt, 1) - array.get(cQCnt, idx20_now)) : na
+float q20    = not na(qC20) and not na(qO20) ? math.min(qC20, qO20) : na
 float win20  = f_winrate(cW20, cN20)
 
 float cSum60 = risk_valid ? array.get(cSum, idx60_now) : na
@@ -791,49 +1026,63 @@ float cSq60  = risk_valid ? array.get(cSq, idx60_now) : na
 float cN60   = risk_valid ? array.get(cCnt, idx60_now) : na
 float cW60   = risk_valid ? array.get(cWin, idx60_now) : na
 float cDD60  = risk_valid ? f_mean(array.get(cDDSum, idx60_now), array.get(cDDCnt, idx60_now)) : na
+float qC60   = risk_valid ? f_mean(array.get(cQSum, idx60_now), array.get(cQCnt, idx60_now)) : na
+float qO60   = risk_valid ? f_mean(array.get(uQSum, 2) - array.get(cQSum, idx60_now), array.get(uQCnt, 2) - array.get(cQCnt, idx60_now)) : na
+float q60    = not na(qC60) and not na(qO60) ? math.min(qC60, qO60) : na
 float win60  = f_winrate(cW60, cN60)
 
-[cMean5, oMean5, effect5, effectSE5, t5, lcb5, ucb5, oN5] = f_effect_stats(cSum5, cSq5, cN5, array.get(uSum, 0), array.get(uSq, 0), array.get(uCnt, 0))
-[cMean20, oMean20, effect20, effectSE20, t20, lcb20, ucb20, oN20] = f_effect_stats(cSum20, cSq20, cN20, array.get(uSum, 1), array.get(uSq, 1), array.get(uCnt, 1))
-[cMean60, oMean60, effect60, effectSE60, t60, lcb60, ucb60, oN60] = f_effect_stats(cSum60, cSq60, cN60, array.get(uSum, 2), array.get(uSq, 2), array.get(uCnt, 2))
+[cMean5, oMean5, effect5, effectSE5, t5, df5, g5, lcb5, ucb5, oN5] = f_effect_stats(cSum5, cSq5, cN5, array.get(uSum, 0), array.get(uSq, 0), array.get(uCnt, 0))
+[cMean20, oMean20, effect20, effectSE20, t20, df20, g20, lcb20, ucb20, oN20] = f_effect_stats(cSum20, cSq20, cN20, array.get(uSum, 1), array.get(uSq, 1), array.get(uCnt, 1))
+[cMean60, oMean60, effect60, effectSE60, t60, df60, g60, lcb60, ucb60, oN60] = f_effect_stats(cSum60, cSq60, cN60, array.get(uSum, 2), array.get(uSq, 2), array.get(uCnt, 2))
 
 // Pre/post structural effects.
-[preC5, preO5, preEff5, preSE5, preT5, preLCB5, preUCB5, preON5] = f_effect_stats(
+[preC5, preO5, preEff5, preSE5, preT5, preDF5, preG5, preLCB5, preUCB5, preON5] = f_effect_stats(
     array.get(splitCSum, idx5_now), array.get(splitCSq, idx5_now), array.get(splitCCnt, idx5_now),
     array.get(splitUSum, 0), array.get(splitUSq, 0), array.get(splitUCnt, 0))
-[postC5, postO5, postEff5, postSE5, postT5, postLCB5, postUCB5, postON5] = f_effect_stats(
+[postC5, postO5, postEff5, postSE5, postT5, postDF5, postG5, postLCB5, postUCB5, postON5] = f_effect_stats(
     array.get(splitCSum, 15 + idx5_now), array.get(splitCSq, 15 + idx5_now), array.get(splitCCnt, 15 + idx5_now),
     array.get(splitUSum, 3), array.get(splitUSq, 3), array.get(splitUCnt, 3))
 
-[preC20, preO20, preEff20, preSE20, preT20, preLCB20, preUCB20, preON20] = f_effect_stats(
+[preC20, preO20, preEff20, preSE20, preT20, preDF20, preG20, preLCB20, preUCB20, preON20] = f_effect_stats(
     array.get(splitCSum, idx20_now), array.get(splitCSq, idx20_now), array.get(splitCCnt, idx20_now),
     array.get(splitUSum, 1), array.get(splitUSq, 1), array.get(splitUCnt, 1))
-[postC20, postO20, postEff20, postSE20, postT20, postLCB20, postUCB20, postON20] = f_effect_stats(
+[postC20, postO20, postEff20, postSE20, postT20, postDF20, postG20, postLCB20, postUCB20, postON20] = f_effect_stats(
     array.get(splitCSum, 15 + idx20_now), array.get(splitCSq, 15 + idx20_now), array.get(splitCCnt, 15 + idx20_now),
     array.get(splitUSum, 4), array.get(splitUSq, 4), array.get(splitUCnt, 4))
 
-[preC60, preO60, preEff60, preSE60, preT60, preLCB60, preUCB60, preON60] = f_effect_stats(
+[preC60, preO60, preEff60, preSE60, preT60, preDF60, preG60, preLCB60, preUCB60, preON60] = f_effect_stats(
     array.get(splitCSum, idx60_now), array.get(splitCSq, idx60_now), array.get(splitCCnt, idx60_now),
     array.get(splitUSum, 2), array.get(splitUSq, 2), array.get(splitUCnt, 2))
-[postC60, postO60, postEff60, postSE60, postT60, postLCB60, postUCB60, postON60] = f_effect_stats(
+[postC60, postO60, postEff60, postSE60, postT60, postDF60, postG60, postLCB60, postUCB60, postON60] = f_effect_stats(
     array.get(splitCSum, 15 + idx60_now), array.get(splitCSq, 15 + idx60_now), array.get(splitCCnt, 15 + idx60_now),
     array.get(splitUSum, 5), array.get(splitUSq, 5), array.get(splitUCnt, 5))
 
-string split5  = f_split_label(preEff5,  postEff5,  array.get(splitCCnt, idx5_now),      array.get(splitCCnt, 15 + idx5_now))
-string split20 = f_split_label(preEff20, postEff20, array.get(splitCCnt, idx20_now),     array.get(splitCCnt, 15 + idx20_now))
-string split60 = f_split_label(preEff60, postEff60, array.get(splitCCnt, idx60_now),     array.get(splitCCnt, 15 + idx60_now))
+float preCN5   = array.get(splitCCnt, idx5_now)
+float postCN5  = array.get(splitCCnt, 15 + idx5_now)
+float preCN20  = array.get(splitCCnt, idx20_now)
+float postCN20 = array.get(splitCCnt, 15 + idx20_now)
+float preCN60  = array.get(splitCCnt, idx60_now)
+float postCN60 = array.get(splitCCnt, 15 + idx60_now)
 
-string grade5  = f_evidence_grade(cN5,  oN5,  effect5,  effectSE5,  split5,  data_quality_score)
-string grade20 = f_evidence_grade(cN20, oN20, effect20, effectSE20, split20, data_quality_score)
-string grade60 = f_evidence_grade(cN60, oN60, effect60, effectSE60, split60, data_quality_score)
+string split5  = f_split_label(preEff5, postEff5, preSE5, postSE5, preCN5, preON5, postCN5, postON5)
+string split20 = f_split_label(preEff20, postEff20, preSE20, postSE20, preCN20, preON20, postCN20, postON20)
+string split60 = f_split_label(preEff60, postEff60, preSE60, postSE60, preCN60, preON60, postCN60, postON60)
+
+float phaseAgree5  = f_phase_agreement(phaseCSum, phaseCCnt, phaseUSum, phaseUCnt, 0, bucket_idx, effect5)
+float phaseAgree20 = f_phase_agreement(phaseCSum, phaseCCnt, phaseUSum, phaseUCnt, 1, bucket_idx, effect20)
+float phaseAgree60 = f_phase_agreement(phaseCSum, phaseCCnt, phaseUSum, phaseUCnt, 2, bucket_idx, effect60)
+
+string grade5  = f_evidence_grade(cN5, oN5, effect5, effectSE5, df5, g5, split5, q5, phaseAgree5, MIN_EFFECT_5)
+string grade20 = f_evidence_grade(cN20, oN20, effect20, effectSE20, df20, g20, split20, q20, phaseAgree20, MIN_EFFECT_20)
+string grade60 = f_evidence_grade(cN60, oN60, effect60, effectSE60, df60, g60, split60, q60, phaseAgree60, MIN_EFFECT_60)
 
 bool evidence20_confirmed = grade20 == "A" or grade20 == "B"
 string tactical_bias = na(effect20) or cN20 < MIN_N_SHOW or oN20 < MIN_N_SHOW ? "UNKNOWN" :
      evidence20_confirmed and effect20 < 0 ? "DEFENSIVE" :
      evidence20_confirmed and effect20 > 0 ? "RISK-ON" : "NEUTRAL"
 
-string takeaway = macro_regime + " | " + data_quality_txt + " | CONF " + structural_conf_txt +
-                  " | 20D " + tactical_bias + " (E" + grade20 + ")"
+string takeaway = macro_regime + " | " + data_quality_txt + " | REL " + reliability_txt +
+                  " | SPEC " + f_fmt_score(specification_score) + " | 20D " + tactical_bias + " (E" + grade20 + ")"
 
 // =====================================================================
 // 14) TABLE LIFECYCLE
@@ -866,7 +1115,7 @@ if barstate.islast and show_macro
         t_macro := table.new(position.top_left, 5, 12, bgcolor=color.new(color.black, 18), border_width=2, border_color=color.new(color.white, 20))
         table.merge_cells(t_macro, 0, 0, 4, 0)
 
-    table.cell(t_macro, 0, 0, "MACRO v6.0.1 | " + f_bucket_label(bucket_now) + " | Risk " + f_fmt_score(risk_pct) + " | " + macro_regime,
+    table.cell(t_macro, 0, 0, "MACRO v7.0.0 | " + f_bucket_label(bucket_now) + " | Risk " + f_fmt_score(risk_pct) + " | " + macro_regime,
         bgcolor=color.new(color.blue, 10), text_color=color.white, text_size=size.small)
 
     table.cell(t_macro, 0, 1, "Rates", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
@@ -907,9 +1156,9 @@ if barstate.islast and show_macro
 
     table.cell(t_macro, 0, 9, "Quality", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_macro, 1, 9, data_quality_txt + " " + f_fmt_score(data_quality_score), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
-    table.cell(t_macro, 2, 9, "Conf " + structural_conf_txt + " " + f_fmt_score(structural_confidence) + confidence_cap_txt, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
-    table.cell(t_macro, 3, 9, "Strength " + f_fmt_score(signal_strength), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
-    table.cell(t_macro, 4, 9, "Impulse " + impulse_txt, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 2, 9, "Rel " + reliability_txt + " " + f_fmt_score(model_reliability) + reliability_cap_txt, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 3, 9, "Fresh " + f_fmt_score(freshness_score) + " | Spec " + f_fmt_score(specification_score), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_macro, 4, 9, "Impulse " + impulse_txt + " | Strength " + f_fmt_score(signal_strength), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
 
     table.cell(t_macro, 0, 10, "Constraint zone", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.merge_cells(t_macro, 1, 10, 4, 10)
@@ -927,7 +1176,7 @@ if barstate.islast and show_risk
         t_risk := table.new(position.top_right, 8, 10, bgcolor=color.new(color.black, 18), border_width=2, border_color=color.new(color.white, 20))
         table.merge_cells(t_risk, 0, 0, 7, 0)
 
-    table.cell(t_risk, 0, 0, "EVIDENCE v6.0.1 | " + f_bucket_label(bucket_now) + " | " + macro_regime + " | DQ " + data_quality_txt,
+    table.cell(t_risk, 0, 0, "EVIDENCE v7.0.0 | " + f_bucket_label(bucket_now) + " | " + macro_regime + " | DQ " + data_quality_txt,
         bgcolor=color.new(color.blue, 0), text_color=color.white, text_size=size.small)
 
     table.cell(t_risk, 0, 1, "Signal", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
@@ -935,7 +1184,7 @@ if barstate.islast and show_risk
     table.cell(t_risk, 2, 1, "Impulse20", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_risk, 3, 1, "Persistence", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_risk, 4, 1, "Concord", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
-    table.cell(t_risk, 5, 1, "Conf", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 5, 1, "Reliability", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_risk, 6, 1, "Constraint", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_risk, 7, 1, "Bias20", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
 
@@ -944,7 +1193,7 @@ if barstate.islast and show_risk
     table.cell(t_risk, 2, 2, f_fmt_raw(risk_impulse), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 3, 2, f_fmt_score(persistence_score), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 4, 2, f_fmt_score(concordance_score), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
-    table.cell(t_risk, 5, 2, structural_conf_txt + " " + f_fmt_score(structural_confidence) + confidence_cap_txt, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 5, 2, reliability_txt + " " + f_fmt_score(model_reliability) + reliability_cap_txt, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 6, 2, constraint_zone, bgcolor=color.new(constraint_index >= 70 ? color.red : constraint_index <= 30 ? color.green : color.orange, 80), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 7, 2, tactical_bias, bgcolor=color.new(tactical_bias == "DEFENSIVE" ? color.red : tactical_bias == "RISK-ON" ? color.green : color.orange, 80), text_color=color.white, text_size=size.tiny)
 
@@ -952,36 +1201,36 @@ if barstate.islast and show_risk
     table.cell(t_risk, 1, 4, "Regime avg", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_risk, 2, 4, "Other avg", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_risk, 3, 4, "Effect", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
-    table.cell(t_risk, 4, 4, "t≈", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 4, 4, "Hedges g", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_risk, 5, 4, "N reg/oth", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
-    table.cell(t_risk, 6, 4, "Pre/Post", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_risk, 6, 4, "Stability | Phase", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_risk, 7, 4, "Grade", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
 
     table.cell(t_risk, 0, 5, "5D", bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 1, 5, f_fmt_pct_simple(cMean5, cN5), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 2, 5, f_fmt_pct_simple(oMean5, oN5), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 3, 5, f_fmt_pct_simple(effect5, math.min(cN5, oN5)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
-    table.cell(t_risk, 4, 5, f_fmt_t(t5, cN5, oN5), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 4, 5, f_fmt_g(g5, cN5, oN5), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 5, 5, f_fmt_n(cN5) + "/" + f_fmt_n(oN5), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
-    table.cell(t_risk, 6, 5, split5, bgcolor=color.new(split5 == "MIXED" ? color.red : color.black, 70), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 6, 5, split5 + " | " + f_fmt_phase(phaseAgree5), bgcolor=color.new(str.contains(split5, "MIXED") or str.contains(split5, "SHIFT") ? color.red : color.black, 70), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 7, 5, "E" + grade5, bgcolor=color.new(f_grade_color(grade5), 75), text_color=color.white, text_size=size.tiny)
 
     table.cell(t_risk, 0, 6, "20D", bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 1, 6, f_fmt_pct_simple(cMean20, cN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 2, 6, f_fmt_pct_simple(oMean20, oN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 3, 6, f_fmt_pct_simple(effect20, math.min(cN20, oN20)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
-    table.cell(t_risk, 4, 6, f_fmt_t(t20, cN20, oN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 4, 6, f_fmt_g(g20, cN20, oN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 5, 6, f_fmt_n(cN20) + "/" + f_fmt_n(oN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
-    table.cell(t_risk, 6, 6, split20, bgcolor=color.new(split20 == "MIXED" ? color.red : color.black, 70), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 6, 6, split20 + " | " + f_fmt_phase(phaseAgree20), bgcolor=color.new(str.contains(split20, "MIXED") or str.contains(split20, "SHIFT") ? color.red : color.black, 70), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 7, 6, "E" + grade20, bgcolor=color.new(f_grade_color(grade20), 75), text_color=color.white, text_size=size.tiny)
 
     table.cell(t_risk, 0, 7, "60D", bgcolor=color.new(color.black, 5), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 1, 7, f_fmt_pct_simple(cMean60, cN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 2, 7, f_fmt_pct_simple(oMean60, oN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 3, 7, f_fmt_pct_simple(effect60, math.min(cN60, oN60)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
-    table.cell(t_risk, 4, 7, f_fmt_t(t60, cN60, oN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 4, 7, f_fmt_g(g60, cN60, oN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 5, 7, f_fmt_n(cN60) + "/" + f_fmt_n(oN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
-    table.cell(t_risk, 6, 7, split60, bgcolor=color.new(split60 == "MIXED" ? color.red : color.black, 70), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 6, 7, split60 + " | " + f_fmt_phase(phaseAgree60), bgcolor=color.new(str.contains(split60, "MIXED") or str.contains(split60, "SHIFT") ? color.red : color.black, 70), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 7, 7, "E" + grade60, bgcolor=color.new(f_grade_color(grade60), 75), text_color=color.white, text_size=size.tiny)
 
     table.cell(t_risk, 0, 8, "Risk", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
@@ -991,7 +1240,7 @@ if barstate.islast and show_risk
     table.cell(t_risk, 4, 8, "DD20 " + f_fmt_pct_raw(cDD20, cN20), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 5, 8, "Win60 " + f_fmt_win(win60, cN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
     table.cell(t_risk, 6, 8, "DD60 " + f_fmt_pct_raw(cDD60, cN60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
-    table.cell(t_risk, 7, 8, "t is approximate", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
+    table.cell(t_risk, 7, 8, "PairQ " + f_fmt_score(q5) + "/" + f_fmt_score(q20) + "/" + f_fmt_score(q60), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.tiny)
 
     table.cell(t_risk, 0, 9, "Takeaway", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.merge_cells(t_risk, 1, 9, 7, 9)
@@ -1005,11 +1254,11 @@ if barstate.islast and show_eq
         t_eq := table.new(position.top_right, 8, 24, bgcolor=color.new(color.black, 15), border_width=2, border_color=color.new(color.white, 20))
         table.merge_cells(t_eq, 0, 0, 7, 0)
 
-    table.cell(t_eq, 0, 0, "EQUITY v6.0.1 | " + f_bucket_label(bucket_now) + " | " + macro_regime + " | 20D " + tactical_bias + " E" + grade20,
+    table.cell(t_eq, 0, 0, "EQUITY v7.0.0 | " + f_bucket_label(bucket_now) + " | " + macro_regime + " | 20D " + tactical_bias + " E" + grade20,
         bgcolor=color.new(color.blue, 0), text_color=color.white, text_size=size.small)
 
     table.merge_cells(t_eq, 0, 1, 7, 1)
-    table.cell(t_eq, 0, 1, "Markets — non-overlapping 20D outcomes conditioned on entry regime", bgcolor=color.new(color.white, 8), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 0, 1, "Markets — primary non-overlapping 20D phase; phase robustness shown in Evidence panel", bgcolor=color.new(color.white, 8), text_color=color.black, text_size=size.tiny)
 
     table.cell(t_eq, 0, 2, "Market", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_eq, 1, 2, "GeoAvg20", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
@@ -1045,8 +1294,8 @@ if barstate.islast and show_eq
 
     table.cell(t_eq, 0, 11, "H", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_eq, 1, 11, "Effect", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
-    table.cell(t_eq, 2, 11, "95% LCB", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
-    table.cell(t_eq, 3, 11, "95% UCB", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 2, 11, "FW95 LCB", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
+    table.cell(t_eq, 3, 11, "FW95 UCB", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_eq, 4, 11, "t≈", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_eq, 5, 11, "N reg/oth", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
     table.cell(t_eq, 6, 11, "Pre/Post", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
@@ -1096,8 +1345,9 @@ if barstate.islast and show_eq
         float se = f_se(ss, sq, nn)
         float shrink = not na(nn) ? nn / (nn + SHRINK_K) : na
         float shr = not na(mm) and not na(shrink) ? mm * shrink : na
-        float lead = nn >= MIN_N_RANK and not na(se) ? shr - Z_SECTOR * se : na
-        float lag  = nn >= MIN_N_RANK and not na(se) ? shr + Z_SECTOR * se : na
+        float sectorCrit = nn >= MIN_N_RANK ? f_tcrit_approx(Z_SECTOR, nn - 1.0) : na
+        float lead = nn >= MIN_N_RANK and not na(se) and not na(sectorCrit) ? shr - sectorCrit * se : na
+        float lag  = nn >= MIN_N_RANK and not na(se) and not na(sectorCrit) ? shr + sectorCrit * se : na
         array.set(secMean, s, mm)
         array.set(secSE, s, se)
         array.set(secShr, s, shr)
@@ -1136,7 +1386,7 @@ if barstate.islast and show_eq
             array.set(used, worstId, true)
 
     table.merge_cells(t_eq, 0, 16, 7, 16)
-    table.cell(t_eq, 0, 16, "Sectors — shrunk RR + Bonferroni-style 90% family-wise score; N >= " + str.tostring(MIN_N_RANK),
+    table.cell(t_eq, 0, 16, "Sectors — zero-prior shrinkage + 90% family-wise conservative bound; N >= " + str.tostring(MIN_N_RANK),
         bgcolor=color.new(color.teal, 10), text_color=color.white, text_size=size.tiny)
 
     table.cell(t_eq, 0, 17, "Rank", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.tiny)
@@ -1249,11 +1499,11 @@ if barstate.islast and show_eq
 // =====================================================================
 bool liquidity_crisis = risk_valid and stress_high and curve_low and intl_low
 bool risk_extreme      = risk_valid and risk_pct >= 80
-bool quality_ok        = data_quality_score >= 70 and structural_confidence >= 55
+bool quality_ok        = data_quality_score >= 70 and model_reliability >= 55 and specification_score >= 60
 bool evidence_bad20    = evidence20_confirmed and not na(effect20) and effect20 < 0
 bool evidence_good20   = evidence20_confirmed and not na(effect20) and effect20 > 0
 
-alertcondition(risk_extreme and quality_ok, title="v6.0.1: Extreme Risk / Calibrated Quality Confirmed", message="MacroAcademic v6.0.1: extreme macro risk with acceptable data and calibrated structural confidence.")
-alertcondition(liquidity_crisis and quality_ok, title="v6.0.1: Liquidity-Curve-External Stress", message="MacroAcademic v6.0.1: liquidity, curve and external stress are jointly adverse.")
-alertcondition(risk_extreme and evidence_bad20 and quality_ok, title="v6.0.1: Extreme Risk + Negative 20D Evidence", message="MacroAcademic v6.0.1: extreme-risk regime with negative 20D evidence versus other regimes.")
-alertcondition(evidence_good20 and quality_ok, title="v6.0.1: Positive 20D Regime Evidence", message="MacroAcademic v6.0.1: current regime has positive 20D evidence versus other regimes.")
+alertcondition(risk_extreme and quality_ok, title="v7.0.0: Extreme Risk / Calibrated Quality Confirmed", message="MacroAcademic v7.0.0: extreme macro risk with acceptable data and acceptable model reliability and specification robustness.")
+alertcondition(liquidity_crisis and quality_ok, title="v7.0.0: Liquidity-Curve-External Stress", message="MacroAcademic v7.0.0: liquidity, curve and external stress are jointly adverse.")
+alertcondition(risk_extreme and evidence_bad20 and quality_ok, title="v7.0.0: Extreme Risk + Negative 20D Evidence", message="MacroAcademic v7.0.0: extreme-risk regime with negative 20D evidence versus other regimes.")
+alertcondition(evidence_good20 and quality_ok, title="v7.0.0: Positive 20D Regime Evidence", message="MacroAcademic v7.0.0: current regime has positive 20D evidence versus other regimes.")
