@@ -4,14 +4,36 @@
 
 **Release Date:** 2026
 **Platform:** TradingView Pine Script v6
+**SHA-256:** `e6db0e36b7870225a9bddfff94303aa4dce19e564a9b17fed88b8cf4f46a56e3`
 
-### Research Precision & Dual Chain Diagnostics
+### Research Precision & Dual Chain Diagnostics — Patch v8.2.1
 
-Bản v8.2.2 nâng cấp từ v6.0.1 lên Research Precision & Dual Chain Diagnostics:
-- Tinh chỉnh inference và độ chính xác nghiên cứu
-- Bổ sung dual chain diagnostics cho chuỗi truyền dẫn
-- Nâng cấp Pine Script v5 → v6
-- Code: 893 dòng (v6.0.1) → 1206 dòng (v8.2.2)
+Bản v8.2.2 là **patch kiểm định và trình bày** cho v8.2.1. Bản này **không thay đổi** công thức mô hình, trọng số Evidence, nested walk-forward, lag selection, Data Gate, Model Gate, ngưỡng VALID/WATCH hay weakest-link discipline.
+
+Xử lý **hai lỗi** Research Mode phát hiện:
+
+**Bug 1 — Format mask sai (`"#.1"` / `"#.3"`):**
+- Pine in `1` và `3` như ký tự literal thay vì placeholder chữ số.
+- Làm sai hiển thị beta, OOS R², Edge, Hit, lag gap và các delta.
+- **Fix:** Định nghĩa 3 mask dùng chung: `FMT_1="#.0"` (1 số), `FMT_2="#.00"` (Edge, lag gap), `FMT_3="#.000"` (beta, R²).
+
+**Bug 2 — P6 ghi đè direct forecast gate:**
+- P6 ghi đè lý do của direct forecast gate bằng `FAIL: LINK x`.
+- Người dùng không phân biệt được lỗi mắt xích vs lỗi forecast toàn chuỗi.
+- **Fix:** P6 giữ **3 kết luận riêng**: Link Gate (A/B/C) + Direct Forecast Gate + Overall State. Direct reason lưu độc lập, không bị Link Gate che.
+
+**Phạm vi KHÔNG thay đổi:**
+- Pine v6, chart 1D, `calc_bars_count=800`, `max_bars_back=800`.
+- 17 static `request.security()`, tất cả `lookahead_off`.
+- Train 120 / calibration 60 / holdout 40, lag 0/1/3/5.
+- Benchmark tốt hơn giữa zero-change và rolling historical mean.
+- Median/MAD robust scaling, predictive coherence cap.
+- DataQ độc lập Evidence, hard VALID/WATCH gates.
+
+**Static QA:** PASS (delimiter balance, constructor arity, table bounds, dual chain vars, lookahead_off, format masks). Xem `QA_v8.2.2.json`.
+**Live compile:** Cần xác nhận trên TradingView (protocol 4 ảnh: Overview/P1/P4/P6).
+
+Code: 893 dòng (v6.0.1) → 1206 dòng (v8.2.2)
 
 ---
 

@@ -1,0 +1,52 @@
+{
+  "file": "MacroAcademic_v8_2_2_Research_Precision_Dual_Chain_Diagnostics.pine",
+  "line_count": 1206,
+  "sha256": "e6db0e36b7870225a9bddfff94303aa4dce19e564a9b17fed88b8cf4f46a56e3",
+  "pine_version_6": true,
+  "version_labels_8_2_2": true,
+  "delimiter_balance_pass": true,
+  "delimiter_error": null,
+  "type_field_counts": {
+    "EvalMetrics": 6,
+    "Candidate": 16,
+    "CoreModel": 26,
+    "ModelResult": 28
+  },
+  "constructor_argument_counts": {
+    "EvalMetrics": [
+      6
+    ],
+    "Candidate": [
+      16
+    ],
+    "CoreModel": [
+      26
+    ],
+    "ModelResult": [
+      28,
+      28
+    ]
+  },
+  "constructor_arity_pass": true,
+  "security_request_count": 17,
+  "security_lookahead_off_pass": true,
+  "security_calc_bars_count_pass": true,
+  "ta_sum_count": 0,
+  "reserved_text_identifier_count": 0,
+  "legacy_literal_format_mask_count": 0,
+  "format_constants_present": true,
+  "edge_uses_two_decimals": true,
+  "lag_gap_uses_two_decimals": true,
+  "beta_uses_three_decimals": true,
+  "select_r2_uses_three_decimals": true,
+  "holdout_r2_uses_three_decimals": true,
+  "dual_chain_variables_present": true,
+  "chain_gate_not_overwriting_direct_reason": true,
+  "p6_research_dual_gate_rows_present": true,
+  "overview_research_dual_gate_present": true,
+  "model_gate_logic_unchanged_signatures": true,
+  "table_rows": 10,
+  "max_table_row_reference": 9,
+  "table_bounds_pass": true,
+  "overall_static_qa_pass": true
+}

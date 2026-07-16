@@ -196,7 +196,7 @@ Trong **2–6 tuần**, bạn chỉ cần lưu ảnh ở **3–5 ngày tiêu bi�
 
 ## 📝 Phiên bản
 
-**v8.2.2** (2026) - Research Precision & Dual Chain Diagnostics, Pine Script v6
+**v8.2.2** (2026) - Patch v8.2.1: Research Precision (fix format mask) + Dual Chain Diagnostics (fix P6 ghi đè direct gate), Pine Script v6. Xem `METHOD_v8.2.2.md` và `RELEASE_NOTES.md`.
 
 **v6.0.1** (2025) - MacroAcademic FULL Edition với 6 panels (P1–P6), Interpretation Upgrade
 
