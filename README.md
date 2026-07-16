@@ -339,7 +339,7 @@ Tất cả các dự án đều được xây dựng với các chuẩn mực h�
 - **02_Macro_Alert_System:** v7.0.0 (Academic Robustness)
 - **03_Indices_Research_Map:** v3.1.3e (Bounded Global Buffer Fix)
 - **04_YieldCurveLab:** v2.3.0 (Horizon Separation & Sample Power)
-- **05_Bond_Transmission_Monitor:** v8.2.2 (Research Precision & Dual Chain Diagnostics)
+- **05_Bond_Transmission_Monitor:** v8.2.2 (Research Precision & Dual Chain Diagnostics — FINAL BASELINE LOCKED 16/07/2026)
 
 ---
 
