@@ -1,0 +1,2435 @@
+//@version=6
+indicator("Macro → VN Indices Research v3.1.3e — Bounded Global Buffer Fix",
+     shorttitle="MacroIndices Academic v3.1.3e",
+     overlay=false,
+     max_bars_back=120,
+     max_labels_count=100,
+     max_lines_count=100)
+
+
+//=============================================================================
+// RESEARCH DESIGN — v3.1.3e
+//=============================================================================
+// 1) One common research clock. The chart timeframe MUST equal Research timeframe.
+// 2) All external series use the last CONFIRMED source bar:
+//       request.security(..., expression[1], lookahead = barmerge.lookahead_on)
+//    This intentionally introduces a one-bar publication lag to eliminate HTF repaint.
+// 3) Forward outcomes are aligned as:
+//       regime at t-L  →  return from t-L to t.
+// 4) Non-overlapping sampling is ON by default. If disabled, inference labels become
+//    DESCRIPTIVE because overlapping forward returns are serially dependent.
+// 5) Dispersion uses SAMPLE variance (n-1), not population variance.
+// 6) Tables report mean, finite-sample t-approximation confidence interval, win rate, N,
+//    and an evidence label combining statistical and economic significance.
+// 7) Sector relative return is compounded correctly for arithmetic returns:
+//       (1 + sector_return) / (1 + benchmark_return) - 1.
+// 8) Composite macro risk dynamically renormalizes available pillars and exposes DATAQ.
+// 9) Regime hysteresis reduces threshold-churn and spurious transition counts.
+// 10) Calibration / validation sample modes support basic holdout robustness checks.
+// 11) Path risk is separated into MAE, MFE, and close-to-close maximum drawdown.
+// 12) Composite diagnostics expose dominant stress, breadth, dispersion, and tail override.
+// 13) Data integrity distinguishes VALID, STALE, PARTIAL, WARMUP, and INVALID states.
+// 14) Wilson intervals quantify uncertainty around win rates and transition probabilities.
+// 15) Sector inference can apply a Bonferroni family-wise correction across 11 sectors.
+// 16) Auxiliary calibration/validation and backward-return controls test stability and lead-lag asymmetry.
+// 17) Fixed 504/756/1260-day specifications diagnose current-regime sensitivity.
+// 18) Cadence-aware freshness excludes the stepwise policy-rate series from daily staleness failures.
+// 19) Index discontinuity gates reject windows containing implausible one-day scale breaks.
+// 20) OOS evidence uses a dedicated minimum N and reports calibration/validation counts.
+// 21) The negative control uses paired forward-minus-backward differences with a t-CI.
+// 22) Non-overlap phase is explicit and reproducible within the loaded research history.
+// 23) Outcome-quality gates classify rejection rates as CLEAN, CAUTION, CONTAMINATED, or UNUSABLE.
+// 24) Contaminated samples cannot receive ROBUST evidence; unusable samples are diagnostic only.
+// 25) Sector rotation requires minimum cross-sectional breadth and never duplicates a sector across tails.
+// 26) Transition probability uses all valid macro states, while return inference uses only clean market outcomes.
+//
+// 27) Market and sector time-series updates are explicitly unrolled by symbol. No selector-derived
+//     local series is history-referenced inside a loop.
+// 28) An internal invariant reconciles VNINDEX market counts with transition return/rejection counts.
+//     Any mismatch locks outcome inference as INTERNAL-FAIL.
+//
+// 29) A bounded indicator-wide max_bars_back=120 covers the largest fixed offset used.
+//     This is far below the prior 5000-bar allocation and avoids per-series parser issues.
+//     It is designed to prevent RE10067, RE10143, and CE10013 simultaneously.
+//
+// IMPORTANT: This is a conditional historical research tool, not a causal model and
+// not an investment recommendation. Parametric CIs remain approximate; Pine Script is not
+// a substitute for a full econometric environment with HAC/bootstrap inference.
+
+
+//=============================================================================
+// 0) CONSTANTS & HELPERS
+//=============================================================================
+
+
+float Z95 = 1.959964
+float Z_BONFERRONI_11 = 2.837596
+int N_BUCKETS = 5
+int N_MARKETS = 6
+int N_SECTORS = 11
+
+
+f_clamp(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+
+f_avg(float sum, float cnt) =>
+    cnt > 0 ? sum / cnt : na
+
+
+f_sample_var(float sum, float sumSq, float cnt) =>
+    cnt > 1 ? math.max((sumSq - sum * sum / cnt) / (cnt - 1.0), 0.0) : na
+
+
+f_sample_sd(float sum, float sumSq, float cnt) =>
+    float v = f_sample_var(sum, sumSq, cnt)
+    not na(v) ? math.sqrt(v) : na
+
+
+f_se(float sum, float sumSq, float cnt) =>
+    float sd = f_sample_sd(sum, sumSq, cnt)
+    cnt > 1 and not na(sd) ? sd / math.sqrt(cnt) : na
+
+
+f_zstat(float sum, float sumSq, float cnt) =>
+    float mu = f_avg(sum, cnt)
+    float se = f_se(sum, sumSq, cnt)
+    cnt > 1 and not na(mu) and not na(se) and se > 0 ? mu / se : na
+
+
+f_ci_low(float sum, float sumSq, float cnt, float zCrit) =>
+    float mu = f_avg(sum, cnt)
+    float se = f_se(sum, sumSq, cnt)
+    not na(mu) and not na(se) ? mu - zCrit * se : na
+
+
+f_ci_high(float sum, float sumSq, float cnt, float zCrit) =>
+    float mu = f_avg(sum, cnt)
+    float se = f_se(sum, sumSq, cnt)
+    not na(mu) and not na(se) ? mu + zCrit * se : na
+
+
+f_winrate(float win, float cnt) =>
+    cnt > 0 ? win / cnt * 100.0 : na
+
+
+f_reset_float_array(float[] arr) =>
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            array.set(arr, i, 0.0)
+
+
+f_score_high_bad(float src, int length) =>
+    ta.percentrank(src, length)
+
+
+f_score_low_bad(float src, int length) =>
+    100.0 - ta.percentrank(src, length)
+
+
+f_clip_return(float r, float lo, float hi) =>
+    na(r) ? na : f_clamp(r, lo, hi)
+
+
+f_compute_return_raw(float cNow, float cThen, bool useLog) =>
+    not na(cNow) and not na(cThen) and cNow > 0 and cThen > 0 ?
+         (useLog ? math.log(cNow / cThen) : cNow / cThen - 1.0) : na
+
+
+f_compute_return(float cNow, float cThen, bool useLog, float clipLo, float clipHi) =>
+    f_clip_return(f_compute_return_raw(cNow, cThen, useLog), clipLo, clipHi)
+
+
+f_relative_return(float sectorRet, float benchRet, bool useLog) =>
+    float rr = na
+    if not na(sectorRet) and not na(benchRet)
+        rr := useLog ? sectorRet - benchRet :
+             (1.0 + benchRet != 0 ? (1.0 + sectorRet) / (1.0 + benchRet) - 1.0 : na)
+    rr
+
+
+f_bucket_raw(float risk) =>
+    int b = na
+    if not na(risk)
+        b := risk < 20 ? 0 :
+             risk < 40 ? 1 :
+             risk < 60 ? 2 :
+             risk < 80 ? 3 : 4
+    b
+
+
+f_bucket_label(int b) =>
+    b == 0 ? "B0 (0–20)" :
+     b == 1 ? "B1 (20–40)" :
+     b == 2 ? "B2 (40–60)" :
+     b == 3 ? "B3 (60–80)" :
+     b == 4 ? "B4 (80–100)" : "NA"
+
+
+f_bucket_text(int b) =>
+    b == 0 ? "Very supportive" :
+     b == 1 ? "Supportive" :
+     b == 2 ? "Neutral" :
+     b == 3 ? "Risky" :
+     b == 4 ? "High stress" : "NA"
+
+
+f_upper_boundary(int b) =>
+    b == 0 ? 20.0 : b == 1 ? 40.0 : b == 2 ? 60.0 : b == 3 ? 80.0 : 100.0
+
+
+f_lower_boundary(int b) =>
+    b == 1 ? 20.0 : b == 2 ? 40.0 : b == 3 ? 60.0 : b == 4 ? 80.0 : 0.0
+
+
+f_regime_arrow(int currentBucket, int priorBucket) =>
+    na(currentBucket) or na(priorBucket) ? "→" :
+     currentBucket > priorBucket ? "↑" :
+     currentBucket < priorBucket ? "↓" : "→"
+
+
+f_fmt_pct(float x, string pattern) =>
+    not na(x) ? str.tostring(x * 100.0, pattern) + "%" : "--"
+
+
+f_fmt_num(float x, string pattern) =>
+    not na(x) ? str.tostring(x, pattern) : "--"
+
+
+f_fmt_ci(float lo, float hi) =>
+    not na(lo) and not na(hi) ? "[" + str.tostring(lo * 100.0, "#.##") + "; " + str.tostring(hi * 100.0, "#.##") + "]%" : "--"
+
+
+f_dataq_label(int pillars, float coverage) =>
+    pillars == 4 and coverage >= 0.95 ? "HIGHQ" :
+     pillars >= 3 and coverage >= 0.70 ? "MEDQ" : "LOWQ"
+
+
+
+
+f_tcrit95(float cnt) =>
+    float df = cnt - 1.0
+    df <= 1 ? 12.706 :
+     df <= 2 ? 4.303 :
+     df <= 3 ? 3.182 :
+     df <= 4 ? 2.776 :
+     df <= 5 ? 2.571 :
+     df <= 6 ? 2.447 :
+     df <= 7 ? 2.365 :
+     df <= 8 ? 2.306 :
+     df <= 9 ? 2.262 :
+     df <= 12 ? 2.179 :
+     df <= 15 ? 2.131 :
+     df <= 20 ? 2.086 :
+     df <= 30 ? 2.042 :
+     df <= 60 ? 2.000 :
+     df <= 120 ? 1.980 : Z95
+
+
+f_ci_low_auto(float sum, float sumSq, float cnt) =>
+    f_ci_low(sum, sumSq, cnt, f_tcrit95(cnt))
+
+
+f_ci_high_auto(float sum, float sumSq, float cnt) =>
+    f_ci_high(sum, sumSq, cnt, f_tcrit95(cnt))
+
+
+f_wilson_low(float successes, float total, float zCrit) =>
+    float out = na
+    if total > 0 and not na(successes)
+        float p = successes / total
+        float z2 = zCrit * zCrit
+        float denom = 1.0 + z2 / total
+        float center = (p + z2 / (2.0 * total)) / denom
+        float half = zCrit * math.sqrt((p * (1.0 - p) + z2 / (4.0 * total)) / total) / denom
+        out := math.max(center - half, 0.0)
+    out
+
+
+f_wilson_high(float successes, float total, float zCrit) =>
+    float out = na
+    if total > 0 and not na(successes)
+        float p = successes / total
+        float z2 = zCrit * zCrit
+        float denom = 1.0 + z2 / total
+        float center = (p + z2 / (2.0 * total)) / denom
+        float half = zCrit * math.sqrt((p * (1.0 - p) + z2 / (4.0 * total)) / total) / denom
+        out := math.min(center + half, 1.0)
+    out
+
+
+f_fmt_prob_ci(float lo, float hi) =>
+    not na(lo) and not na(hi) ? "[" + str.tostring(lo * 100.0, "#.#") + "; " + str.tostring(hi * 100.0, "#.#") + "]%" : "--"
+
+
+f_pillar_dispersion(float a, float b, float c, float d) =>
+    float sum = 0.0
+    float sumSq = 0.0
+    float n = 0.0
+    if not na(a)
+        sum += a
+        sumSq += a * a
+        n += 1.0
+    if not na(b)
+        sum += b
+        sumSq += b * b
+        n += 1.0
+    if not na(c)
+        sum += c
+        sumSq += c * c
+        n += 1.0
+    if not na(d)
+        sum += d
+        sumSq += d * d
+        n += 1.0
+    f_sample_sd(sum, sumSq, n)
+
+
+f_stale_age(int sourceTime) =>
+    int age = ta.barssince(ta.change(sourceTime) != 0)
+    na(sourceTime) ? 100000 : nz(age, 0)
+
+
+f_integrity_label(bool warmup, bool inputValid, int pillars, float coverage, int maxStaleAge, int staleLimit) =>
+    warmup ? "WARMUP" :
+     not inputValid ? "INVALID" :
+     maxStaleAge > staleLimit ? "STALE" :
+     pillars < 4 or coverage < 0.95 ? "PARTIAL" : "VALID"
+
+
+f_consensus_label(int breadth60, int breadth80, float dispersion, float dispersionWarn) =>
+    breadth80 >= 2 ? "BROAD EXTREME" :
+     breadth60 >= 3 ? "BROAD RISK" :
+     not na(dispersion) and dispersion >= dispersionWarn ? "DIVERGENT" : "BALANCED"
+
+
+f_stability_label(
+     float calSum, float calSumSq, float calCnt,
+     float valSum, float valSumSq, float valCnt,
+     int minN, float econFloor) =>
+    float calMean = f_avg(calSum, calCnt)
+    float valMean = f_avg(valSum, valCnt)
+    float calLo = f_ci_low_auto(calSum, calSumSq, calCnt)
+    float calHi = f_ci_high_auto(calSum, calSumSq, calCnt)
+    float valLo = f_ci_low_auto(valSum, valSumSq, valCnt)
+    float valHi = f_ci_high_auto(valSum, valSumSq, valCnt)
+    bool enough = calCnt >= minN and valCnt >= minN
+    bool sameSign = not na(calMean) and not na(valMean) and ((calMean > 0 and valMean > 0) or (calMean < 0 and valMean < 0))
+    bool bothMaterial = not na(calMean) and not na(valMean) and math.abs(calMean) >= econFloor and math.abs(valMean) >= econFloor
+    bool calSig = not na(calLo) and not na(calHi) and (calLo > 0 or calHi < 0)
+    bool valSig = not na(valLo) and not na(valHi) and (valLo > 0 or valHi < 0)
+    not enough ? "OOS THIN" :
+     sameSign and bothMaterial and calSig and valSig ? "OOS ROBUST" :
+     sameSign and bothMaterial ? "OOS MATERIAL" :
+     sameSign ? "SIGN STABLE" : "OOS FRAGILE"
+
+
+f_paired_control_label(float diffSum, float diffSumSq, float diffCnt, int minN, float econFloor, bool independentApprox) =>
+    float diffMean = f_avg(diffSum, diffCnt)
+    float diffLo = f_ci_low_auto(diffSum, diffSumSq, diffCnt)
+    float diffHi = f_ci_high_auto(diffSum, diffSumSq, diffCnt)
+    diffCnt < minN ? "CONTROL THIN" :
+     not independentApprox ? "DESCRIPTIVE CONTROL" :
+     not na(diffMean) and not na(diffLo) and diffMean >= econFloor and diffLo > 0 ? "FORWARD-DOMINANT" :
+     not na(diffMean) and not na(diffHi) and diffMean <= -econFloor and diffHi < 0 ? "BACKWARD-DOMINANT" :
+     "NO CLEAR ASYMMETRY"
+
+
+f_has_jump_window(float closeSeries, int startOffset, int horizon, float maxAbsDailyMove) =>
+    bool broken = false
+    if horizon > 0
+        for j = 0 to horizon - 1
+            float newer = closeSeries[startOffset + j]
+            float older = closeSeries[startOffset + j + 1]
+            if not na(newer) and not na(older) and newer > 0 and older > 0
+                float oneDayMove = math.abs(newer / older - 1.0)
+                if oneDayMove > maxAbsDailyMove
+                    broken := true
+    broken
+
+
+f_rejection_rate(float validCnt, float rejectedCnt) =>
+    float valid = nz(validCnt, 0.0)
+    float rejected = nz(rejectedCnt, 0.0)
+    float total = valid + rejected
+    total > 0 ? rejected / total * 100.0 : na
+
+
+f_sample_health(
+     float validCnt, float rejectedCnt,
+     float cautionPct, float contaminatedPct, float unusablePct) =>
+    float rejectRate = f_rejection_rate(validCnt, rejectedCnt)
+    na(rejectRate) ? "NO-DATA" :
+     rejectRate > unusablePct ? "UNUSABLE" :
+     rejectRate > contaminatedPct ? "CONTAMINATED" :
+     rejectRate > cautionPct ? "CAUTION" : "CLEAN"
+
+
+f_quality_allows_inference(string sampleHealth) =>
+    sampleHealth == "CLEAN" or sampleHealth == "CAUTION"
+
+
+f_quality_evidence(string baseEvidence, string sampleHealth) =>
+    sampleHealth == "UNUSABLE" ? "UNUSABLE" :
+     sampleHealth == "CONTAMINATED" ? "CONTAMINATED" :
+     sampleHealth == "NO-DATA" ? "NO-DATA" :
+     sampleHealth == "CAUTION" and baseEvidence == "ROBUST" ? "CAUTION-ROBUST" :
+     sampleHealth == "CAUTION" and baseEvidence == "STAT-ONLY" ? "CAUTION-STAT" :
+     sampleHealth == "CAUTION" and baseEvidence == "ECON-ONLY" ? "CAUTION-ECON" :
+     sampleHealth == "CAUTION" and baseEvidence == "THIN" ? "CAUTION-THIN" :
+     sampleHealth == "CAUTION" ? "CAUTION" : baseEvidence
+
+
+f_academic_label(string baseEvidence, string integrity, string stability, string leadLag, int specAgreement) =>
+    integrity == "INVALID" or integrity == "WARMUP" ? "INVALID" :
+     integrity == "STALE" ? "DATA-STALE" :
+     integrity == "PARTIAL" and baseEvidence == "ROBUST" ? "DATA-PARTIAL" :
+     baseEvidence == "THIN" ? "THIN" :
+     baseEvidence == "DESCRIPTIVE" ? "DESCRIPTIVE" :
+     stability == "OOS FRAGILE" ? "FRAGILE" :
+     baseEvidence == "ROBUST" and stability == "OOS ROBUST" and specAgreement >= 2 and leadLag != "BACKWARD-DOMINANT" ? "ROBUST-OOS" :
+     (baseEvidence == "ROBUST" or baseEvidence == "STAT-ONLY" or baseEvidence == "ECON-ONLY") and
+      (stability == "OOS ROBUST" or stability == "OOS MATERIAL" or stability == "SIGN STABLE") and specAgreement >= 2 ? "STABLE-CONDITIONAL" :
+     baseEvidence
+
+
+f_path_outcomes(float closeSeries, float highSeries, float lowSeries, int horizon, bool useLog) =>
+    float startClose = closeSeries[horizon]
+
+
+    // MAE/MFE begin AFTER the signal close, so the signal bar's pre-close range is excluded.
+    float minLow = na
+    float maxHigh = na
+    if horizon > 0
+        for j = 0 to horizon - 1
+            int offset = horizon - 1 - j
+            float h = highSeries[offset]
+            float l = lowSeries[offset]
+            if not na(h)
+                maxHigh := na(maxHigh) ? h : math.max(maxHigh, h)
+            if not na(l)
+                minLow := na(minLow) ? l : math.min(minLow, l)
+
+
+    float mae = not na(startClose) and startClose > 0 and not na(minLow) and minLow > 0 ?
+         (useLog ? math.log(minLow / startClose) : minLow / startClose - 1.0) : na
+    float mfe = not na(startClose) and startClose > 0 and not na(maxHigh) and maxHigh > 0 ?
+         (useLog ? math.log(maxHigh / startClose) : maxHigh / startClose - 1.0) : na
+
+
+    // Close-to-close path drawdown is unambiguous with daily data and includes the signal close as the initial peak.
+    float peakClose = na
+    float closeMdd = na
+    if not na(startClose) and startClose > 0
+        closeMdd := 0.0
+        for j = 0 to horizon
+            int offset = horizon - j
+            float c = closeSeries[offset]
+            if not na(c) and c > 0
+                peakClose := na(peakClose) ? c : math.max(peakClose, c)
+                float dd = useLog ? math.log(c / peakClose) : c / peakClose - 1.0
+                closeMdd := math.min(closeMdd, dd)
+
+
+    [mae, mfe, closeMdd]
+
+
+f_evidence_label(float sum, float sumSq, float cnt, int minN, float zCrit, float econFloor, bool independentApprox) =>
+    float mu = f_avg(sum, cnt)
+    float z = f_zstat(sum, sumSq, cnt)
+    bool statSig = not na(z) and math.abs(z) >= zCrit
+    bool econSig = not na(mu) and math.abs(mu) >= econFloor
+    na(cnt) or cnt < minN ? "THIN" :
+     not independentApprox ? "DESCRIPTIVE" :
+     statSig and econSig ? "ROBUST" :
+     statSig ? "STAT-ONLY" :
+     econSig ? "ECON-ONLY" : "WEAK"
+
+
+f_status_from_score(float score, string highText, string lowText) =>
+    na(score) ? "NA" : score >= 80 ? highText : score <= 20 ? lowText : "MID"
+
+
+f_weighted_risk(float s1, float w1, float s2, float w2, float s3, float w3, float s4, float w4) =>
+    float numerator = 0.0
+    float validWeight = 0.0
+    int pillars = 0
+    float totalWeight = math.max(w1, 0) + math.max(w2, 0) + math.max(w3, 0) + math.max(w4, 0)
+
+
+    if not na(s1) and w1 > 0
+        numerator += s1 * w1
+        validWeight += w1
+        pillars += 1
+    if not na(s2) and w2 > 0
+        numerator += s2 * w2
+        validWeight += w2
+        pillars += 1
+    if not na(s3) and w3 > 0
+        numerator += s3 * w3
+        validWeight += w3
+        pillars += 1
+    if not na(s4) and w4 > 0
+        numerator += s4 * w4
+        validWeight += w4
+        pillars += 1
+
+
+    float coverage = totalWeight > 0 ? validWeight / totalWeight : 0.0
+    float risk = validWeight > 0 ? numerator / validWeight : na
+    [risk, pillars, coverage]
+
+
+//=============================================================================
+// 1) INPUTS
+//=============================================================================
+
+
+group_clock = "01. Research Clock & Integrity"
+research_tf = input.timeframe("1D", "Research timeframe", group=group_clock,
+     tooltip="For correct event alignment, the chart timeframe must equal this timeframe.")
+use_non_overlap = input.bool(true, "Use non-overlapping outcome samples", group=group_clock,
+     tooltip="Recommended for approximate inference. Disable only for descriptive mapping.")
+reset_stats = input.bool(false, "Reset accumulated statistics", group=group_clock)
+max_stale_daily_bars = input.int(3, "Maximum stale bars: daily sources", minval=0, maxval=20, group=group_clock,
+     tooltip="Applied to interbank and sovereign-yield sources. The policy-rate series is stepwise and is reported separately rather than treated as a daily stale failure.")
+non_overlap_phase = input.int(0, "Non-overlap phase", minval=0, maxval=59, group=group_clock,
+     tooltip="Selects the phase cohort used for non-overlapping outcomes. Values are reduced modulo the selected horizon.")
+filter_index_breaks = input.bool(true, "Reject index scale-break windows", group=group_clock,
+     tooltip="Excludes outcome windows containing an implausibly large one-day close move, which usually indicates a rebasing or data-stitching defect.")
+max_index_daily_move_pct = input.float(15.0, "Maximum valid 1D index move (%)", minval=5.0, maxval=50.0, step=1.0, group=group_clock)
+
+
+group_macro = "02. Macro Composite"
+score_lb = input.int(756, "Percentile lookback", minval=252, maxval=2500, group=group_macro)
+risk_smooth_len = input.int(5, "Risk smoothing EMA", minval=1, maxval=60, group=group_macro)
+hysteresis_pts = input.float(3.0, "Bucket hysteresis (risk points)", minval=0.0, maxval=10.0, step=0.5, group=group_macro)
+min_pillars = input.int(3, "Minimum available pillars", minval=1, maxval=4, group=group_macro)
+min_weight_coverage = input.float(0.70, "Minimum valid weight coverage", minval=0.25, maxval=1.0, step=0.05, group=group_macro)
+tail_warning_pct = input.float(80.0, "Dominant-pillar tail threshold", minval=60.0, maxval=99.0, step=1.0, group=group_macro)
+breadth_warning_pct = input.float(60.0, "Stress-breadth threshold", minval=40.0, maxval=90.0, step=1.0, group=group_macro)
+dispersion_warning = input.float(25.0, "Pillar-dispersion warning", minval=5.0, maxval=50.0, step=1.0, group=group_macro)
+
+
+w_liquidity = input.float(0.35, "Weight: Liquidity stress", minval=0.0, maxval=1.0, step=0.05, group=group_macro)
+w_curve = input.float(0.30, "Weight: Curve shape", minval=0.0, maxval=1.0, step=0.05, group=group_macro)
+w_external = input.float(0.20, "Weight: International spread", minval=0.0, maxval=1.0, step=0.05, group=group_macro)
+w_long_policy = input.float(0.15, "Weight: 10Y–policy spread", minval=0.0, maxval=1.0, step=0.05, group=group_macro)
+
+
+group_outcome = "03. Outcome Definition"
+analysis_horizon = input.int(20, "Displayed horizon", options=[5, 20, 60], group=group_outcome)
+transition_horizon = input.int(20, "Transition horizon", options=[5, 20, 60], group=group_outcome)
+use_log_return = input.bool(false, "Use log returns", group=group_outcome)
+ret_clip_hi = input.float(0.80, "Winsor cap: upper return", minval=0.10, maxval=3.0, step=0.05, group=group_outcome)
+ret_clip_lo = input.float(-0.60, "Winsor cap: lower return", minval=-0.95, maxval=-0.05, step=0.05, group=group_outcome)
+
+
+group_sample = "04. Sample & Holdout"
+sample_mode = input.string("Full sample", "Sample mode",
+     options=["Full sample", "Calibration", "Validation"], group=group_sample)
+sample_start_year = input.int(2015, "Start year", minval=2000, maxval=2100, group=group_sample)
+sample_end_year = input.int(2100, "End year", minval=2000, maxval=2100, group=group_sample)
+split_year = input.int(2022, "Calibration/validation split year", minval=2001, maxval=2099, group=group_sample)
+
+
+group_inference = "05. Inference & Materiality"
+min_n_market = input.int(30, "Minimum N: market", minval=10, maxval=500, group=group_inference)
+min_n_sector = input.int(30, "Minimum N: sector", minval=10, maxval=500, group=group_inference)
+min_n_transition = input.int(30, "Minimum N: transition state origin", minval=10, maxval=500, group=group_inference)
+min_n_transition_return = input.int(20, "Minimum N: transition return direction", minval=10, maxval=500, group=group_inference,
+     tooltip="State probability and market-return inference use separate sample-size gates.")
+min_n_oos = input.int(15, "Minimum N: each OOS segment", minval=8, maxval=100, group=group_inference,
+     tooltip="Calibration and validation are assessed separately. This threshold is intentionally distinct from the full-sample minimum N.")
+min_n_control = input.int(20, "Minimum N: paired negative control", minval=10, maxval=200, group=group_inference)
+z_critical_market = input.float(1.96, "Critical |z|: market", minval=1.0, maxval=4.0, step=0.01, group=group_inference)
+z_critical_sector = input.float(2.58, "User critical |z|: sector", minval=1.0, maxval=4.0, step=0.01, group=group_inference)
+sector_multiple_testing = input.string("Bonferroni 11", "Sector multiple-testing control",
+     options=["Bonferroni 11", "User critical"], group=group_inference,
+     tooltip="Bonferroni 11 uses a two-sided family-wise 5% threshold of approximately |z| = 2.84.")
+market_econ_floor_pct = input.float(1.0, "Economic floor: market return (%)", minval=0.0, maxval=20.0, step=0.25, group=group_inference)
+sector_econ_floor_pct = input.float(1.0, "Economic floor: sector relative return (%)", minval=0.0, maxval=20.0, step=0.25, group=group_inference)
+
+
+group_quality = "06. Outcome Data Quality"
+rejection_caution_pct = input.float(10.0, "Rejection rate: caution (%)", minval=0.0, maxval=50.0, step=1.0, group=group_quality)
+rejection_contaminated_pct = input.float(20.0, "Rejection rate: contaminated (%)", minval=1.0, maxval=75.0, step=1.0, group=group_quality)
+rejection_unusable_pct = input.float(35.0, "Rejection rate: unusable (%)", minval=1.0, maxval=95.0, step=1.0, group=group_quality,
+     tooltip="Above this rejection rate, mean/path statistics remain visible only as diagnostics and inferential fields are suppressed.")
+min_sector_breadth = input.int(6, "Minimum eligible sectors for rotation ranking", minval=4, maxval=11, group=group_quality,
+     tooltip="Eligible means minimum N is met and rejection health is CLEAN or CAUTION. Below this breadth, the panel lists eligible series but does not claim Top/Bottom rotation.")
+
+
+group_view = "07. View"
+bucket_view = input.string("Auto (current)", "Bucket view",
+     options=["Auto (current)", "B0 (0–20)", "B1 (20–40)", "B2 (40–60)", "B3 (60–80)", "B4 (80–100)"],
+     group=group_view)
+panel_view = input.string("Panel 1 — Macro Weather", "Panel",
+     options=["Panel 1 — Macro Weather", "Panel 2 — Market Conditional Returns", "Panel 3 — Sector Rotation", "Panel 4 — Transition Matrix"],
+     group=group_view)
+show_method_note = input.bool(true, "Show methodology note", group=group_view)
+show_path_risk = input.bool(true, "Show MAE / MFE / close-MDD", group=group_view)
+
+
+//=============================================================================
+// 2) RUNTIME INTEGRITY GATE
+//=============================================================================
+
+
+float chart_seconds = timeframe.in_seconds()
+float research_seconds = timeframe.in_seconds(research_tf)
+
+
+if barstate.isfirst and math.abs(chart_seconds - research_seconds) > 0.5
+    runtime.error("Academic Build requires chart timeframe = Research timeframe. Change the chart to " + research_tf + ".")
+
+
+if barstate.isfirst and sample_end_year < sample_start_year
+    runtime.error("Sample end year must be greater than or equal to start year.")
+
+
+if barstate.isfirst and not (rejection_caution_pct < rejection_contaminated_pct and rejection_contaminated_pct < rejection_unusable_pct)
+    runtime.error("Outcome-quality thresholds must satisfy caution < contaminated < unusable.")
+
+
+//=============================================================================
+// 3) CONFIRMED DATA REQUESTS
+//=============================================================================
+
+
+f_request_close(string symbol) =>
+    request.security(symbol, research_tf, close[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+
+f_request_close_time(string symbol) =>
+    request.security(symbol, research_tf, [close[1], time[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+
+f_request_ohlct(string symbol) =>
+    request.security(symbol, research_tf, [close[1], high[1], low[1], time[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+
+// Macro series. Close and source timestamp are requested together to preserve request-budget headroom.
+[policy_rate, policy_time] = f_request_close_time("VNINTR")
+[bond_2y, bond_2y_time] = f_request_close_time("VN02Y")
+[bond_10y, bond_10y_time] = f_request_close_time("VN10Y")
+[us_10y, us_10y_time] = f_request_close_time("US10Y")
+[interbank_rate, interbank_time] = f_request_close_time("VNINBR")
+
+
+// Market indices. OHLC and timestamp are requested as tuples.
+[mkt_vnindex, mkt_vnindex_high, mkt_vnindex_low, confirmed_market_time] = f_request_ohlct("HOSE:VNINDEX")
+[mkt_vn30, mkt_vn30_high, mkt_vn30_low, mkt_vn30_time] = f_request_ohlct("HOSE:VN30")
+[mkt_vn100, mkt_vn100_high, mkt_vn100_low, mkt_vn100_time] = f_request_ohlct("HOSE:VN100")
+[mkt_vnall, mkt_vnall_high, mkt_vnall_low, mkt_vnall_time] = f_request_ohlct("HOSE:VNALLSHARE")
+[mkt_vnmid, mkt_vnmid_high, mkt_vnmid_low, mkt_vnmid_time] = f_request_ohlct("HOSE:VNMIDCAP")
+[mkt_vnsmall, mkt_vnsmall_high, mkt_vnsmall_low, mkt_vnsmall_time] = f_request_ohlct("HOSE:VNSMALLCAP")
+
+
+// Sector indices
+float sec_vnfin = f_request_close("HOSE:VNFIN")
+float sec_vnfin_sel = f_request_close("HOSE:VNFINSELECT")
+float sec_vnind = f_request_close("HOSE:VNIND")
+float sec_vnit = f_request_close("HOSE:VNIT")
+float sec_vnreal = f_request_close("HOSE:VNREAL")
+float sec_vncons = f_request_close("HOSE:VNCONS")
+float sec_vncond = f_request_close("HOSE:VNCOND")
+float sec_vnene = f_request_close("HOSE:VNENE")
+float sec_vnmat = f_request_close("HOSE:VNMAT")
+float sec_vnheal = f_request_close("HOSE:VNHEAL")
+float sec_vnuti = f_request_close("HOSE:VNUTI")
+
+
+//=============================================================================
+// 4) MACRO ENGINE
+//=============================================================================
+
+
+float liquidity_stress = interbank_rate - policy_rate
+float curve_standard = bond_10y - bond_2y
+float intl_yield_diff = bond_10y - us_10y
+float long_policy_spread = bond_10y - policy_rate
+
+
+float score_liquidity = f_score_high_bad(liquidity_stress, score_lb)
+float score_curve = f_score_low_bad(curve_standard, score_lb)
+float score_external = f_score_low_bad(intl_yield_diff, score_lb)
+float score_long_policy = f_score_low_bad(long_policy_spread, score_lb)
+
+
+[risk_raw_unchecked, pillar_count, weight_coverage] = f_weighted_risk(
+     score_liquidity, w_liquidity,
+     score_curve, w_curve,
+     score_external, w_external,
+     score_long_policy, w_long_policy)
+
+
+bool macro_warmup = bar_index < score_lb
+bool risk_input_valid = pillar_count >= min_pillars and weight_coverage >= min_weight_coverage
+float risk_raw = risk_input_valid ? f_clamp(risk_raw_unchecked, 0.0, 100.0) : na
+float risk_pct = risk_smooth_len > 1 ? ta.ema(risk_raw, risk_smooth_len) : risk_raw
+bool risk_valid = not na(risk_pct)
+string dataq = f_dataq_label(pillar_count, weight_coverage)
+
+
+// Source-age diagnostics. Source timestamps change even when a rate itself is unchanged.
+int stale_policy = f_stale_age(policy_time)
+int stale_2y = f_stale_age(bond_2y_time)
+int stale_10y = f_stale_age(bond_10y_time)
+int stale_us10y = f_stale_age(us_10y_time)
+int stale_interbank = f_stale_age(interbank_time)
+// The policy rate is a legitimate step function. Daily freshness is assessed only on market-observed rate/yield series.
+int max_daily_stale_age = math.max(stale_2y, math.max(stale_10y, math.max(stale_us10y, stale_interbank)))
+string integrity_state = f_integrity_label(macro_warmup, risk_input_valid, pillar_count, weight_coverage, max_daily_stale_age, max_stale_daily_bars)
+
+
+// Cross-pillar structure diagnostics.
+float dominant_score = na
+string dominant_pillar = "NA"
+if not na(score_liquidity)
+    dominant_score := score_liquidity
+    dominant_pillar := "Liquidity"
+if not na(score_curve) and (na(dominant_score) or score_curve > dominant_score)
+    dominant_score := score_curve
+    dominant_pillar := "Curve"
+if not na(score_external) and (na(dominant_score) or score_external > dominant_score)
+    dominant_score := score_external
+    dominant_pillar := "External"
+if not na(score_long_policy) and (na(dominant_score) or score_long_policy > dominant_score)
+    dominant_score := score_long_policy
+    dominant_pillar := "Long–Policy"
+
+
+int stress_breadth60 = (not na(score_liquidity) and score_liquidity >= breadth_warning_pct ? 1 : 0) +
+     (not na(score_curve) and score_curve >= breadth_warning_pct ? 1 : 0) +
+     (not na(score_external) and score_external >= breadth_warning_pct ? 1 : 0) +
+     (not na(score_long_policy) and score_long_policy >= breadth_warning_pct ? 1 : 0)
+int stress_breadth80 = (not na(score_liquidity) and score_liquidity >= tail_warning_pct ? 1 : 0) +
+     (not na(score_curve) and score_curve >= tail_warning_pct ? 1 : 0) +
+     (not na(score_external) and score_external >= tail_warning_pct ? 1 : 0) +
+     (not na(score_long_policy) and score_long_policy >= tail_warning_pct ? 1 : 0)
+float pillar_dispersion = f_pillar_dispersion(score_liquidity, score_curve, score_external, score_long_policy)
+bool tail_override = not na(dominant_score) and dominant_score >= tail_warning_pct
+string consensus_state = f_consensus_label(stress_breadth60, stress_breadth80, pillar_dispersion, dispersion_warning)
+
+
+// Fixed-lookback specification sensitivity for the current macro-state classification.
+float sens_liq_504 = f_score_high_bad(liquidity_stress, 504)
+float sens_curve_504 = f_score_low_bad(curve_standard, 504)
+float sens_external_504 = f_score_low_bad(intl_yield_diff, 504)
+float sens_long_504 = f_score_low_bad(long_policy_spread, 504)
+[sens_raw_504_u, sens_pillars_504, sens_cov_504] = f_weighted_risk(
+     sens_liq_504, w_liquidity, sens_curve_504, w_curve,
+     sens_external_504, w_external, sens_long_504, w_long_policy)
+float sens_raw_504 = sens_pillars_504 >= min_pillars and sens_cov_504 >= min_weight_coverage ? sens_raw_504_u : na
+float sens_risk_504 = risk_smooth_len > 1 ? ta.ema(sens_raw_504, risk_smooth_len) : sens_raw_504
+
+
+float sens_liq_756 = f_score_high_bad(liquidity_stress, 756)
+float sens_curve_756 = f_score_low_bad(curve_standard, 756)
+float sens_external_756 = f_score_low_bad(intl_yield_diff, 756)
+float sens_long_756 = f_score_low_bad(long_policy_spread, 756)
+[sens_raw_756_u, sens_pillars_756, sens_cov_756] = f_weighted_risk(
+     sens_liq_756, w_liquidity, sens_curve_756, w_curve,
+     sens_external_756, w_external, sens_long_756, w_long_policy)
+float sens_raw_756 = sens_pillars_756 >= min_pillars and sens_cov_756 >= min_weight_coverage ? sens_raw_756_u : na
+float sens_risk_756 = risk_smooth_len > 1 ? ta.ema(sens_raw_756, risk_smooth_len) : sens_raw_756
+
+
+float sens_liq_1260 = f_score_high_bad(liquidity_stress, 1260)
+float sens_curve_1260 = f_score_low_bad(curve_standard, 1260)
+float sens_external_1260 = f_score_low_bad(intl_yield_diff, 1260)
+float sens_long_1260 = f_score_low_bad(long_policy_spread, 1260)
+[sens_raw_1260_u, sens_pillars_1260, sens_cov_1260] = f_weighted_risk(
+     sens_liq_1260, w_liquidity, sens_curve_1260, w_curve,
+     sens_external_1260, w_external, sens_long_1260, w_long_policy)
+float sens_raw_1260 = sens_pillars_1260 >= min_pillars and sens_cov_1260 >= min_weight_coverage ? sens_raw_1260_u : na
+float sens_risk_1260 = risk_smooth_len > 1 ? ta.ema(sens_raw_1260, risk_smooth_len) : sens_raw_1260
+
+
+int sens_bucket_504 = f_bucket_raw(sens_risk_504)
+int sens_bucket_756 = f_bucket_raw(sens_risk_756)
+int sens_bucket_1260 = f_bucket_raw(sens_risk_1260)
+int spec_agreement = na(sens_bucket_504) or na(sens_bucket_756) or na(sens_bucket_1260) ? 0 :
+     sens_bucket_504 == sens_bucket_756 and sens_bucket_756 == sens_bucket_1260 ? 3 :
+     sens_bucket_504 == sens_bucket_756 or sens_bucket_504 == sens_bucket_1260 or sens_bucket_756 == sens_bucket_1260 ? 2 : 1
+string spec_bucket_text = not na(sens_bucket_504) and not na(sens_bucket_756) and not na(sens_bucket_1260) ?
+     "B" + str.tostring(sens_bucket_504) + "/B" + str.tostring(sens_bucket_756) + "/B" + str.tostring(sens_bucket_1260) : "--"
+
+
+// Stateful hysteresis bucket.
+var int risk_bucket = na
+if risk_valid
+    if na(risk_bucket)
+        risk_bucket := f_bucket_raw(risk_pct)
+    else
+        while risk_bucket < 4 and risk_pct >= f_upper_boundary(risk_bucket) + hysteresis_pts
+            risk_bucket += 1
+        while risk_bucket > 0 and risk_pct < f_lower_boundary(risk_bucket) - hysteresis_pts
+            risk_bucket -= 1
+
+
+int risk_bucket_20ago = risk_valid[20] ? risk_bucket[20] : na
+float risk_ma20 = ta.sma(risk_pct, 20)
+float risk_mom5 = risk_pct - risk_pct[5]
+float risk_vol20 = ta.stdev(risk_pct, 20)
+
+
+plot(risk_pct, "Macro Risk % (confirmed)", color=color.new(color.orange, 0), linewidth=2)
+plot(risk_ma20, "Risk MA20", color=color.new(color.blue, 20), linewidth=1)
+plot(20, "B0/B1", color=color.new(color.gray, 88))
+plot(40, "B1/B2", color=color.new(color.gray, 88))
+plot(60, "B2/B3", color=color.new(color.gray, 88))
+plot(80, "B3/B4", color=color.new(color.gray, 88))
+
+
+//=============================================================================
+// 5) SERIES ACCESSORS
+//=============================================================================
+
+
+var string[] market_names = array.from("VNINDEX", "VN30", "VN100", "VNALLSHARE", "VNMIDCAP", "VNSMALLCAP")
+var string[] sector_names = array.from("VNFIN", "VNFINSELECT", "VNIND", "VNIT", "VNREAL", "VNCONS", "VNCOND", "VNENE", "VNMAT", "VNHEAL", "VNUTI")
+
+
+f_market_close(int m) =>
+    m == 0 ? mkt_vnindex :
+     m == 1 ? mkt_vn30 :
+     m == 2 ? mkt_vn100 :
+     m == 3 ? mkt_vnall :
+     m == 4 ? mkt_vnmid :
+     m == 5 ? mkt_vnsmall : na
+
+
+f_market_high(int m) =>
+    m == 0 ? mkt_vnindex_high :
+     m == 1 ? mkt_vn30_high :
+     m == 2 ? mkt_vn100_high :
+     m == 3 ? mkt_vnall_high :
+     m == 4 ? mkt_vnmid_high :
+     m == 5 ? mkt_vnsmall_high : na
+
+
+f_market_low(int m) =>
+    m == 0 ? mkt_vnindex_low :
+     m == 1 ? mkt_vn30_low :
+     m == 2 ? mkt_vn100_low :
+     m == 3 ? mkt_vnall_low :
+     m == 4 ? mkt_vnmid_low :
+     m == 5 ? mkt_vnsmall_low : na
+
+
+f_sector_close(int s) =>
+    s == 0 ? sec_vnfin :
+     s == 1 ? sec_vnfin_sel :
+     s == 2 ? sec_vnind :
+     s == 3 ? sec_vnit :
+     s == 4 ? sec_vnreal :
+     s == 5 ? sec_vncons :
+     s == 6 ? sec_vncond :
+     s == 7 ? sec_vnene :
+     s == 8 ? sec_vnmat :
+     s == 9 ? sec_vnheal :
+     s == 10 ? sec_vnuti : na
+
+
+float benchmark_close = mkt_vnindex
+
+
+//=============================================================================
+// 6) STATISTICS STORAGE
+//=============================================================================
+
+
+// Market cells: 6 markets × 5 buckets = 30 per horizon.
+var float[] sumR5_market = array.new_float(30, 0.0)
+var float[] sumSqR5_market = array.new_float(30, 0.0)
+var float[] cntR5_market = array.new_float(30, 0.0)
+var float[] winR5_market = array.new_float(30, 0.0)
+var float[] sumMAE5_market = array.new_float(30, 0.0)
+var float[] cntMAE5_market = array.new_float(30, 0.0)
+var float[] sumMFE5_market = array.new_float(30, 0.0)
+var float[] cntMFE5_market = array.new_float(30, 0.0)
+var float[] sumMDD5_market = array.new_float(30, 0.0)
+var float[] cntMDD5_market = array.new_float(30, 0.0)
+
+
+var float[] sumR20_market = array.new_float(30, 0.0)
+var float[] sumSqR20_market = array.new_float(30, 0.0)
+var float[] cntR20_market = array.new_float(30, 0.0)
+var float[] winR20_market = array.new_float(30, 0.0)
+var float[] sumMAE20_market = array.new_float(30, 0.0)
+var float[] cntMAE20_market = array.new_float(30, 0.0)
+var float[] sumMFE20_market = array.new_float(30, 0.0)
+var float[] cntMFE20_market = array.new_float(30, 0.0)
+var float[] sumMDD20_market = array.new_float(30, 0.0)
+var float[] cntMDD20_market = array.new_float(30, 0.0)
+
+
+var float[] sumR60_market = array.new_float(30, 0.0)
+var float[] sumSqR60_market = array.new_float(30, 0.0)
+var float[] cntR60_market = array.new_float(30, 0.0)
+var float[] winR60_market = array.new_float(30, 0.0)
+var float[] sumMAE60_market = array.new_float(30, 0.0)
+var float[] cntMAE60_market = array.new_float(30, 0.0)
+var float[] sumMFE60_market = array.new_float(30, 0.0)
+var float[] cntMFE60_market = array.new_float(30, 0.0)
+var float[] sumMDD60_market = array.new_float(30, 0.0)
+var float[] cntMDD60_market = array.new_float(30, 0.0)
+var float[] rejectR5_market = array.new_float(30, 0.0)
+var float[] rejectR20_market = array.new_float(30, 0.0)
+var float[] rejectR60_market = array.new_float(30, 0.0)
+
+
+// Sector cells: 11 sectors × 5 buckets = 55 per horizon.
+var float[] sumRR5_sector = array.new_float(55, 0.0)
+var float[] sumSqRR5_sector = array.new_float(55, 0.0)
+var float[] cntRR5_sector = array.new_float(55, 0.0)
+var float[] winRR5_sector = array.new_float(55, 0.0)
+
+
+var float[] sumRR20_sector = array.new_float(55, 0.0)
+var float[] sumSqRR20_sector = array.new_float(55, 0.0)
+var float[] cntRR20_sector = array.new_float(55, 0.0)
+var float[] winRR20_sector = array.new_float(55, 0.0)
+
+
+var float[] sumRR60_sector = array.new_float(55, 0.0)
+var float[] sumSqRR60_sector = array.new_float(55, 0.0)
+var float[] cntRR60_sector = array.new_float(55, 0.0)
+var float[] winRR60_sector = array.new_float(55, 0.0)
+var float[] rejectRR5_sector = array.new_float(55, 0.0)
+var float[] rejectRR20_sector = array.new_float(55, 0.0)
+var float[] rejectRR60_sector = array.new_float(55, 0.0)
+
+
+// VNINDEX auxiliary robustness cells: backward control and fixed calibration/validation.
+var float[] sumBackR5_vni = array.new_float(5, 0.0)
+var float[] sumSqBackR5_vni = array.new_float(5, 0.0)
+var float[] cntBackR5_vni = array.new_float(5, 0.0)
+var float[] sumCalR5_vni = array.new_float(5, 0.0)
+var float[] sumSqCalR5_vni = array.new_float(5, 0.0)
+var float[] cntCalR5_vni = array.new_float(5, 0.0)
+var float[] sumValR5_vni = array.new_float(5, 0.0)
+var float[] sumSqValR5_vni = array.new_float(5, 0.0)
+var float[] cntValR5_vni = array.new_float(5, 0.0)
+
+
+var float[] sumBackR20_vni = array.new_float(5, 0.0)
+var float[] sumSqBackR20_vni = array.new_float(5, 0.0)
+var float[] cntBackR20_vni = array.new_float(5, 0.0)
+var float[] sumCalR20_vni = array.new_float(5, 0.0)
+var float[] sumSqCalR20_vni = array.new_float(5, 0.0)
+var float[] cntCalR20_vni = array.new_float(5, 0.0)
+var float[] sumValR20_vni = array.new_float(5, 0.0)
+var float[] sumSqValR20_vni = array.new_float(5, 0.0)
+var float[] cntValR20_vni = array.new_float(5, 0.0)
+
+
+var float[] sumBackR60_vni = array.new_float(5, 0.0)
+var float[] sumSqBackR60_vni = array.new_float(5, 0.0)
+var float[] cntBackR60_vni = array.new_float(5, 0.0)
+var float[] sumCalR60_vni = array.new_float(5, 0.0)
+var float[] sumSqCalR60_vni = array.new_float(5, 0.0)
+var float[] cntCalR60_vni = array.new_float(5, 0.0)
+var float[] sumValR60_vni = array.new_float(5, 0.0)
+var float[] sumSqValR60_vni = array.new_float(5, 0.0)
+var float[] cntValR60_vni = array.new_float(5, 0.0)
+var float[] sumDiffR5_vni = array.new_float(5, 0.0)
+var float[] sumSqDiffR5_vni = array.new_float(5, 0.0)
+var float[] cntDiffR5_vni = array.new_float(5, 0.0)
+var float[] sumDiffR20_vni = array.new_float(5, 0.0)
+var float[] sumSqDiffR20_vni = array.new_float(5, 0.0)
+var float[] cntDiffR20_vni = array.new_float(5, 0.0)
+var float[] sumDiffR60_vni = array.new_float(5, 0.0)
+var float[] sumSqDiffR60_vni = array.new_float(5, 0.0)
+var float[] cntDiffR60_vni = array.new_float(5, 0.0)
+
+
+// Transition cells: 5 origin buckets × 5 destination buckets = 25.
+// State counts drive transition probabilities; return counts include only clean VNINDEX windows.
+var float[] trans_state_count = array.new_float(25, 0.0)
+var float[] trans_count = array.new_float(25, 0.0)
+var float[] trans_reject = array.new_float(25, 0.0)
+var float[] trans_sum_ret = array.new_float(25, 0.0)
+var float[] trans_sum_sq_ret = array.new_float(25, 0.0)
+var float[] trans_win = array.new_float(25, 0.0)
+
+
+f_reset_all_stats() =>
+    f_reset_float_array(sumR5_market)
+    f_reset_float_array(sumSqR5_market)
+    f_reset_float_array(cntR5_market)
+    f_reset_float_array(winR5_market)
+    f_reset_float_array(sumMAE5_market)
+    f_reset_float_array(cntMAE5_market)
+    f_reset_float_array(sumMFE5_market)
+    f_reset_float_array(cntMFE5_market)
+    f_reset_float_array(sumMDD5_market)
+    f_reset_float_array(cntMDD5_market)
+    f_reset_float_array(sumR20_market)
+    f_reset_float_array(sumSqR20_market)
+    f_reset_float_array(cntR20_market)
+    f_reset_float_array(winR20_market)
+    f_reset_float_array(sumMAE20_market)
+    f_reset_float_array(cntMAE20_market)
+    f_reset_float_array(sumMFE20_market)
+    f_reset_float_array(cntMFE20_market)
+    f_reset_float_array(sumMDD20_market)
+    f_reset_float_array(cntMDD20_market)
+    f_reset_float_array(sumR60_market)
+    f_reset_float_array(sumSqR60_market)
+    f_reset_float_array(cntR60_market)
+    f_reset_float_array(winR60_market)
+    f_reset_float_array(sumMAE60_market)
+    f_reset_float_array(cntMAE60_market)
+    f_reset_float_array(sumMFE60_market)
+    f_reset_float_array(cntMFE60_market)
+    f_reset_float_array(sumMDD60_market)
+    f_reset_float_array(cntMDD60_market)
+    f_reset_float_array(rejectR5_market)
+    f_reset_float_array(rejectR20_market)
+    f_reset_float_array(rejectR60_market)
+    f_reset_float_array(sumRR5_sector)
+    f_reset_float_array(sumSqRR5_sector)
+    f_reset_float_array(cntRR5_sector)
+    f_reset_float_array(winRR5_sector)
+    f_reset_float_array(sumRR20_sector)
+    f_reset_float_array(sumSqRR20_sector)
+    f_reset_float_array(cntRR20_sector)
+    f_reset_float_array(winRR20_sector)
+    f_reset_float_array(sumRR60_sector)
+    f_reset_float_array(sumSqRR60_sector)
+    f_reset_float_array(cntRR60_sector)
+    f_reset_float_array(winRR60_sector)
+    f_reset_float_array(rejectRR5_sector)
+    f_reset_float_array(rejectRR20_sector)
+    f_reset_float_array(rejectRR60_sector)
+    f_reset_float_array(sumBackR5_vni)
+    f_reset_float_array(sumSqBackR5_vni)
+    f_reset_float_array(cntBackR5_vni)
+    f_reset_float_array(sumCalR5_vni)
+    f_reset_float_array(sumSqCalR5_vni)
+    f_reset_float_array(cntCalR5_vni)
+    f_reset_float_array(sumValR5_vni)
+    f_reset_float_array(sumSqValR5_vni)
+    f_reset_float_array(cntValR5_vni)
+    f_reset_float_array(sumBackR20_vni)
+    f_reset_float_array(sumSqBackR20_vni)
+    f_reset_float_array(cntBackR20_vni)
+    f_reset_float_array(sumCalR20_vni)
+    f_reset_float_array(sumSqCalR20_vni)
+    f_reset_float_array(cntCalR20_vni)
+    f_reset_float_array(sumValR20_vni)
+    f_reset_float_array(sumSqValR20_vni)
+    f_reset_float_array(cntValR20_vni)
+    f_reset_float_array(sumBackR60_vni)
+    f_reset_float_array(sumSqBackR60_vni)
+    f_reset_float_array(cntBackR60_vni)
+    f_reset_float_array(sumCalR60_vni)
+    f_reset_float_array(sumSqCalR60_vni)
+    f_reset_float_array(cntCalR60_vni)
+    f_reset_float_array(sumValR60_vni)
+    f_reset_float_array(sumSqValR60_vni)
+    f_reset_float_array(cntValR60_vni)
+    f_reset_float_array(sumDiffR5_vni)
+    f_reset_float_array(sumSqDiffR5_vni)
+    f_reset_float_array(cntDiffR5_vni)
+    f_reset_float_array(sumDiffR20_vni)
+    f_reset_float_array(sumSqDiffR20_vni)
+    f_reset_float_array(cntDiffR20_vni)
+    f_reset_float_array(sumDiffR60_vni)
+    f_reset_float_array(sumSqDiffR60_vni)
+    f_reset_float_array(cntDiffR60_vni)
+    f_reset_float_array(trans_state_count)
+    f_reset_float_array(trans_count)
+    f_reset_float_array(trans_reject)
+    f_reset_float_array(trans_sum_ret)
+    f_reset_float_array(trans_sum_sq_ret)
+    f_reset_float_array(trans_win)
+
+
+bool do_reset = barstate.isfirst or (reset_stats and not reset_stats[1])
+if do_reset
+    f_reset_all_stats()
+//=============================================================================
+// 7) SAMPLE FILTERS & UPDATE ENGINE
+//=============================================================================
+
+
+f_sample_range_ok(int signalTime, int outcomeTime) =>
+    bool ok = false
+    if not na(signalTime) and not na(outcomeTime)
+        int signalYear = year(signalTime)
+        int outcomeYear = year(outcomeTime)
+        ok := signalYear >= sample_start_year and outcomeYear <= sample_end_year
+    ok
+
+
+f_sample_ok(int signalTime, int outcomeTime) =>
+    bool ok = false
+    if f_sample_range_ok(signalTime, outcomeTime)
+        int signalYear = year(signalTime)
+        int outcomeYear = year(outcomeTime)
+        ok := sample_mode == "Full sample" ? true :
+             sample_mode == "Calibration" ? outcomeYear <= split_year :
+             signalYear > split_year
+    ok
+
+
+var int research_bar_count = 0
+bool commit_bar = barstate.isconfirmed
+if commit_bar
+    research_bar_count += 1
+
+
+f_non_overlap_ok(int horizon) =>
+    int phase = non_overlap_phase % horizon
+    not use_non_overlap or (research_bar_count + phase) % horizon == 0
+
+
+f_update_return_stats(float[] sumArr, float[] sumSqArr, float[] cntArr, float[] winArr, int idx, float ret, bool doUpdate) =>
+    if doUpdate and not na(ret)
+        array.set(sumArr, idx, array.get(sumArr, idx) + ret)
+        array.set(sumSqArr, idx, array.get(sumSqArr, idx) + ret * ret)
+        array.set(cntArr, idx, array.get(cntArr, idx) + 1.0)
+        if ret > 0
+            array.set(winArr, idx, array.get(winArr, idx) + 1.0)
+
+
+f_update_sum_count(float[] sumArr, float[] cntArr, int idx, float value, bool doUpdate) =>
+    if doUpdate and not na(value)
+        array.set(sumArr, idx, array.get(sumArr, idx) + value)
+        array.set(cntArr, idx, array.get(cntArr, idx) + 1.0)
+
+
+f_update_sum_sq_count(float[] sumArr, float[] sumSqArr, float[] cntArr, int idx, float value, bool doUpdate) =>
+    if doUpdate and not na(value)
+        array.set(sumArr, idx, array.get(sumArr, idx) + value)
+        array.set(sumSqArr, idx, array.get(sumSqArr, idx) + value * value)
+        array.set(cntArr, idx, array.get(cntArr, idx) + 1.0)
+
+
+f_update_one_market(
+     int marketIndex,
+     float closeSeries, float highSeries, float lowSeries,
+     int horizon,
+     float[] sumArr, float[] sumSqArr, float[] cntArr, float[] winArr,
+     float[] sumMAEArr, float[] cntMAEArr,
+     float[] sumMFEArr, float[] cntMFEArr,
+     float[] sumMDDArr, float[] cntMDDArr,
+     float[] rejectArr,
+     float[] backSumArr, float[] backSumSqArr, float[] backCntArr,
+     float[] diffSumArr, float[] diffSumSqArr, float[] diffCntArr,
+     float[] calSumArr, float[] calSumSqArr, float[] calCntArr,
+     float[] valSumArr, float[] valSumSqArr, float[] valCntArr) =>
+
+
+
+
+    bool hasSignal = risk_valid[horizon] and not na(risk_bucket[horizon])
+    int signalBucket = hasSignal ? risk_bucket[horizon] : na
+    int signalTime = confirmed_market_time[horizon]
+    int outcomeTime = confirmed_market_time
+    bool sampleRange = f_sample_range_ok(signalTime, outcomeTime)
+    bool doMainUpdate = commit_bar and hasSignal and f_sample_ok(signalTime, outcomeTime) and f_non_overlap_ok(horizon)
+    bool doAuxUpdate = commit_bar and hasSignal and sampleRange and f_non_overlap_ok(horizon)
+
+
+    float cThen = closeSeries[horizon]
+    float ret = f_compute_return(closeSeries, cThen, use_log_return, ret_clip_lo, ret_clip_hi)
+    [mae, mfe, closeMdd] = f_path_outcomes(closeSeries, highSeries, lowSeries, horizon, use_log_return)
+    float maxDailyMove = max_index_daily_move_pct / 100.0
+    bool forwardBreak = filter_index_breaks and f_has_jump_window(closeSeries, 0, horizon, maxDailyMove)
+    bool forwardValid = not forwardBreak and not na(ret)
+
+
+    if doMainUpdate
+        int idx = marketIndex * N_BUCKETS + signalBucket
+        if forwardValid
+            f_update_return_stats(sumArr, sumSqArr, cntArr, winArr, idx, ret, true)
+            f_update_sum_count(sumMAEArr, cntMAEArr, idx, mae, true)
+            f_update_sum_count(sumMFEArr, cntMFEArr, idx, mfe, true)
+            f_update_sum_count(sumMDDArr, cntMDDArr, idx, closeMdd, true)
+        else
+            array.set(rejectArr, idx, array.get(rejectArr, idx) + 1.0)
+
+
+    // VNINDEX-only auxiliary tests use a fixed full-range sample, independent of panel sample mode.
+    if marketIndex == 0 and doAuxUpdate and forwardValid
+        float cBeforeSignal = closeSeries[horizon * 2]
+        bool backwardBreak = filter_index_breaks and f_has_jump_window(closeSeries, horizon, horizon, maxDailyMove)
+        float backwardRet = f_compute_return(cThen, cBeforeSignal, use_log_return, ret_clip_lo, ret_clip_hi)
+
+
+        if not backwardBreak
+            f_update_sum_sq_count(backSumArr, backSumSqArr, backCntArr, signalBucket, backwardRet, true)
+            float pairedDiff = not na(ret) and not na(backwardRet) ? ret - backwardRet : na
+            f_update_sum_sq_count(diffSumArr, diffSumSqArr, diffCntArr, signalBucket, pairedDiff, true)
+
+
+        int signalYear = year(signalTime)
+        int outcomeYear = year(outcomeTime)
+        if outcomeYear <= split_year
+            f_update_sum_sq_count(calSumArr, calSumSqArr, calCntArr, signalBucket, ret, true)
+        if signalYear > split_year
+            f_update_sum_sq_count(valSumArr, valSumSqArr, valCntArr, signalBucket, ret, true)
+
+
+f_update_one_sector(
+     int sectorIndex, float sectorSeries, int horizon,
+     float[] sumArr, float[] sumSqArr, float[] cntArr, float[] winArr, float[] rejectArr) =>
+
+
+
+
+    bool hasSignal = risk_valid[horizon] and not na(risk_bucket[horizon])
+    int signalBucket = hasSignal ? risk_bucket[horizon] : na
+    int signalTime = confirmed_market_time[horizon]
+    bool doUpdate = commit_bar and hasSignal and f_sample_ok(signalTime, confirmed_market_time) and f_non_overlap_ok(horizon)
+
+
+    float benchThen = benchmark_close[horizon]
+    float benchRetRaw = f_compute_return_raw(benchmark_close, benchThen, use_log_return)
+    float sectorThen = sectorSeries[horizon]
+    float sectorRetRaw = f_compute_return_raw(sectorSeries, sectorThen, use_log_return)
+    float relativeRetRaw = f_relative_return(sectorRetRaw, benchRetRaw, use_log_return)
+    float relativeRet = f_clip_return(relativeRetRaw, ret_clip_lo, ret_clip_hi)
+    float maxDailyMove = max_index_daily_move_pct / 100.0
+    bool benchBreak = filter_index_breaks and f_has_jump_window(benchmark_close, 0, horizon, maxDailyMove)
+    bool sectorBreak = filter_index_breaks and f_has_jump_window(sectorSeries, 0, horizon, maxDailyMove)
+    bool windowValid = not benchBreak and not sectorBreak and not na(relativeRet)
+
+
+    if doUpdate
+        int idx = sectorIndex * N_BUCKETS + signalBucket
+        if windowValid
+            f_update_return_stats(sumArr, sumSqArr, cntArr, winArr, idx, relativeRet, true)
+        else
+            array.set(rejectArr, idx, array.get(rejectArr, idx) + 1.0)
+
+
+f_update_transition(int horizon) =>
+    bool hasFrom = risk_valid[horizon] and not na(risk_bucket[horizon])
+    bool hasTo = risk_valid and not na(risk_bucket)
+    int fromBucket = hasFrom ? risk_bucket[horizon] : na
+    int toBucket = hasTo ? risk_bucket : na
+    int signalTime = confirmed_market_time[horizon]
+    bool doUpdate = commit_bar and hasFrom and hasTo and f_sample_ok(signalTime, confirmed_market_time) and f_non_overlap_ok(horizon)
+
+
+    float benchRet = f_compute_return(benchmark_close, benchmark_close[horizon], use_log_return, ret_clip_lo, ret_clip_hi)
+    float maxDailyMove = max_index_daily_move_pct / 100.0
+    bool benchBreak = filter_index_breaks and f_has_jump_window(benchmark_close, 0, horizon, maxDailyMove)
+
+
+    if doUpdate
+        int idx = fromBucket * N_BUCKETS + toBucket
+        array.set(trans_state_count, idx, array.get(trans_state_count, idx) + 1.0)
+        if not benchBreak and not na(benchRet)
+            array.set(trans_count, idx, array.get(trans_count, idx) + 1.0)
+            array.set(trans_sum_ret, idx, array.get(trans_sum_ret, idx) + benchRet)
+            array.set(trans_sum_sq_ret, idx, array.get(trans_sum_sq_ret, idx) + benchRet * benchRet)
+            if benchRet > 0
+                array.set(trans_win, idx, array.get(trans_win, idx) + 1.0)
+        else
+            array.set(trans_reject, idx, array.get(trans_reject, idx) + 1.0)
+
+
+// Explicitly unrolled 5-bar market calls. Each written call owns an independent series history.
+f_update_one_market(
+     0, mkt_vnindex, mkt_vnindex_high, mkt_vnindex_low, 5,
+     sumR5_market, sumSqR5_market, cntR5_market, winR5_market,
+     sumMAE5_market, cntMAE5_market, sumMFE5_market, cntMFE5_market, sumMDD5_market, cntMDD5_market,
+     rejectR5_market,
+     sumBackR5_vni, sumSqBackR5_vni, cntBackR5_vni,
+     sumDiffR5_vni, sumSqDiffR5_vni, cntDiffR5_vni,
+     sumCalR5_vni, sumSqCalR5_vni, cntCalR5_vni,
+     sumValR5_vni, sumSqValR5_vni, cntValR5_vni)
+f_update_one_market(
+     1, mkt_vn30, mkt_vn30_high, mkt_vn30_low, 5,
+     sumR5_market, sumSqR5_market, cntR5_market, winR5_market,
+     sumMAE5_market, cntMAE5_market, sumMFE5_market, cntMFE5_market, sumMDD5_market, cntMDD5_market,
+     rejectR5_market,
+     sumBackR5_vni, sumSqBackR5_vni, cntBackR5_vni,
+     sumDiffR5_vni, sumSqDiffR5_vni, cntDiffR5_vni,
+     sumCalR5_vni, sumSqCalR5_vni, cntCalR5_vni,
+     sumValR5_vni, sumSqValR5_vni, cntValR5_vni)
+f_update_one_market(
+     2, mkt_vn100, mkt_vn100_high, mkt_vn100_low, 5,
+     sumR5_market, sumSqR5_market, cntR5_market, winR5_market,
+     sumMAE5_market, cntMAE5_market, sumMFE5_market, cntMFE5_market, sumMDD5_market, cntMDD5_market,
+     rejectR5_market,
+     sumBackR5_vni, sumSqBackR5_vni, cntBackR5_vni,
+     sumDiffR5_vni, sumSqDiffR5_vni, cntDiffR5_vni,
+     sumCalR5_vni, sumSqCalR5_vni, cntCalR5_vni,
+     sumValR5_vni, sumSqValR5_vni, cntValR5_vni)
+f_update_one_market(
+     3, mkt_vnall, mkt_vnall_high, mkt_vnall_low, 5,
+     sumR5_market, sumSqR5_market, cntR5_market, winR5_market,
+     sumMAE5_market, cntMAE5_market, sumMFE5_market, cntMFE5_market, sumMDD5_market, cntMDD5_market,
+     rejectR5_market,
+     sumBackR5_vni, sumSqBackR5_vni, cntBackR5_vni,
+     sumDiffR5_vni, sumSqDiffR5_vni, cntDiffR5_vni,
+     sumCalR5_vni, sumSqCalR5_vni, cntCalR5_vni,
+     sumValR5_vni, sumSqValR5_vni, cntValR5_vni)
+f_update_one_market(
+     4, mkt_vnmid, mkt_vnmid_high, mkt_vnmid_low, 5,
+     sumR5_market, sumSqR5_market, cntR5_market, winR5_market,
+     sumMAE5_market, cntMAE5_market, sumMFE5_market, cntMFE5_market, sumMDD5_market, cntMDD5_market,
+     rejectR5_market,
+     sumBackR5_vni, sumSqBackR5_vni, cntBackR5_vni,
+     sumDiffR5_vni, sumSqDiffR5_vni, cntDiffR5_vni,
+     sumCalR5_vni, sumSqCalR5_vni, cntCalR5_vni,
+     sumValR5_vni, sumSqValR5_vni, cntValR5_vni)
+f_update_one_market(
+     5, mkt_vnsmall, mkt_vnsmall_high, mkt_vnsmall_low, 5,
+     sumR5_market, sumSqR5_market, cntR5_market, winR5_market,
+     sumMAE5_market, cntMAE5_market, sumMFE5_market, cntMFE5_market, sumMDD5_market, cntMDD5_market,
+     rejectR5_market,
+     sumBackR5_vni, sumSqBackR5_vni, cntBackR5_vni,
+     sumDiffR5_vni, sumSqDiffR5_vni, cntDiffR5_vni,
+     sumCalR5_vni, sumSqCalR5_vni, cntCalR5_vni,
+     sumValR5_vni, sumSqValR5_vni, cntValR5_vni)
+// Explicitly unrolled 5-bar sector calls.
+f_update_one_sector(
+     0, sec_vnfin, 5,
+     sumRR5_sector, sumSqRR5_sector, cntRR5_sector, winRR5_sector, rejectRR5_sector)
+f_update_one_sector(
+     1, sec_vnfin_sel, 5,
+     sumRR5_sector, sumSqRR5_sector, cntRR5_sector, winRR5_sector, rejectRR5_sector)
+f_update_one_sector(
+     2, sec_vnind, 5,
+     sumRR5_sector, sumSqRR5_sector, cntRR5_sector, winRR5_sector, rejectRR5_sector)
+f_update_one_sector(
+     3, sec_vnit, 5,
+     sumRR5_sector, sumSqRR5_sector, cntRR5_sector, winRR5_sector, rejectRR5_sector)
+f_update_one_sector(
+     4, sec_vnreal, 5,
+     sumRR5_sector, sumSqRR5_sector, cntRR5_sector, winRR5_sector, rejectRR5_sector)
+f_update_one_sector(
+     5, sec_vncons, 5,
+     sumRR5_sector, sumSqRR5_sector, cntRR5_sector, winRR5_sector, rejectRR5_sector)
+f_update_one_sector(
+     6, sec_vncond, 5,
+     sumRR5_sector, sumSqRR5_sector, cntRR5_sector, winRR5_sector, rejectRR5_sector)
+f_update_one_sector(
+     7, sec_vnene, 5,
+     sumRR5_sector, sumSqRR5_sector, cntRR5_sector, winRR5_sector, rejectRR5_sector)
+f_update_one_sector(
+     8, sec_vnmat, 5,
+     sumRR5_sector, sumSqRR5_sector, cntRR5_sector, winRR5_sector, rejectRR5_sector)
+f_update_one_sector(
+     9, sec_vnheal, 5,
+     sumRR5_sector, sumSqRR5_sector, cntRR5_sector, winRR5_sector, rejectRR5_sector)
+f_update_one_sector(
+     10, sec_vnuti, 5,
+     sumRR5_sector, sumSqRR5_sector, cntRR5_sector, winRR5_sector, rejectRR5_sector)
+
+
+// Explicitly unrolled 20-bar market calls. Each written call owns an independent series history.
+f_update_one_market(
+     0, mkt_vnindex, mkt_vnindex_high, mkt_vnindex_low, 20,
+     sumR20_market, sumSqR20_market, cntR20_market, winR20_market,
+     sumMAE20_market, cntMAE20_market, sumMFE20_market, cntMFE20_market, sumMDD20_market, cntMDD20_market,
+     rejectR20_market,
+     sumBackR20_vni, sumSqBackR20_vni, cntBackR20_vni,
+     sumDiffR20_vni, sumSqDiffR20_vni, cntDiffR20_vni,
+     sumCalR20_vni, sumSqCalR20_vni, cntCalR20_vni,
+     sumValR20_vni, sumSqValR20_vni, cntValR20_vni)
+f_update_one_market(
+     1, mkt_vn30, mkt_vn30_high, mkt_vn30_low, 20,
+     sumR20_market, sumSqR20_market, cntR20_market, winR20_market,
+     sumMAE20_market, cntMAE20_market, sumMFE20_market, cntMFE20_market, sumMDD20_market, cntMDD20_market,
+     rejectR20_market,
+     sumBackR20_vni, sumSqBackR20_vni, cntBackR20_vni,
+     sumDiffR20_vni, sumSqDiffR20_vni, cntDiffR20_vni,
+     sumCalR20_vni, sumSqCalR20_vni, cntCalR20_vni,
+     sumValR20_vni, sumSqValR20_vni, cntValR20_vni)
+f_update_one_market(
+     2, mkt_vn100, mkt_vn100_high, mkt_vn100_low, 20,
+     sumR20_market, sumSqR20_market, cntR20_market, winR20_market,
+     sumMAE20_market, cntMAE20_market, sumMFE20_market, cntMFE20_market, sumMDD20_market, cntMDD20_market,
+     rejectR20_market,
+     sumBackR20_vni, sumSqBackR20_vni, cntBackR20_vni,
+     sumDiffR20_vni, sumSqDiffR20_vni, cntDiffR20_vni,
+     sumCalR20_vni, sumSqCalR20_vni, cntCalR20_vni,
+     sumValR20_vni, sumSqValR20_vni, cntValR20_vni)
+f_update_one_market(
+     3, mkt_vnall, mkt_vnall_high, mkt_vnall_low, 20,
+     sumR20_market, sumSqR20_market, cntR20_market, winR20_market,
+     sumMAE20_market, cntMAE20_market, sumMFE20_market, cntMFE20_market, sumMDD20_market, cntMDD20_market,
+     rejectR20_market,
+     sumBackR20_vni, sumSqBackR20_vni, cntBackR20_vni,
+     sumDiffR20_vni, sumSqDiffR20_vni, cntDiffR20_vni,
+     sumCalR20_vni, sumSqCalR20_vni, cntCalR20_vni,
+     sumValR20_vni, sumSqValR20_vni, cntValR20_vni)
+f_update_one_market(
+     4, mkt_vnmid, mkt_vnmid_high, mkt_vnmid_low, 20,
+     sumR20_market, sumSqR20_market, cntR20_market, winR20_market,
+     sumMAE20_market, cntMAE20_market, sumMFE20_market, cntMFE20_market, sumMDD20_market, cntMDD20_market,
+     rejectR20_market,
+     sumBackR20_vni, sumSqBackR20_vni, cntBackR20_vni,
+     sumDiffR20_vni, sumSqDiffR20_vni, cntDiffR20_vni,
+     sumCalR20_vni, sumSqCalR20_vni, cntCalR20_vni,
+     sumValR20_vni, sumSqValR20_vni, cntValR20_vni)
+f_update_one_market(
+     5, mkt_vnsmall, mkt_vnsmall_high, mkt_vnsmall_low, 20,
+     sumR20_market, sumSqR20_market, cntR20_market, winR20_market,
+     sumMAE20_market, cntMAE20_market, sumMFE20_market, cntMFE20_market, sumMDD20_market, cntMDD20_market,
+     rejectR20_market,
+     sumBackR20_vni, sumSqBackR20_vni, cntBackR20_vni,
+     sumDiffR20_vni, sumSqDiffR20_vni, cntDiffR20_vni,
+     sumCalR20_vni, sumSqCalR20_vni, cntCalR20_vni,
+     sumValR20_vni, sumSqValR20_vni, cntValR20_vni)
+// Explicitly unrolled 20-bar sector calls.
+f_update_one_sector(
+     0, sec_vnfin, 20,
+     sumRR20_sector, sumSqRR20_sector, cntRR20_sector, winRR20_sector, rejectRR20_sector)
+f_update_one_sector(
+     1, sec_vnfin_sel, 20,
+     sumRR20_sector, sumSqRR20_sector, cntRR20_sector, winRR20_sector, rejectRR20_sector)
+f_update_one_sector(
+     2, sec_vnind, 20,
+     sumRR20_sector, sumSqRR20_sector, cntRR20_sector, winRR20_sector, rejectRR20_sector)
+f_update_one_sector(
+     3, sec_vnit, 20,
+     sumRR20_sector, sumSqRR20_sector, cntRR20_sector, winRR20_sector, rejectRR20_sector)
+f_update_one_sector(
+     4, sec_vnreal, 20,
+     sumRR20_sector, sumSqRR20_sector, cntRR20_sector, winRR20_sector, rejectRR20_sector)
+f_update_one_sector(
+     5, sec_vncons, 20,
+     sumRR20_sector, sumSqRR20_sector, cntRR20_sector, winRR20_sector, rejectRR20_sector)
+f_update_one_sector(
+     6, sec_vncond, 20,
+     sumRR20_sector, sumSqRR20_sector, cntRR20_sector, winRR20_sector, rejectRR20_sector)
+f_update_one_sector(
+     7, sec_vnene, 20,
+     sumRR20_sector, sumSqRR20_sector, cntRR20_sector, winRR20_sector, rejectRR20_sector)
+f_update_one_sector(
+     8, sec_vnmat, 20,
+     sumRR20_sector, sumSqRR20_sector, cntRR20_sector, winRR20_sector, rejectRR20_sector)
+f_update_one_sector(
+     9, sec_vnheal, 20,
+     sumRR20_sector, sumSqRR20_sector, cntRR20_sector, winRR20_sector, rejectRR20_sector)
+f_update_one_sector(
+     10, sec_vnuti, 20,
+     sumRR20_sector, sumSqRR20_sector, cntRR20_sector, winRR20_sector, rejectRR20_sector)
+
+
+// Explicitly unrolled 60-bar market calls. Each written call owns an independent series history.
+f_update_one_market(
+     0, mkt_vnindex, mkt_vnindex_high, mkt_vnindex_low, 60,
+     sumR60_market, sumSqR60_market, cntR60_market, winR60_market,
+     sumMAE60_market, cntMAE60_market, sumMFE60_market, cntMFE60_market, sumMDD60_market, cntMDD60_market,
+     rejectR60_market,
+     sumBackR60_vni, sumSqBackR60_vni, cntBackR60_vni,
+     sumDiffR60_vni, sumSqDiffR60_vni, cntDiffR60_vni,
+     sumCalR60_vni, sumSqCalR60_vni, cntCalR60_vni,
+     sumValR60_vni, sumSqValR60_vni, cntValR60_vni)
+f_update_one_market(
+     1, mkt_vn30, mkt_vn30_high, mkt_vn30_low, 60,
+     sumR60_market, sumSqR60_market, cntR60_market, winR60_market,
+     sumMAE60_market, cntMAE60_market, sumMFE60_market, cntMFE60_market, sumMDD60_market, cntMDD60_market,
+     rejectR60_market,
+     sumBackR60_vni, sumSqBackR60_vni, cntBackR60_vni,
+     sumDiffR60_vni, sumSqDiffR60_vni, cntDiffR60_vni,
+     sumCalR60_vni, sumSqCalR60_vni, cntCalR60_vni,
+     sumValR60_vni, sumSqValR60_vni, cntValR60_vni)
+f_update_one_market(
+     2, mkt_vn100, mkt_vn100_high, mkt_vn100_low, 60,
+     sumR60_market, sumSqR60_market, cntR60_market, winR60_market,
+     sumMAE60_market, cntMAE60_market, sumMFE60_market, cntMFE60_market, sumMDD60_market, cntMDD60_market,
+     rejectR60_market,
+     sumBackR60_vni, sumSqBackR60_vni, cntBackR60_vni,
+     sumDiffR60_vni, sumSqDiffR60_vni, cntDiffR60_vni,
+     sumCalR60_vni, sumSqCalR60_vni, cntCalR60_vni,
+     sumValR60_vni, sumSqValR60_vni, cntValR60_vni)
+f_update_one_market(
+     3, mkt_vnall, mkt_vnall_high, mkt_vnall_low, 60,
+     sumR60_market, sumSqR60_market, cntR60_market, winR60_market,
+     sumMAE60_market, cntMAE60_market, sumMFE60_market, cntMFE60_market, sumMDD60_market, cntMDD60_market,
+     rejectR60_market,
+     sumBackR60_vni, sumSqBackR60_vni, cntBackR60_vni,
+     sumDiffR60_vni, sumSqDiffR60_vni, cntDiffR60_vni,
+     sumCalR60_vni, sumSqCalR60_vni, cntCalR60_vni,
+     sumValR60_vni, sumSqValR60_vni, cntValR60_vni)
+f_update_one_market(
+     4, mkt_vnmid, mkt_vnmid_high, mkt_vnmid_low, 60,
+     sumR60_market, sumSqR60_market, cntR60_market, winR60_market,
+     sumMAE60_market, cntMAE60_market, sumMFE60_market, cntMFE60_market, sumMDD60_market, cntMDD60_market,
+     rejectR60_market,
+     sumBackR60_vni, sumSqBackR60_vni, cntBackR60_vni,
+     sumDiffR60_vni, sumSqDiffR60_vni, cntDiffR60_vni,
+     sumCalR60_vni, sumSqCalR60_vni, cntCalR60_vni,
+     sumValR60_vni, sumSqValR60_vni, cntValR60_vni)
+f_update_one_market(
+     5, mkt_vnsmall, mkt_vnsmall_high, mkt_vnsmall_low, 60,
+     sumR60_market, sumSqR60_market, cntR60_market, winR60_market,
+     sumMAE60_market, cntMAE60_market, sumMFE60_market, cntMFE60_market, sumMDD60_market, cntMDD60_market,
+     rejectR60_market,
+     sumBackR60_vni, sumSqBackR60_vni, cntBackR60_vni,
+     sumDiffR60_vni, sumSqDiffR60_vni, cntDiffR60_vni,
+     sumCalR60_vni, sumSqCalR60_vni, cntCalR60_vni,
+     sumValR60_vni, sumSqValR60_vni, cntValR60_vni)
+// Explicitly unrolled 60-bar sector calls.
+f_update_one_sector(
+     0, sec_vnfin, 60,
+     sumRR60_sector, sumSqRR60_sector, cntRR60_sector, winRR60_sector, rejectRR60_sector)
+f_update_one_sector(
+     1, sec_vnfin_sel, 60,
+     sumRR60_sector, sumSqRR60_sector, cntRR60_sector, winRR60_sector, rejectRR60_sector)
+f_update_one_sector(
+     2, sec_vnind, 60,
+     sumRR60_sector, sumSqRR60_sector, cntRR60_sector, winRR60_sector, rejectRR60_sector)
+f_update_one_sector(
+     3, sec_vnit, 60,
+     sumRR60_sector, sumSqRR60_sector, cntRR60_sector, winRR60_sector, rejectRR60_sector)
+f_update_one_sector(
+     4, sec_vnreal, 60,
+     sumRR60_sector, sumSqRR60_sector, cntRR60_sector, winRR60_sector, rejectRR60_sector)
+f_update_one_sector(
+     5, sec_vncons, 60,
+     sumRR60_sector, sumSqRR60_sector, cntRR60_sector, winRR60_sector, rejectRR60_sector)
+f_update_one_sector(
+     6, sec_vncond, 60,
+     sumRR60_sector, sumSqRR60_sector, cntRR60_sector, winRR60_sector, rejectRR60_sector)
+f_update_one_sector(
+     7, sec_vnene, 60,
+     sumRR60_sector, sumSqRR60_sector, cntRR60_sector, winRR60_sector, rejectRR60_sector)
+f_update_one_sector(
+     8, sec_vnmat, 60,
+     sumRR60_sector, sumSqRR60_sector, cntRR60_sector, winRR60_sector, rejectRR60_sector)
+f_update_one_sector(
+     9, sec_vnheal, 60,
+     sumRR60_sector, sumSqRR60_sector, cntRR60_sector, winRR60_sector, rejectRR60_sector)
+f_update_one_sector(
+     10, sec_vnuti, 60,
+     sumRR60_sector, sumSqRR60_sector, cntRR60_sector, winRR60_sector, rejectRR60_sector)
+
+
+if transition_horizon == 5
+    f_update_transition(5)
+else if transition_horizon == 20
+    f_update_transition(20)
+else
+    f_update_transition(60)
+
+
+//=============================================================================
+// 8) ARRAY SELECTORS
+//=============================================================================
+
+
+f_market_sum(int horizon, int idx) =>
+    horizon == 5 ? array.get(sumR5_market, idx) :
+     horizon == 20 ? array.get(sumR20_market, idx) : array.get(sumR60_market, idx)
+
+
+f_market_sum_sq(int horizon, int idx) =>
+    horizon == 5 ? array.get(sumSqR5_market, idx) :
+     horizon == 20 ? array.get(sumSqR20_market, idx) : array.get(sumSqR60_market, idx)
+
+
+f_market_count(int horizon, int idx) =>
+    horizon == 5 ? array.get(cntR5_market, idx) :
+     horizon == 20 ? array.get(cntR20_market, idx) : array.get(cntR60_market, idx)
+
+
+f_market_win(int horizon, int idx) =>
+    horizon == 5 ? array.get(winR5_market, idx) :
+     horizon == 20 ? array.get(winR20_market, idx) : array.get(winR60_market, idx)
+
+
+f_market_mae_sum(int horizon, int idx) =>
+    horizon == 5 ? array.get(sumMAE5_market, idx) :
+     horizon == 20 ? array.get(sumMAE20_market, idx) : array.get(sumMAE60_market, idx)
+
+
+f_market_mae_count(int horizon, int idx) =>
+    horizon == 5 ? array.get(cntMAE5_market, idx) :
+     horizon == 20 ? array.get(cntMAE20_market, idx) : array.get(cntMAE60_market, idx)
+
+
+f_market_mfe_sum(int horizon, int idx) =>
+    horizon == 5 ? array.get(sumMFE5_market, idx) :
+     horizon == 20 ? array.get(sumMFE20_market, idx) : array.get(sumMFE60_market, idx)
+
+
+f_market_mfe_count(int horizon, int idx) =>
+    horizon == 5 ? array.get(cntMFE5_market, idx) :
+     horizon == 20 ? array.get(cntMFE20_market, idx) : array.get(cntMFE60_market, idx)
+
+
+f_market_mdd_sum(int horizon, int idx) =>
+    horizon == 5 ? array.get(sumMDD5_market, idx) :
+     horizon == 20 ? array.get(sumMDD20_market, idx) : array.get(sumMDD60_market, idx)
+
+
+f_market_mdd_count(int horizon, int idx) =>
+    horizon == 5 ? array.get(cntMDD5_market, idx) :
+     horizon == 20 ? array.get(cntMDD20_market, idx) : array.get(cntMDD60_market, idx)
+
+
+f_market_reject_count(int horizon, int idx) =>
+    horizon == 5 ? array.get(rejectR5_market, idx) :
+     horizon == 20 ? array.get(rejectR20_market, idx) : array.get(rejectR60_market, idx)
+
+
+f_sector_sum(int horizon, int idx) =>
+    horizon == 5 ? array.get(sumRR5_sector, idx) :
+     horizon == 20 ? array.get(sumRR20_sector, idx) : array.get(sumRR60_sector, idx)
+
+
+f_sector_sum_sq(int horizon, int idx) =>
+    horizon == 5 ? array.get(sumSqRR5_sector, idx) :
+     horizon == 20 ? array.get(sumSqRR20_sector, idx) : array.get(sumSqRR60_sector, idx)
+
+
+f_sector_count(int horizon, int idx) =>
+    horizon == 5 ? array.get(cntRR5_sector, idx) :
+     horizon == 20 ? array.get(cntRR20_sector, idx) : array.get(cntRR60_sector, idx)
+
+
+f_sector_win(int horizon, int idx) =>
+    horizon == 5 ? array.get(winRR5_sector, idx) :
+     horizon == 20 ? array.get(winRR20_sector, idx) : array.get(winRR60_sector, idx)
+
+
+f_sector_reject_count(int horizon, int idx) =>
+    horizon == 5 ? array.get(rejectRR5_sector, idx) :
+     horizon == 20 ? array.get(rejectRR20_sector, idx) : array.get(rejectRR60_sector, idx)
+
+
+f_vni_back_sum(int horizon, int bucket) =>
+    horizon == 5 ? array.get(sumBackR5_vni, bucket) :
+     horizon == 20 ? array.get(sumBackR20_vni, bucket) : array.get(sumBackR60_vni, bucket)
+
+
+f_vni_back_sum_sq(int horizon, int bucket) =>
+    horizon == 5 ? array.get(sumSqBackR5_vni, bucket) :
+     horizon == 20 ? array.get(sumSqBackR20_vni, bucket) : array.get(sumSqBackR60_vni, bucket)
+
+
+f_vni_back_count(int horizon, int bucket) =>
+    horizon == 5 ? array.get(cntBackR5_vni, bucket) :
+     horizon == 20 ? array.get(cntBackR20_vni, bucket) : array.get(cntBackR60_vni, bucket)
+
+
+f_vni_cal_sum(int horizon, int bucket) =>
+    horizon == 5 ? array.get(sumCalR5_vni, bucket) :
+     horizon == 20 ? array.get(sumCalR20_vni, bucket) : array.get(sumCalR60_vni, bucket)
+
+
+f_vni_cal_sum_sq(int horizon, int bucket) =>
+    horizon == 5 ? array.get(sumSqCalR5_vni, bucket) :
+     horizon == 20 ? array.get(sumSqCalR20_vni, bucket) : array.get(sumSqCalR60_vni, bucket)
+
+
+f_vni_cal_count(int horizon, int bucket) =>
+    horizon == 5 ? array.get(cntCalR5_vni, bucket) :
+     horizon == 20 ? array.get(cntCalR20_vni, bucket) : array.get(cntCalR60_vni, bucket)
+
+
+f_vni_val_sum(int horizon, int bucket) =>
+    horizon == 5 ? array.get(sumValR5_vni, bucket) :
+     horizon == 20 ? array.get(sumValR20_vni, bucket) : array.get(sumValR60_vni, bucket)
+
+
+f_vni_val_sum_sq(int horizon, int bucket) =>
+    horizon == 5 ? array.get(sumSqValR5_vni, bucket) :
+     horizon == 20 ? array.get(sumSqValR20_vni, bucket) : array.get(sumSqValR60_vni, bucket)
+
+
+f_vni_val_count(int horizon, int bucket) =>
+    horizon == 5 ? array.get(cntValR5_vni, bucket) :
+     horizon == 20 ? array.get(cntValR20_vni, bucket) : array.get(cntValR60_vni, bucket)
+
+
+f_vni_diff_sum(int horizon, int bucket) =>
+    horizon == 5 ? array.get(sumDiffR5_vni, bucket) :
+     horizon == 20 ? array.get(sumDiffR20_vni, bucket) : array.get(sumDiffR60_vni, bucket)
+
+
+f_vni_diff_sum_sq(int horizon, int bucket) =>
+    horizon == 5 ? array.get(sumSqDiffR5_vni, bucket) :
+     horizon == 20 ? array.get(sumSqDiffR20_vni, bucket) : array.get(sumSqDiffR60_vni, bucket)
+
+
+f_vni_diff_count(int horizon, int bucket) =>
+    horizon == 5 ? array.get(cntDiffR5_vni, bucket) :
+     horizon == 20 ? array.get(cntDiffR20_vni, bucket) : array.get(cntDiffR60_vni, bucket)
+
+
+// Direction: 1 = risk up, 0 = same, -1 = risk down.
+f_transition_aggregate(int fromBucket, int direction) =>
+    float cnt = 0.0
+    float sumRet = 0.0
+    float sumSqRet = 0.0
+    float wins = 0.0
+
+
+    for toBucket = 0 to N_BUCKETS - 1
+        bool include = direction == 1 ? toBucket > fromBucket :
+             direction == -1 ? toBucket < fromBucket : toBucket == fromBucket
+        if include
+            int idx = fromBucket * N_BUCKETS + toBucket
+            cnt += array.get(trans_count, idx)
+            sumRet += array.get(trans_sum_ret, idx)
+            sumSqRet += array.get(trans_sum_sq_ret, idx)
+            wins += array.get(trans_win, idx)
+
+
+    [cnt, sumRet, sumSqRet, wins]
+
+
+f_transition_state_aggregate(int fromBucket, int direction) =>
+    float stateCnt = 0.0
+    float rejected = 0.0
+    for toBucket = 0 to N_BUCKETS - 1
+        bool include = direction == 1 ? toBucket > fromBucket :
+             direction == -1 ? toBucket < fromBucket : toBucket == fromBucket
+        if include
+            int idx = fromBucket * N_BUCKETS + toBucket
+            stateCnt += array.get(trans_state_count, idx)
+            rejected += array.get(trans_reject, idx)
+    [stateCnt, rejected]
+
+
+f_transition_origin_totals(int fromBucket) =>
+    float stateCnt = 0.0
+    float retCnt = 0.0
+    float rejected = 0.0
+    for toBucket = 0 to N_BUCKETS - 1
+        int idx = fromBucket * N_BUCKETS + toBucket
+        stateCnt += array.get(trans_state_count, idx)
+        retCnt += array.get(trans_count, idx)
+        rejected += array.get(trans_reject, idx)
+    [stateCnt, retCnt, rejected]
+
+
+// Internal count invariant for the current origin bucket at the transition horizon.
+// VNINDEX market counts and transition return/rejection counts must reconcile exactly.
+int invariant_origin_safe = risk_valid and not na(risk_bucket) ? risk_bucket : 0
+[invariant_state_raw, invariant_ret_raw, invariant_rej_raw] = f_transition_origin_totals(invariant_origin_safe)
+float invariant_market_valid = risk_valid and not na(risk_bucket) ? f_market_count(transition_horizon, invariant_origin_safe) : na
+float invariant_market_reject = risk_valid and not na(risk_bucket) ? f_market_reject_count(transition_horizon, invariant_origin_safe) : na
+float invariant_state_n = risk_valid and not na(risk_bucket) ? invariant_state_raw : na
+float invariant_return_n = risk_valid and not na(risk_bucket) ? invariant_ret_raw : na
+float invariant_reject_n = risk_valid and not na(risk_bucket) ? invariant_rej_raw : na
+bool internal_consistency_available = not na(invariant_state_n) and invariant_state_n > 0
+bool internal_consistency_pass = not internal_consistency_available or (
+     math.abs(nz(invariant_market_valid) - nz(invariant_return_n)) < 0.001 and
+     math.abs(nz(invariant_market_reject) - nz(invariant_reject_n)) < 0.001 and
+     math.abs(nz(invariant_state_n) - nz(invariant_return_n) - nz(invariant_reject_n)) < 0.001)
+string internal_consistency_state = not internal_consistency_available ? "PENDING" :
+     internal_consistency_pass ? "PASS" : "FAIL"
+
+
+//=============================================================================
+// 9) BUCKET & PANEL FLAGS
+//=============================================================================
+
+
+int bucket_auto = risk_valid and not na(risk_bucket) ? risk_bucket : na
+int bucket_selected = bucket_view == "Auto (current)" ? bucket_auto :
+     bucket_view == "B0 (0–20)" ? 0 :
+     bucket_view == "B1 (20–40)" ? 1 :
+     bucket_view == "B2 (40–60)" ? 2 :
+     bucket_view == "B3 (60–80)" ? 3 : 4
+
+
+bool show_panel1 = panel_view == "Panel 1 — Macro Weather"
+bool show_panel2 = panel_view == "Panel 2 — Market Conditional Returns"
+bool show_panel3 = panel_view == "Panel 3 — Sector Rotation"
+bool show_panel4 = panel_view == "Panel 4 — Transition Matrix"
+
+
+bool inference_approx_valid = use_non_overlap
+float market_econ_floor = market_econ_floor_pct / 100.0
+float sector_econ_floor = sector_econ_floor_pct / 100.0
+float sector_z_effective = sector_multiple_testing == "Bonferroni 11" ? Z_BONFERRONI_11 : z_critical_sector
+
+
+//=============================================================================
+// 10) PANEL 1 — MACRO WEATHER & ROBUSTNESS
+//=============================================================================
+
+
+string liquidity_status = f_status_from_score(score_liquidity, "TIGHT", "EASY")
+string curve_status = f_status_from_score(score_curve, "FLAT/INV", "STEEP/OK")
+string external_status = f_status_from_score(score_external, "EXT PRESS", "OK")
+string long_policy_status = f_status_from_score(score_long_policy, "COMPRESSED", "OK")
+
+
+float vni_sum = na
+float vni_sum_sq = na
+float vni_n = na
+float vni_win = na
+float vni_mae_sum = na
+float vni_mae_n = na
+float vni_mfe_sum = na
+float vni_mfe_n = na
+float vni_mdd_sum = na
+float vni_mdd_n = na
+float vni_back_sum = na
+float vni_back_sum_sq = na
+float vni_back_n = na
+float vni_cal_sum = na
+float vni_cal_sum_sq = na
+float vni_cal_n = na
+float vni_val_sum = na
+float vni_val_sum_sq = na
+float vni_val_n = na
+float vni_diff_sum = na
+float vni_diff_sum_sq = na
+float vni_diff_n = na
+float vni_reject_n = na
+
+
+if risk_valid and not na(risk_bucket)
+    int vni_idx = risk_bucket
+    vni_sum := f_market_sum(analysis_horizon, vni_idx)
+    vni_sum_sq := f_market_sum_sq(analysis_horizon, vni_idx)
+    vni_n := f_market_count(analysis_horizon, vni_idx)
+    vni_win := f_market_win(analysis_horizon, vni_idx)
+    vni_mae_sum := f_market_mae_sum(analysis_horizon, vni_idx)
+    vni_mae_n := f_market_mae_count(analysis_horizon, vni_idx)
+    vni_mfe_sum := f_market_mfe_sum(analysis_horizon, vni_idx)
+    vni_mfe_n := f_market_mfe_count(analysis_horizon, vni_idx)
+    vni_mdd_sum := f_market_mdd_sum(analysis_horizon, vni_idx)
+    vni_mdd_n := f_market_mdd_count(analysis_horizon, vni_idx)
+    vni_back_sum := f_vni_back_sum(analysis_horizon, vni_idx)
+    vni_back_sum_sq := f_vni_back_sum_sq(analysis_horizon, vni_idx)
+    vni_back_n := f_vni_back_count(analysis_horizon, vni_idx)
+    vni_cal_sum := f_vni_cal_sum(analysis_horizon, vni_idx)
+    vni_cal_sum_sq := f_vni_cal_sum_sq(analysis_horizon, vni_idx)
+    vni_cal_n := f_vni_cal_count(analysis_horizon, vni_idx)
+    vni_val_sum := f_vni_val_sum(analysis_horizon, vni_idx)
+    vni_val_sum_sq := f_vni_val_sum_sq(analysis_horizon, vni_idx)
+    vni_val_n := f_vni_val_count(analysis_horizon, vni_idx)
+    vni_diff_sum := f_vni_diff_sum(analysis_horizon, vni_idx)
+    vni_diff_sum_sq := f_vni_diff_sum_sq(analysis_horizon, vni_idx)
+    vni_diff_n := f_vni_diff_count(analysis_horizon, vni_idx)
+    vni_reject_n := f_market_reject_count(analysis_horizon, vni_idx)
+
+
+float vni_mean = f_avg(vni_sum, vni_n)
+float vni_ci_lo = f_ci_low_auto(vni_sum, vni_sum_sq, vni_n)
+float vni_ci_hi = f_ci_high_auto(vni_sum, vni_sum_sq, vni_n)
+float vni_win_rate = f_winrate(vni_win, vni_n)
+float vni_win_ci_lo = f_wilson_low(vni_win, vni_n, Z95)
+float vni_win_ci_hi = f_wilson_high(vni_win, vni_n, Z95)
+float vni_avg_mae = f_avg(vni_mae_sum, vni_mae_n)
+float vni_avg_mfe = f_avg(vni_mfe_sum, vni_mfe_n)
+float vni_avg_mdd = f_avg(vni_mdd_sum, vni_mdd_n)
+float vni_back_mean = f_avg(vni_back_sum, vni_back_n)
+float vni_cal_mean = f_avg(vni_cal_sum, vni_cal_n)
+float vni_val_mean = f_avg(vni_val_sum, vni_val_n)
+float vni_diff_mean = f_avg(vni_diff_sum, vni_diff_n)
+float vni_diff_ci_lo = f_ci_low_auto(vni_diff_sum, vni_diff_sum_sq, vni_diff_n)
+float vni_diff_ci_hi = f_ci_high_auto(vni_diff_sum, vni_diff_sum_sq, vni_diff_n)
+float vni_reject_rate = f_rejection_rate(vni_n, vni_reject_n)
+string vni_sample_health = f_sample_health(
+     vni_n, vni_reject_n,
+     rejection_caution_pct, rejection_contaminated_pct, rejection_unusable_pct)
+bool vni_quality_allows_inference = f_quality_allows_inference(vni_sample_health)
+
+
+string vni_base_evidence = f_evidence_label(
+     vni_sum, vni_sum_sq, vni_n, min_n_market,
+     math.max(z_critical_market, f_tcrit95(vni_n)), market_econ_floor, inference_approx_valid)
+string vni_stability = f_stability_label(
+     vni_cal_sum, vni_cal_sum_sq, vni_cal_n,
+     vni_val_sum, vni_val_sum_sq, vni_val_n,
+     min_n_oos, market_econ_floor)
+string vni_lead_lag = f_paired_control_label(
+     vni_diff_sum, vni_diff_sum_sq, vni_diff_n,
+     min_n_control, market_econ_floor, inference_approx_valid)
+string vni_academic_base = f_academic_label(
+     vni_base_evidence, integrity_state, vni_stability, vni_lead_lag, spec_agreement)
+string vni_academic_evidence = internal_consistency_pass ? f_quality_evidence(vni_academic_base, vni_sample_health) : "INTERNAL-FAIL"
+
+
+string macro_takeaway = not risk_valid ? "NO VALID COMPOSITE" :
+     not internal_consistency_pass ? "INTERNAL CONSISTENCY FAIL — OUTCOME INFERENCE LOCKED" :
+     integrity_state == "STALE" ? "COMPOSITE AVAILABLE — SOURCE DATA STALE" :
+     vni_sample_health == "UNUSABLE" ? "MACRO VALID — VNINDEX OUTCOME DATA UNUSABLE" :
+     vni_sample_health == "CONTAMINATED" ? "MACRO VALID — VNINDEX OUTCOME DATA CONTAMINATED" :
+     tail_override and stress_breadth80 == 1 ? "NEUTRAL COMPOSITE WITH SINGLE-PILLAR TAIL RISK" :
+     stress_breadth80 >= 2 ? "BROAD HIGH-STRESS CONFIGURATION" :
+     consensus_state == "DIVERGENT" ? "DIVERGENT PILLARS — COMPOSITE MASKS DISPERSION" :
+     vni_academic_evidence == "ROBUST-OOS" ? "ROBUST CONDITIONAL MARKET EVIDENCE" :
+     vni_academic_evidence == "FRAGILE" ? "FULL-SAMPLE EFFECT IS OUT-OF-SAMPLE FRAGILE" :
+     risk_bucket <= 1 and vni_mean > 0 ? "SUPPORTIVE MACRO / POSITIVE CONDITIONAL RETURN" :
+     risk_bucket >= 3 and vni_mean < 0 ? "DEFENSIVE MACRO / NEGATIVE CONDITIONAL RETURN" :
+     "MIXED CONDITIONAL EVIDENCE"
+
+
+var table macro_table = na
+var table method_table = na
+var label risk_label = na
+
+
+if barstate.islast
+    if not na(risk_label)
+        label.delete(risk_label)
+    if risk_valid
+        risk_label := label.new(
+             bar_index, risk_pct,
+             "Risk " + str.tostring(risk_pct, "#.#") + "% | " + f_bucket_label(risk_bucket) +
+             " | " + integrity_state + " | Dominant " + dominant_pillar + " " + f_fmt_num(dominant_score, "#.#"),
+             style=label.style_label_left, textcolor=color.white,
+             color=tail_override ? color.new(color.orange, 35) : color.new(color.blue, 60), size=size.small)
+
+
+if barstate.islast
+    if show_panel1
+        if na(macro_table)
+            macro_table := table.new(position.top_right, 4, 12, bgcolor=color.new(color.black, 15), border_width=2, border_color=color.new(color.white, 25))
+            table.merge_cells(macro_table, 0, 0, 3, 0)
+    else
+        if not na(macro_table)
+            table.delete(macro_table)
+            macro_table := na
+
+
+if barstate.islast and show_panel1 and not na(macro_table)
+    string date_text = not na(confirmed_market_time) ? str.format_time(confirmed_market_time, "yyyy-MM-dd") : "--"
+    string header = risk_valid ?
+         "Macro Weather v3.1.3 | " + f_bucket_label(risk_bucket) + " | Risk " + str.tostring(risk_pct, "#.#") +
+         "% | " + integrity_state :
+         "Macro Weather v3.1.3 | COMPOSITE UNAVAILABLE"
+
+
+    table.cell(macro_table, 0, 0, header, bgcolor=color.new(color.orange, 0), text_color=color.white, text_size=size.small)
+
+
+    table.cell(macro_table, 0, 1, "Pillar", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(macro_table, 1, 1, "Raw", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(macro_table, 2, 1, "Risk pct", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(macro_table, 3, 1, "State", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+
+
+    table.cell(macro_table, 0, 2, "Liquidity: IB–Policy", bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 1, 2, f_fmt_num(liquidity_stress, "#.##"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 2, 2, f_fmt_num(score_liquidity, "#.#"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 3, 2, liquidity_status + " | daily age " + str.tostring(stale_interbank), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+
+
+    table.cell(macro_table, 0, 3, "Curve: 10Y–2Y", bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 1, 3, f_fmt_num(curve_standard, "#.##"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 2, 3, f_fmt_num(score_curve, "#.#"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 3, 3, curve_status + " | daily age " + str.tostring(math.max(stale_2y, stale_10y)), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+
+
+    table.cell(macro_table, 0, 4, "External: VN10Y–US10Y", bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 1, 4, f_fmt_num(intl_yield_diff, "#.##"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 2, 4, f_fmt_num(score_external, "#.#"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 3, 4, external_status + " | daily age " + str.tostring(math.max(stale_10y, stale_us10y)), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+
+
+    table.cell(macro_table, 0, 5, "Long–Policy: 10Y–Policy", bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 1, 5, f_fmt_num(long_policy_spread, "#.##"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 2, 5, f_fmt_num(score_long_policy, "#.#"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 3, 5, long_policy_status + " | 10Y age " + str.tostring(stale_10y) + " | policy age " + str.tostring(stale_policy), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+
+
+    table.cell(macro_table, 0, 6, "Structure", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(macro_table, 1, 6, "Dominant " + dominant_pillar + " " + f_fmt_num(dominant_score, "#.#"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 2, 6, "Breadth " + str.tostring(stress_breadth60) + "/4 | Extreme " + str.tostring(stress_breadth80) + "/4", bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 3, 6, consensus_state + " | Disp " + f_fmt_num(pillar_dispersion, "#.#"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+
+
+    table.cell(macro_table, 0, 7, "Dynamics", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(macro_table, 1, 7, "Mom5 " + f_fmt_num(risk_mom5, "#.##"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 2, 7, "MA20 " + f_fmt_num(risk_ma20, "#.##") + " | Vol20 " + f_fmt_num(risk_vol20, "#.##"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 3, 7, "20D " + f_regime_arrow(risk_bucket, risk_bucket_20ago) + " | Spec " + spec_bucket_text + " (" + str.tostring(spec_agreement) + "/3)", bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+
+
+    table.cell(macro_table, 0, 8, "VNINDEX | H=" + str.tostring(analysis_horizon), bgcolor=color.new(color.blue, 15), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 1, 8, (vni_quality_allows_inference ? "Winsor mean " : "Diagnostic mean ") + f_fmt_pct(vni_mean, "#.##"), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 2, 8, vni_quality_allows_inference ? "t-CI95 " + f_fmt_ci(vni_ci_lo, vni_ci_hi) : "CI suppressed | " + vni_sample_health, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 3, 8,
+         "Win " + (not na(vni_win_rate) ? str.tostring(vni_win_rate, "#.#") + "%" : "--") +
+         (vni_quality_allows_inference ? " | W95 " + f_fmt_prob_ci(vni_win_ci_lo, vni_win_ci_hi) : " | diagnostic"),
+         bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+
+    table.cell(macro_table, 0, 9, "Path risk", bgcolor=color.new(color.blue, 25), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 1, 9, show_path_risk ? "MAE " + f_fmt_pct(vni_avg_mae, "#.##") : "OFF", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 2, 9, show_path_risk ? "MFE " + f_fmt_pct(vni_avg_mfe, "#.##") : "OFF", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 3, 9, show_path_risk ? "Close-MDD " + f_fmt_pct(vni_avg_mdd, "#.##") : "OFF", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+
+    table.cell(macro_table, 0, 10, "Robustness", bgcolor=color.new(color.blue, 25), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 1, 10, vni_academic_evidence + " | QC " + vni_sample_health + " | Rej " + f_fmt_num(vni_reject_rate, "#.#") + "% | Internal " + internal_consistency_state, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 2, 10,
+         vni_stability + " | Cal " + f_fmt_pct(vni_cal_mean, "#.##") + " N" + str.tostring(math.round(nz(vni_cal_n, 0))) +
+         " / Val " + f_fmt_pct(vni_val_mean, "#.##") + " N" + str.tostring(math.round(nz(vni_val_n, 0))),
+         bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 3, 10,
+         vni_lead_lag + " | ΔF−B " + f_fmt_pct(vni_diff_mean, "#.##") + " " + f_fmt_ci(vni_diff_ci_lo, vni_diff_ci_hi) +
+         " | N " + str.tostring(math.round(nz(vni_diff_n, 0))) + " | Rej " + str.tostring(math.round(nz(vni_reject_n, 0))),
+         bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+
+    table.cell(macro_table, 0, 11, "TAKEAWAY", bgcolor=color.new(color.blue, 0), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 1, 11, macro_takeaway, bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 2, 11, "Tail " + (tail_override ? "ON" : "OFF") + " | " + dataq + " | " + integrity_state + " | Outcome " + vni_sample_health, bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+    table.cell(macro_table, 3, 11, date_text + " | T−1 confirmed", bgcolor=color.new(color.black, 20), text_color=color.white, text_size=size.small)
+
+
+if barstate.islast
+    if show_method_note
+        if na(method_table)
+            method_table := table.new(position.bottom_left, 2, 9, bgcolor=color.new(color.black, 78), border_width=1, border_color=color.new(color.white, 20))
+            table.merge_cells(method_table, 0, 0, 1, 0)
+    else
+        if not na(method_table)
+            table.delete(method_table)
+            method_table := na
+
+
+if barstate.islast and show_method_note and not na(method_table)
+    table.cell(method_table, 0, 0, "Research diagnostics v3.1.3", bgcolor=color.new(color.blue, 35), text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 0, 1, "Sample", text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 1, 1, sample_mode + " | " + str.tostring(sample_start_year) + "–" + str.tostring(sample_end_year) + " | split " + str.tostring(split_year), text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 0, 2, "Dependence", text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 1, 2, use_non_overlap ? "Non-overlap phase " + str.tostring(non_overlap_phase % analysis_horizon) + " | approximate inference" : "Overlap | descriptive only", text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 0, 3, "Integrity", text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 1, 3, integrity_state + " | max daily age " + str.tostring(max_daily_stale_age) + " | policy age " + str.tostring(stale_policy) + " | " + str.tostring(pillar_count) + "/4", text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 0, 4, "Multiplicity", text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 1, 4, sector_multiple_testing + " | sector crit* " + str.tostring(sector_z_effective, "#.###"), text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 0, 5, "Outcome QC", text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 1, 5, "Rejection gates " + str.tostring(rejection_caution_pct, "#") + "/" + str.tostring(rejection_contaminated_pct, "#") + "/" + str.tostring(rejection_unusable_pct, "#") + "% | jump >" + str.tostring(max_index_daily_move_pct, "#") + "%", text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 0, 6, "Internal", text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 1, 6, internal_consistency_state + " | Mkt " + f_fmt_num(invariant_market_valid, "#") + "/" + f_fmt_num(invariant_market_reject, "#") + " | Trans " + f_fmt_num(invariant_return_n, "#") + "/" + f_fmt_num(invariant_reject_n, "#"), text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 0, 7, "Robustness", text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 1, 7, "Unrolled series + OOS split + paired F−B + dual-count transitions + breadth gate", text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 0, 8, "Limit", text_color=color.white, text_size=size.tiny)
+    table.cell(method_table, 1, 8, "Conditional association ≠ causality; path metrics use daily OHLC/close", text_color=color.white, text_size=size.tiny)
+
+
+//=============================================================================
+// 11) PANEL 2 — MARKET CONDITIONAL RETURNS & OUTCOME QUALITY
+//=============================================================================
+
+
+var table market_table = na
+if barstate.islast
+    if show_panel2
+        if na(market_table)
+            market_table := table.new(position.top_right, 10, 8, bgcolor=color.new(color.black, 18), border_width=2, border_color=color.new(color.white, 25))
+            table.merge_cells(market_table, 0, 0, 9, 0)
+    else
+        if not na(market_table)
+            table.delete(market_table)
+            market_table := na
+
+
+if barstate.islast and show_panel2 and not na(market_table)
+    string bucket_text = not na(bucket_selected) ? f_bucket_label(bucket_selected) : "NA"
+    table.cell(market_table, 0, 0,
+         "Market Outcomes v3.1.3 | H=" + str.tostring(analysis_horizon) + " | " + bucket_text + " | QC-gated",
+         bgcolor=color.new(color.blue, 0), text_color=color.white, text_size=size.small)
+
+
+    table.cell(market_table, 0, 1, "Index", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 1, 1, "Mean (diag)", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 2, 1, "t-CI95", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 3, 1, "Win | W95", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 4, 1, "MAE", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 5, 1, "MFE", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 6, 1, "Close-MDD", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 7, 1, "t-stat", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 8, 1, "N / Rej", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(market_table, 9, 1, "Evidence / QC", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+
+
+    for m = 0 to N_MARKETS - 1
+        int row = m + 2
+        bool validBucket = not na(bucket_selected)
+        int idx = validBucket ? m * N_BUCKETS + bucket_selected : 0
+        float sum = validBucket ? f_market_sum(analysis_horizon, idx) : na
+        float sumSq = validBucket ? f_market_sum_sq(analysis_horizon, idx) : na
+        float cnt = validBucket ? f_market_count(analysis_horizon, idx) : na
+        float wins = validBucket ? f_market_win(analysis_horizon, idx) : na
+        float maeSum = validBucket ? f_market_mae_sum(analysis_horizon, idx) : na
+        float maeCnt = validBucket ? f_market_mae_count(analysis_horizon, idx) : na
+        float mfeSum = validBucket ? f_market_mfe_sum(analysis_horizon, idx) : na
+        float mfeCnt = validBucket ? f_market_mfe_count(analysis_horizon, idx) : na
+        float mddSum = validBucket ? f_market_mdd_sum(analysis_horizon, idx) : na
+        float mddCnt = validBucket ? f_market_mdd_count(analysis_horizon, idx) : na
+        float rejected = validBucket ? f_market_reject_count(analysis_horizon, idx) : na
+
+
+        float mean = f_avg(sum, cnt)
+        float ciLo = f_ci_low_auto(sum, sumSq, cnt)
+        float ciHi = f_ci_high_auto(sum, sumSq, cnt)
+        float winRate = f_winrate(wins, cnt)
+        float winLo = f_wilson_low(wins, cnt, Z95)
+        float winHi = f_wilson_high(wins, cnt, Z95)
+        float avgMae = f_avg(maeSum, maeCnt)
+        float avgMfe = f_avg(mfeSum, mfeCnt)
+        float avgMdd = f_avg(mddSum, mddCnt)
+        float tstat = f_zstat(sum, sumSq, cnt)
+        float marketCrit = math.max(z_critical_market, f_tcrit95(cnt))
+        string baseEvidence = f_evidence_label(sum, sumSq, cnt, min_n_market, marketCrit, market_econ_floor, inference_approx_valid)
+        string sampleHealth = f_sample_health(cnt, rejected, rejection_caution_pct, rejection_contaminated_pct, rejection_unusable_pct)
+        string evidence = internal_consistency_pass ? f_quality_evidence(baseEvidence, sampleHealth) : "INTERNAL-FAIL"
+        bool qualityAllows = f_quality_allows_inference(sampleHealth)
+        bool hasDescriptive = not na(cnt) and cnt > 0
+        bool enoughInference = hasDescriptive and cnt >= min_n_market and qualityAllows
+
+
+        table.cell(market_table, 0, row, array.get(market_names, m), bgcolor=color.new(color.black, 10), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 1, row, hasDescriptive ? f_fmt_pct(mean, "#.##") : "--", bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 2, row, enoughInference ? f_fmt_ci(ciLo, ciHi) : "--", bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 3, row,
+             hasDescriptive and not na(winRate) ? str.tostring(winRate, "#.#") + "%" + (enoughInference ? " " + f_fmt_prob_ci(winLo, winHi) : "") : "--",
+             bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 4, row, hasDescriptive and show_path_risk ? f_fmt_pct(avgMae, "#.##") : "--", bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 5, row, hasDescriptive and show_path_risk ? f_fmt_pct(avgMfe, "#.##") : "--", bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 6, row, hasDescriptive and show_path_risk ? f_fmt_pct(avgMdd, "#.##") : "--", bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 7, row, enoughInference ? f_fmt_num(tstat, "#.##") : "--", bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 8, row, str.tostring(math.round(nz(cnt, 0))) + " / " + str.tostring(math.round(nz(rejected, 0))), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(market_table, 9, row, evidence, bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+
+
+//=============================================================================
+// 12) PANEL 3 — SECTOR ROTATION WITH MULTIPLICITY & BREADTH GATES
+//=============================================================================
+
+
+var table sector_table = na
+if barstate.islast
+    if show_panel3
+        if na(sector_table)
+            sector_table := table.new(position.bottom_right, 7, 12, bgcolor=color.new(color.black, 15), border_width=2, border_color=color.new(color.white, 25))
+            table.merge_cells(sector_table, 0, 0, 6, 0)
+            table.merge_cells(sector_table, 1, 11, 6, 11)
+    else
+        if not na(sector_table)
+            table.delete(sector_table)
+            sector_table := na
+
+
+if barstate.islast and show_panel3 and not na(sector_table)
+    string bucket_text = not na(bucket_selected) ? f_bucket_label(bucket_selected) : "NA"
+
+
+    float[] means = array.new_float(N_SECTORS, na)
+    float[] counts = array.new_float(N_SECTORS, na)
+    float[] tstats = array.new_float(N_SECTORS, na)
+    float[] ciLows = array.new_float(N_SECTORS, na)
+    float[] ciHighs = array.new_float(N_SECTORS, na)
+    string[] evidenceArr = array.new_string(N_SECTORS, "THIN")
+    string[] healthArr = array.new_string(N_SECTORS, "NO-DATA")
+    float[] rejects = array.new_float(N_SECTORS, na)
+    bool[] eligibleArr = array.new_bool(N_SECTORS, false)
+    int eligibleCount = 0
+
+
+    for s = 0 to N_SECTORS - 1
+        bool validBucket = not na(bucket_selected)
+        int idx = validBucket ? s * N_BUCKETS + bucket_selected : 0
+        float sum = validBucket ? f_sector_sum(analysis_horizon, idx) : na
+        float sumSq = validBucket ? f_sector_sum_sq(analysis_horizon, idx) : na
+        float cnt = validBucket ? f_sector_count(analysis_horizon, idx) : na
+        float rejected = validBucket ? f_sector_reject_count(analysis_horizon, idx) : na
+        float mean = f_avg(sum, cnt)
+        float tstat = f_zstat(sum, sumSq, cnt)
+        float sectorCritCell = math.max(sector_z_effective, f_tcrit95(cnt))
+        float ciLo = f_ci_low(sum, sumSq, cnt, sectorCritCell)
+        float ciHi = f_ci_high(sum, sumSq, cnt, sectorCritCell)
+        string baseEvidence = f_evidence_label(sum, sumSq, cnt, min_n_sector, sectorCritCell, sector_econ_floor, inference_approx_valid)
+        string sampleHealth = f_sample_health(cnt, rejected, rejection_caution_pct, rejection_contaminated_pct, rejection_unusable_pct)
+        string evidence = internal_consistency_pass ? f_quality_evidence(baseEvidence, sampleHealth) : "INTERNAL-FAIL"
+        bool eligible = internal_consistency_pass and not na(cnt) and cnt >= min_n_sector and f_quality_allows_inference(sampleHealth)
+        if eligible
+            eligibleCount += 1
+        array.set(means, s, mean)
+        array.set(counts, s, cnt)
+        array.set(tstats, s, tstat)
+        array.set(ciLows, s, ciLo)
+        array.set(ciHighs, s, ciHi)
+        array.set(evidenceArr, s, evidence)
+        array.set(healthArr, s, sampleHealth)
+        array.set(rejects, s, rejected)
+        array.set(eligibleArr, s, eligible)
+
+
+    bool breadthOk = eligibleCount >= min_sector_breadth
+    table.cell(sector_table, 0, 0,
+         "Sector Rotation v3.1.3 | H=" + str.tostring(analysis_horizon) + " | " + bucket_text +
+         " | Eligible " + str.tostring(eligibleCount) + "/" + str.tostring(N_SECTORS),
+         bgcolor=color.new(color.teal, 0), text_color=color.white, text_size=size.small)
+
+
+    int[] topIdx = array.new_int(3, -1)
+    int[] bottomIdx = array.new_int(3, -1)
+    bool[] selected = array.new_bool(N_SECTORS, false)
+
+
+    // Always list up to three best eligible series. A Top/Bottom rotation claim requires breadthOk.
+    for k = 0 to 2
+        float bestValue = na
+        int bestIndex = -1
+        for sectorIndex = 0 to N_SECTORS - 1
+            float value = array.get(means, sectorIndex)
+            bool eligible = array.get(eligibleArr, sectorIndex)
+            bool used = array.get(selected, sectorIndex)
+            if eligible and not used and not na(value)
+                if bestIndex == -1 or value > bestValue
+                    bestValue := value
+                    bestIndex := sectorIndex
+        array.set(topIdx, k, bestIndex)
+        if bestIndex != -1
+            array.set(selected, bestIndex, true)
+
+
+    if breadthOk
+        for k = 0 to 2
+            float worstValue = na
+            int worstIndex = -1
+            for sectorIndex = 0 to N_SECTORS - 1
+                float value = array.get(means, sectorIndex)
+                bool eligible = array.get(eligibleArr, sectorIndex)
+                bool used = array.get(selected, sectorIndex)
+                if eligible and not used and not na(value)
+                    if worstIndex == -1 or value < worstValue
+                        worstValue := value
+                        worstIndex := sectorIndex
+            array.set(bottomIdx, k, worstIndex)
+            if worstIndex != -1
+                array.set(selected, worstIndex, true)
+
+
+    table.cell(sector_table, 0, 1, "Rank", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 1, 1, "Sector", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 2, 1, "Mean RR", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 3, 1, "Adj CI95", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 4, 1, "t-stat", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 5, 1, "N / Rej", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(sector_table, 6, 1, "Evidence / QC", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+
+
+    for k = 0 to 2
+        int row = 2 + k
+        int sidx = array.get(topIdx, k)
+        table.cell(sector_table, 0, row, (breadthOk ? "TOP " : "ELIG ") + str.tostring(k + 1), bgcolor=color.new(color.green, 35), text_color=color.white, text_size=size.small)
+        if sidx == -1
+            for c = 1 to 6
+                table.cell(sector_table, c, row, "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        else
+            table.cell(sector_table, 1, row, array.get(sector_names, sidx), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 2, row, f_fmt_pct(array.get(means, sidx), "#.##"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 3, row, f_fmt_ci(array.get(ciLows, sidx), array.get(ciHighs, sidx)), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 4, row, f_fmt_num(array.get(tstats, sidx), "#.##"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 5, row, str.tostring(math.round(array.get(counts, sidx))) + " / " + str.tostring(math.round(nz(array.get(rejects, sidx), 0))), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 6, row, array.get(evidenceArr, sidx), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+
+
+    table.cell(sector_table, 0, 5, "—", bgcolor=color.new(color.black, 70), text_color=color.white, text_size=size.small)
+    for c = 1 to 6
+        table.cell(sector_table, c, 5, "", bgcolor=color.new(color.black, 70), text_color=color.white, text_size=size.small)
+
+
+    for k = 0 to 2
+        int row = 6 + k
+        int sidx = breadthOk ? array.get(bottomIdx, k) : -1
+        table.cell(sector_table, 0, row, breadthOk ? "BOT " + str.tostring(k + 1) : "NO ROTATION", bgcolor=color.new(color.red, 35), text_color=color.white, text_size=size.small)
+        if sidx == -1
+            for c = 1 to 6
+                table.cell(sector_table, c, row, "--", bgcolor=color.new(color.black, 30), text_color=color.white, text_size=size.small)
+        else
+            table.cell(sector_table, 1, row, array.get(sector_names, sidx), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 2, row, f_fmt_pct(array.get(means, sidx), "#.##"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 3, row, f_fmt_ci(array.get(ciLows, sidx), array.get(ciHighs, sidx)), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 4, row, f_fmt_num(array.get(tstats, sidx), "#.##"), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 5, row, str.tostring(math.round(array.get(counts, sidx))) + " / " + str.tostring(math.round(nz(array.get(rejects, sidx), 0))), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+            table.cell(sector_table, 6, row, array.get(evidenceArr, sidx), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+
+
+    string bestName = breadthOk and array.get(topIdx, 0) != -1 ? array.get(sector_names, array.get(topIdx, 0)) : "--"
+    string worstName = breadthOk and array.get(bottomIdx, 0) != -1 ? array.get(sector_names, array.get(bottomIdx, 0)) : "--"
+    string sectorTakeaway = breadthOk ? bestName + " vs " + worstName : "INSUFFICIENT BREADTH " + str.tostring(eligibleCount) + "/" + str.tostring(N_SECTORS)
+
+
+    table.cell(sector_table, 0, 9, "TAKEAWAY", bgcolor=color.new(color.blue, 15), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 1, 9, sectorTakeaway, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 2, 9, breadthOk ? "ROTATION" : "DIAGNOSTIC", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 3, 9, "Min breadth " + str.tostring(min_sector_breadth), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 4, 9, "crit* ≥" + str.tostring(sector_z_effective, "#.###"), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 5, 9, use_non_overlap ? "NON-OVERLAP" : "OVERLAP", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 6, 9, sample_mode, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+
+    table.cell(sector_table, 0, 10, "Control", bgcolor=color.new(color.blue, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 1, 10, sector_multiple_testing, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 2, 10, "11 tests", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 3, 10, "Family-wise 5%", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 4, 10, "QC excludes ≥" + str.tostring(rejection_contaminated_pct, "#") + "%", bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 5, 10, dataq, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(sector_table, 6, 10, integrity_state, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+
+    table.cell(sector_table, 0, 11, "Note", bgcolor=color.new(color.black, 60), text_color=color.white, text_size=size.tiny)
+    table.cell(sector_table, 1, 11, "No Top/Bottom claim below breadth gate; contaminated series cannot receive ROBUST evidence.", bgcolor=color.new(color.black, 60), text_color=color.white, text_size=size.tiny)
+
+
+//=============================================================================
+// 13) PANEL 4 — DUAL-COUNT TRANSITION ANALYSIS
+//=============================================================================
+
+
+var table transition_table = na
+if barstate.islast
+    if show_panel4
+        if na(transition_table)
+            transition_table := table.new(position.top_right, 9, 6, bgcolor=color.new(color.black, 15), border_width=2, border_color=color.new(color.white, 25))
+            table.merge_cells(transition_table, 0, 0, 8, 0)
+    else
+        if not na(transition_table)
+            table.delete(transition_table)
+            transition_table := na
+
+
+if barstate.islast and show_panel4 and not na(transition_table)
+    int origin = risk_valid and not na(risk_bucket) ? risk_bucket : na
+    table.cell(transition_table, 0, 0,
+         "Transition v3.1.3 | H=" + str.tostring(transition_horizon) + " | Origin " + f_bucket_label(origin) + " | State vs return samples",
+         bgcolor=color.new(color.orange, 0), text_color=color.white, text_size=size.small)
+
+
+    table.cell(transition_table, 0, 1, "Direction", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(transition_table, 1, 1, "Prob%", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(transition_table, 2, 1, "Prob W95", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(transition_table, 3, 1, "Mean return", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(transition_table, 4, 1, "t-CI95", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(transition_table, 5, 1, "Win | W95", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(transition_table, 6, 1, "N state", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(transition_table, 7, 1, "N ret / Rej", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+    table.cell(transition_table, 8, 1, "Evidence / QC", bgcolor=color.new(color.white, 10), text_color=color.black, text_size=size.small)
+
+
+    float totalOriginState = 0.0
+    float totalOriginReturn = 0.0
+    float totalOriginReject = 0.0
+    if not na(origin)
+        for destination = 0 to N_BUCKETS - 1
+            int idx = origin * N_BUCKETS + destination
+            totalOriginState += array.get(trans_state_count, idx)
+            totalOriginReturn += array.get(trans_count, idx)
+            totalOriginReject += array.get(trans_reject, idx)
+
+
+    int[] directions = array.from(1, 0, -1)
+    string[] directionNames = array.from("Risk ↑", "Same bucket", "Risk ↓")
+
+
+    float upProb = na
+    float sameProb = na
+    float downProb = na
+
+
+    for r = 0 to 2
+        int direction = array.get(directions, r)
+        float stateCnt = na
+        float rejected = na
+        float retCnt = na
+        float sumRet = na
+        float sumSqRet = na
+        float wins = na
+        if not na(origin)
+            [aggStateCnt, aggRejected] = f_transition_state_aggregate(origin, direction)
+            [aggRetCnt, aggSumRet, aggSumSqRet, aggWins] = f_transition_aggregate(origin, direction)
+            stateCnt := aggStateCnt
+            rejected := aggRejected
+            retCnt := aggRetCnt
+            sumRet := aggSumRet
+            sumSqRet := aggSumSqRet
+            wins := aggWins
+
+
+        float probability = totalOriginState > 0 and not na(stateCnt) ? stateCnt / totalOriginState * 100.0 : na
+        float probLo = f_wilson_low(stateCnt, totalOriginState, Z95)
+        float probHi = f_wilson_high(stateCnt, totalOriginState, Z95)
+        float mean = f_avg(sumRet, retCnt)
+        float ciLo = f_ci_low_auto(sumRet, sumSqRet, retCnt)
+        float ciHi = f_ci_high_auto(sumRet, sumSqRet, retCnt)
+        float winRate = f_winrate(wins, retCnt)
+        float winLo = f_wilson_low(wins, retCnt, Z95)
+        float winHi = f_wilson_high(wins, retCnt, Z95)
+        float transitionCrit = math.max(z_critical_market, f_tcrit95(retCnt))
+        string baseEvidence = f_evidence_label(sumRet, sumSqRet, retCnt, min_n_transition_return, transitionCrit, market_econ_floor, inference_approx_valid)
+        string sampleHealth = f_sample_health(retCnt, rejected, rejection_caution_pct, rejection_contaminated_pct, rejection_unusable_pct)
+        string evidence = internal_consistency_pass ? f_quality_evidence(baseEvidence, sampleHealth) : "INTERNAL-FAIL"
+        bool qualityAllows = f_quality_allows_inference(sampleHealth)
+        bool enoughOrigin = totalOriginState >= min_n_transition
+        bool hasReturn = not na(retCnt) and retCnt > 0
+        bool enoughReturnInference = internal_consistency_pass and hasReturn and retCnt >= min_n_transition_return and qualityAllows
+        int row = r + 2
+
+
+        if direction == 1
+            upProb := probability
+        else if direction == 0
+            sameProb := probability
+        else
+            downProb := probability
+
+
+        table.cell(transition_table, 0, row, array.get(directionNames, r), bgcolor=color.new(color.black, 18), text_color=color.white, text_size=size.small)
+        table.cell(transition_table, 1, row, enoughOrigin and not na(probability) ? str.tostring(probability, "#.#") + "%" : "--", bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(transition_table, 2, row, enoughOrigin ? f_fmt_prob_ci(probLo, probHi) : "--", bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(transition_table, 3, row, hasReturn ? f_fmt_pct(mean, "#.##") : "--", bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(transition_table, 4, row, enoughReturnInference ? f_fmt_ci(ciLo, ciHi) : "--", bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(transition_table, 5, row,
+             hasReturn and not na(winRate) ? str.tostring(winRate, "#.#") + "%" + (enoughReturnInference ? " " + f_fmt_prob_ci(winLo, winHi) : "") : "--",
+             bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(transition_table, 6, row, str.tostring(math.round(nz(stateCnt, 0))), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(transition_table, 7, row, str.tostring(math.round(nz(retCnt, 0))) + " / " + str.tostring(math.round(nz(rejected, 0))), bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+        table.cell(transition_table, 8, row, evidence, bgcolor=color.new(color.black, 28), text_color=color.white, text_size=size.small)
+
+
+    string transition_takeaway = not internal_consistency_pass ? "INTERNAL CONSISTENCY FAIL" :
+         totalOriginState < min_n_transition ? "ORIGIN STATE SAMPLE THIN" :
+         not na(sameProb) and sameProb >= 50 ? "REGIME PERSISTENCE DOMINATES" :
+         not na(upProb) and not na(downProb) and upProb > downProb ? "RISK DETERIORATION MORE FREQUENT" :
+         not na(upProb) and not na(downProb) and downProb > upProb ? "RISK IMPROVEMENT MORE FREQUENT" : "BALANCED TRANSITIONS"
+    string transitionOutcomeHealth = f_sample_health(totalOriginReturn, totalOriginReject, rejection_caution_pct, rejection_contaminated_pct, rejection_unusable_pct)
+
+
+    table.cell(transition_table, 0, 5, "TAKEAWAY", bgcolor=color.new(color.blue, 15), text_color=color.white, text_size=size.small)
+    table.cell(transition_table, 1, 5, transition_takeaway, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(transition_table, 2, 5, "Nstate " + str.tostring(math.round(totalOriginState)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(transition_table, 3, 5, "Nret " + str.tostring(math.round(totalOriginReturn)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(transition_table, 4, 5, "Rej " + str.tostring(math.round(totalOriginReject)), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(transition_table, 5, 5, sample_mode, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(transition_table, 6, 5, "Hyst " + str.tostring(hysteresis_pts, "#.#"), bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(transition_table, 7, 5, "Internal " + internal_consistency_state, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+    table.cell(transition_table, 8, 5, "Return QC " + transitionOutcomeHealth, bgcolor=color.new(color.black, 25), text_color=color.white, text_size=size.small)
+
+
+//=============================================================================
+// 14) ALERTS
+//=============================================================================
+
+
+bool risk_cross_high = risk_valid and risk_pct >= 80 and risk_pct[1] < 80
+bool risk_cross_low = risk_valid and risk_pct <= 20 and risk_pct[1] > 20
+bool integrity_became_stale = integrity_state == "STALE" and integrity_state[1] != "STALE"
+bool tail_override_on = tail_override and not tail_override[1]
+bool vni_outcome_became_unusable = vni_sample_health == "UNUSABLE" and vni_sample_health[1] != "UNUSABLE"
+bool internal_consistency_failed = not internal_consistency_pass and internal_consistency_pass[1]
+
+
+alertcondition(risk_cross_high, "Macro risk entered B4", "Macro composite risk entered the high-stress region.")
+alertcondition(risk_cross_low, "Macro risk entered B0", "Macro composite risk entered the very-supportive region.")
+alertcondition(integrity_became_stale, "Macro source data became stale", "At least one macro source timestamp exceeded the configured staleness limit.")
+alertcondition(tail_override_on, "Dominant macro pillar entered tail risk", "At least one macro pillar crossed the dominant-pillar tail threshold.")
+alertcondition(vni_outcome_became_unusable, "VNINDEX outcome sample became unusable", "The selected VNINDEX bucket/horizon exceeded the configured rejection-rate gate; outcome inference is disabled.")
+alertcondition(internal_consistency_failed, "Internal consistency invariant failed", "VNINDEX market counts no longer reconcile with transition return/rejection counts; outcome inference is locked.")

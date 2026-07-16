@@ -73,7 +73,7 @@ Phiên bản: v7.0.0 | Tác giả: Macro Research Team
 ### 📈 03_Indices_Research_Map
 **Mapping vĩ mô → Hiệu suất thị trường (Script B)**
 
-Phiên bản: v2.0 | Tác giả: Macro Research Team
+Phiên bản: v3.1.3e | Tác giả: Macro Research Team
 
 **Mục đích:** Script B trong hệ thống 2 script, map Risk Score từ Script A sang hiệu suất thị trường:
 - Replicate Macro Engine từ Script A
@@ -90,7 +90,7 @@ Phiên bản: v2.0 | Tác giả: Macro Research Team
 - Bạn cần backtest chiến lược theo bucket
 
 **File chính:**
-- `Indices_Research_Map_v2.0.pine`
+- `Indices_Research_Map_v3.1.3e.pine`
 
 📖 **Xem chi tiết:** [README Indices Research Map](./03_Indices_Research_Map/)
 
@@ -337,7 +337,7 @@ Tất cả các dự án đều được xây dựng với các chuẩn mực h�
 ### Sub-projects:
 - **01_MacroAcademic_Engine:** v3.2.1 (Semantic Clarity Patch)
 - **02_Macro_Alert_System:** v7.0.0 (Academic Robustness)
-- **03_Indices_Research_Map:** v2.0.1 (Clean Fixed Build)
+- **03_Indices_Research_Map:** v3.1.3e (Bounded Global Buffer Fix)
 - **04_YieldCurveLab:** v2.3.0 (Horizon Separation & Sample Power)
 - **05_Bond_Transmission_Monitor:** v6.0.1 (Interpretation Upgrade)
 
