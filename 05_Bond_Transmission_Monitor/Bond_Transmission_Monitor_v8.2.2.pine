@@ -1,0 +1,1206 @@
+//@version=6
+indicator("Giám sát truyền dẫn trái phiếu VN — MacroAcademic v8.2.2 (Research Precision & Dual Chain Diagnostics)",
+     shorttitle="Macro TP VN v8.2.2",
+     overlay=false,
+     format=format.price,
+     precision=1,
+     max_labels_count=100,
+     max_lines_count=100,
+     max_bars_back=800,
+     calc_bars_count=800,
+     dynamic_requests=false)
+
+// =====================================================================
+// MACROACADEMIC v8.2.2 — NGUYÊN TẮC THIẾT KẾ
+// =====================================================================
+// 1) Tách hoàn toàn ba khái niệm:
+//    - Observed Pressure: áp lực đang quan sát trong dữ liệu.
+//    - Model Forecast: áp lực mà mô hình liên hệ dự báo ước lượng.
+//    - DataQ / Evidence Score: chất lượng dữ liệu không được bù cho predictive edge yếu.
+// 2) Nested walk-forward discipline:
+//    - Hệ số tại t chỉ dùng dữ liệu tới t-1.
+//    - Lag được chọn trên cửa sổ OOS cũ hơn.
+//    - Năng lực cuối cùng được đánh giá trên holdout OOS gần nhất, không dùng để chọn lag.
+// 3) Benchmark khó: lấy benchmark tốt hơn giữa dự báo 0 và trung bình lịch sử.
+// 4) Không báo p-value/t-stat giả chính xác; ưu tiên OOS, directional edge, stability,
+//    residual diagnostics và generalization gap.
+// 5) P6 dùng weakest-link gate và đồng thời kiểm định forecast trực tiếp của toàn chuỗi.
+// 6) Liên hệ dự báo, không phải suy luận nhân quả.
+// 7) Runtime-bounded core — chỉ tính 800 bar gần nhất.
+//    Mức 800 bao phủ nested MAD (2×252), train 120, select 60, holdout 40,
+//    lag tối đa 5 và sai phân, nhưng tránh chạy trên toàn bộ lịch sử chart.
+// 8) Continuous Evidence Score: OOS R² và directional edge được ánh xạ quanh mốc 50,
+//    nhờ đó mô hình yếu/gần đạt không còn đồng loạt suy biến về 0.
+// 9) Hard VALID/WATCH gates vẫn kiểm tra trực tiếp OOS, edge, coverage, sign,
+//    stability, residual quality, lag robustness và generalization.
+// 10) Gate Diagnostics tách UNSTABLE, GEN FAIL và BREAK WARNING; không gọi
+//     stability thấp là structural break.
+// 11) Executive display làm mượt riêng lớp trình bày; dữ liệu raw vẫn dùng trong engine.
+// 12) Bắt buộc chart 1D để một bar mô hình tương ứng một quan sát ngày.
+// 13) Predictive coherence cap: Evidence không được vượt vùng trung tính khi cả
+//     OOS và directional edge cùng thất bại hoặc dấu lý thuyết bị vi phạm.
+// 14) Unified display layer: Overview, driver ranking, detail, plot, background và
+//     xu hướng dùng cùng raw/EMA convention theo chế độ Research/Executive.
+// 15) Research precision: format mask dùng placeholder 0 thực, không dùng số literal
+//     sau dấu thập phân; Edge có 2 chữ số, Beta/OOS R² có 3 chữ số.
+// 16) Dual chain diagnostics: P6 giữ riêng Link Gate và Direct Forecast Gate;
+//     lý do của forecast trực tiếp không bị ghi đè khi một mắt xích thất bại.
+
+// =====================================================================
+// 0) HẰNG SỐ
+// =====================================================================
+string TF_DATA = "1D"
+
+int   LEN_Z        = 252
+int   LEN_TRAIN    = 120
+int   LEN_SELECT   = 60
+int   LEN_HOLDOUT  = 40
+int   LEN_DATA_Q   = 220
+int   CALC_BARS     = 800
+float CLIP_Z       = 3.0
+float OOS_R2_CAP   = 0.10
+float DIR_EDGE_CAP = 10.0
+float LAG_PENALTY  = 1.5
+float DIR_EPS_FRAC = 0.05
+
+int LAG_0 = 0
+int LAG_1 = 1
+int LAG_3 = 3
+int LAG_5 = 5
+
+string STATE_VALID  = "VALID"
+string STATE_WATCH  = "WATCH"
+string STATE_NONE   = "NO SIGNAL"
+string STATE_DATA   = "DATA FAIL"
+
+// Pine format masks: 0 là placeholder chữ số. Tránh dùng số literal
+// sau dấu thập phân vì chúng không biểu thị số chữ số cần hiển thị.
+string FMT_1 = "#.0"
+string FMT_2 = "#.00"
+string FMT_3 = "#.000"
+
+// =====================================================================
+// 1) KIỂU DỮ LIỆU
+// =====================================================================
+type EvalMetrics
+    float oosR2
+    float hit
+    float naiveHit
+    float dirSkill
+    float dirCoverage
+    float residualQ
+
+type Candidate
+    int lag
+    float beta
+    float alpha
+    float prediction
+    float residual
+    float selectScore
+    float selectOosR2
+    float holdOosR2
+    float holdHit
+    float holdNaive
+    float holdDirSkill
+    float holdDirCoverage
+    float stability
+    float residualQ
+    float signScore
+    float selectionSignScore
+
+type CoreModel
+    int lag
+    float lagGap
+    float beta
+    float alpha
+    float prediction
+    float residual
+    float selectionScore
+    float selectionOosR2
+    float holdOosR2
+    float holdHit
+    float holdNaive
+    float holdDirSkill
+    float holdDirCoverage
+    float stability
+    float residualQ
+    float signScore
+    float generalization
+    float modelSkill
+    bool strictPass
+    bool watchPass
+    bool diagnosticBlock
+    bool unstableFlag
+    bool genFail
+    bool breakWarning
+    string diagnostic
+    string gateReason
+
+type ModelResult
+    string id
+    string name
+    float observed
+    float forecast
+    float validated
+    float dataQ
+    float modelSkill
+    string state
+    int lag
+    float lagGap
+    float beta
+    float selectionOosR2
+    float holdOosR2
+    float hit
+    float naiveHit
+    float dirSkill
+    float dirCoverage
+    float stability
+    float residualQ
+    float coverage
+    float freshness
+    float breadth
+    float delta1
+    float delta7
+    bool diagnosticBlock
+    string diagnostic
+    string gateReason
+    string note
+
+// =====================================================================
+// 2) INPUT
+// =====================================================================
+groupView = "A) Giao diện"
+viewMode = input.string("Overview", "Màn hình",
+     options=["Overview", "P1 BOJ→VN", "P2 Global→VN", "P3 Level & Curve→VN", "P4 Yen carry→VN", "P5 FX & Liquidity→VN", "P6 Transmission chain"],
+     group=groupView)
+displayMode = input.string("Executive", "Độ chi tiết", options=["Executive", "Research"], group=groupView)
+tablePos = input.string("Dưới phải", "Vị trí bảng", options=["Trên phải", "Trên trái", "Dưới phải", "Dưới trái"], group=groupView)
+showBg = input.bool(true, "Tô nền theo áp lực quan sát", group=groupView)
+showLabel = input.bool(true, "Nhãn cuối đường", group=groupView)
+displaySmoothN = input.int(3, "EMA hiển thị Executive", minval=1, maxval=10, group=groupView)
+
+// Kỷ luật mô hình
+groupModel = "B) Kỷ luật mô hình"
+useBestLag = input.bool(true, "Nested best-lag", group=groupModel)
+manualLag = input.int(1, "Lag thủ công", minval=0, maxval=20, group=groupModel)
+minDataQ = input.float(80.0, "Data Gate tối thiểu", minval=0, maxval=100, step=5, group=groupModel)
+minStability = input.float(40.0, "Stability tối thiểu cho VALID", minval=0, maxval=100, step=5, group=groupModel)
+minLagGap = input.float(2.5, "Khoảng cách lag tối thiểu", minval=0, maxval=25, step=0.5, group=groupModel)
+freshSoftDays = input.int(3, "Bắt đầu phạt dữ liệu sau (ngày)", minval=0, maxval=30, group=groupModel)
+freshHardDays = input.int(10, "Dữ liệu hết hiệu lực sau (ngày)", minval=1, maxval=60, group=groupModel)
+smoothN = input.int(1, "EMA dữ liệu mô hình (khuyến nghị 1)", minval=1, maxval=10, group=groupModel)
+
+// Dấu kỳ vọng — phải được đặt trước, không tối ưu theo kết quả
+groupSigns = "C) Dấu kỳ vọng lý thuyết"
+signP1 = input.int(1, "P1 Nhật→VN", minval=-1, maxval=1, group=groupSigns)
+signP2 = input.int(1, "P2 Global long-end→VN", minval=-1, maxval=1, group=groupSigns)
+signP3Level = input.int(1, "P3 Global level", minval=-1, maxval=1, group=groupSigns)
+signP3Curve = input.int(1, "P3 Global steepening", minval=-1, maxval=1, group=groupSigns)
+signP4 = input.int(1, "P4 Yen carry stress→VN", minval=-1, maxval=1, group=groupSigns)
+signP5 = input.int(1, "P5 FX/liquidity stress→VN", minval=-1, maxval=1, group=groupSigns)
+signA = input.int(1, "P6 A Global→USDVND", minval=-1, maxval=1, group=groupSigns)
+signB = input.int(1, "P6 B USDVND→Interbank", minval=-1, maxval=1, group=groupSigns)
+signC = input.int(1, "P6 C Interbank→VN10Y", minval=-1, maxval=1, group=groupSigns)
+
+// Symbols
+groupVN = "D) Việt Nam"
+symVN10 = input.symbol("TVC:VN10Y", "VN 10Y", group=groupVN)
+symVN02 = input.symbol("TVC:VN02Y", "VN 2Y", group=groupVN)
+symUSDVND = input.symbol("FX_IDC:USDVND", "USDVND", group=groupVN)
+symVNINBR = input.symbol("ECONOMICS:VNINBR", "VN interbank", group=groupVN)
+
+groupJP = "E) Nhật Bản"
+symJP10 = input.symbol("TVC:JP10Y", "JP 10Y", group=groupJP)
+symJP02 = input.symbol("TVC:JP02Y", "JP 2Y", group=groupJP)
+jpDriverChoice = input.string("JP10Y", "Driver P1", options=["JP10Y", "JP02Y"], group=groupJP)
+
+groupGlobal = "F) Trái phiếu toàn cầu"
+symUS10 = input.symbol("TVC:US10Y", "US 10Y", group=groupGlobal)
+symUS02 = input.symbol("TVC:US02Y", "US 2Y", group=groupGlobal)
+symDE10 = input.symbol("TVC:DE10Y", "DE 10Y", group=groupGlobal)
+symDE02 = input.symbol("TVC:DE02Y", "DE 2Y", group=groupGlobal)
+symGB10 = input.symbol("TVC:GB10Y", "GB 10Y", group=groupGlobal)
+symGB02 = input.symbol("TVC:GB02Y", "GB 2Y", group=groupGlobal)
+symAU10 = input.symbol("TVC:AU10Y", "AU 10Y", group=groupGlobal)
+symCA10 = input.symbol("TVC:CA10Y", "CA 10Y", group=groupGlobal)
+
+groupRisk = "G) FX & Risk-off"
+symDXY = input.symbol("TVC:DXY", "DXY", group=groupRisk)
+symUSDJPY = input.symbol("FX_IDC:USDJPY", "USDJPY", group=groupRisk)
+symVIX = input.symbol("CBOE:VIX", "VIX", group=groupRisk)
+
+// =====================================================================
+// 2B) KỶ LUẬT TẦN SUẤT
+// =====================================================================
+// Các biến mô hình đều là daily. Chạy trên intraday sẽ lặp forward-filled daily values,
+// làm sai effective sample, OOS windows và tăng runtime không cần thiết.
+bool chartIs1D = timeframe.isdaily and timeframe.multiplier == 1
+if barstate.isfirst and not chartIs1D
+    runtime.error("MacroAcademic v8.2.2 yêu cầu chart timeframe 1D để bảo toàn mẫu ngày và runtime.")
+
+// =====================================================================
+// 3) HÀM TOÁN HỌC & DỮ LIỆU
+// =====================================================================
+f_clamp(x, lo, hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_fmt(x, fmt) =>
+    na(x) ? "—" : str.tostring(x, fmt)
+
+f_smooth(x, n) =>
+    n <= 1 ? x : ta.ema(x, n)
+
+f_lag(x, n) =>
+    n <= 0 ? x : x[n]
+
+f_mean2(a, b) =>
+    float s = 0.0
+    int n = 0
+    if not na(a)
+        s += a
+        n += 1
+    if not na(b)
+        s += b
+        n += 1
+    n > 0 ? s / n : na
+
+f_mean3(a, b, c) =>
+    float s = 0.0
+    int n = 0
+    if not na(a)
+        s += a
+        n += 1
+    if not na(b)
+        s += b
+        n += 1
+    if not na(c)
+        s += c
+        n += 1
+    n > 0 ? s / n : na
+
+f_mean4(a, b, c, d) =>
+    float s = 0.0
+    int n = 0
+    if not na(a)
+        s += a
+        n += 1
+    if not na(b)
+        s += b
+        n += 1
+    if not na(c)
+        s += c
+        n += 1
+    if not na(d)
+        s += d
+        n += 1
+    n > 0 ? s / n : na
+
+f_mean5(a, b, c, d, e) =>
+    float s = 0.0
+    int n = 0
+    if not na(a)
+        s += a
+        n += 1
+    if not na(b)
+        s += b
+        n += 1
+    if not na(c)
+        s += c
+        n += 1
+    if not na(d)
+        s += d
+        n += 1
+    if not na(e)
+        s += e
+        n += 1
+    n > 0 ? s / n : na
+
+f_min2(a, b) =>
+    na(a) ? b : na(b) ? a : math.min(a, b)
+
+f_min3(a, b, c) =>
+    f_min2(f_min2(a, b), c)
+
+f_min4(a, b, c, d) =>
+    f_min2(f_min3(a, b, c), d)
+
+
+f_coverage(src, win) =>
+    ta.sma(na(src) ? 0.0 : 1.0, win)
+
+f_roll_sum_full(src, win) =>
+    ta.sma(src, win) * win
+
+f_freshness_score(srcTime, softDays, hardDays) =>
+    float ageDays = na(srcTime) ? 999.0 : math.max(0.0, (time - srcTime) / 86400000.0)
+    ageDays <= softDays ? 100.0 :
+     ageDays >= hardDays ? 0.0 :
+     100.0 * (hardDays - ageDays) / math.max(1.0, hardDays - softDays)
+
+f_breadth2(a, b) =>
+    50.0 * ((na(a) ? 0.0 : 1.0) + (na(b) ? 0.0 : 1.0))
+
+f_breadth3(a, b, c) =>
+    100.0 * ((na(a) ? 0.0 : 1.0) + (na(b) ? 0.0 : 1.0) + (na(c) ? 0.0 : 1.0)) / 3.0
+
+f_breadth5(a, b, c, d, e) =>
+    100.0 * ((na(a) ? 0.0 : 1.0) + (na(b) ? 0.0 : 1.0) + (na(c) ? 0.0 : 1.0) + (na(d) ? 0.0 : 1.0) + (na(e) ? 0.0 : 1.0)) / 5.0
+
+// Median/MAD robust location-scale. Tách center/scale để tái sử dụng,
+// đặc biệt khi nhiều forecast cùng có đơn vị target là ΔVN10Y.
+f_robust_center_scale(src, length) =>
+    float med = ta.median(src, length)
+    float mad = ta.median(math.abs(src - med), length)
+    float fallback = ta.stdev(src, length)
+    float scale = not na(mad) and mad > 0 ? 1.4826 * mad : fallback
+    [med, scale]
+
+f_robust_z_from(src, med, scale, clipMult) =>
+    float z = not na(scale) and scale > 0 ? (src - med) / scale : na
+    f_clamp(z, -clipMult, clipMult)
+
+f_robust_z(src, length, clipMult) =>
+    [med, scale] = f_robust_center_scale(src, length)
+    f_robust_z_from(src, med, scale, clipMult)
+
+f_z_to_score(z) =>
+    f_clamp(50.0 + (100.0 / (2.0 * CLIP_Z)) * z, 0.0, 100.0)
+
+f_target_unit_score(value, targetMed, targetScale) =>
+    f_z_to_score(f_robust_z_from(value, targetMed, targetScale, CLIP_Z))
+
+// Continuous score centered at 50:
+// OOS R² -0.10 / 0 / +0.10 maps to 0 / 50 / 100.
+f_oos_component(r2) =>
+    f_clamp(50.0 + 50.0 * nz(r2, -OOS_R2_CAP) / OOS_R2_CAP, 0.0, 100.0)
+
+// Directional edge -10 / 0 / +10 percentage points maps to 0 / 50 / 100.
+f_dir_component(edge) =>
+    f_clamp(50.0 + 50.0 * nz(edge, -DIR_EDGE_CAP) / DIR_EDGE_CAP, 0.0, 100.0)
+
+f_lag_component(lagGap, autoLag) =>
+    autoLag ? f_clamp(50.0 + 5.0 * (nz(lagGap, 0.0) - minLagGap), 0.0, 100.0) : 100.0
+
+f_coverage_component(dirCoverage) =>
+    f_clamp(2.0 * nz(dirCoverage, 0.0) - 50.0, 0.0, 100.0)
+
+f_append_reason(base, condition, item) =>
+    condition ? (str.length(base) == 0 ? item : base + " · " + item) : base
+
+f_diagnostic_label(unstableFlag, genFail, breakWarning) =>
+    breakWarning ? "BREAK WARNING" : genFail ? "GEN FAIL" : unstableFlag ? "UNSTABLE" : "STABLE"
+
+f_diag_color(diag) =>
+    diag == "BREAK WARNING" ? color.new(color.red, 50) :
+     diag == "GEN FAIL" ? color.new(color.orange, 55) :
+     diag == "UNSTABLE" ? color.new(color.yellow, 70) :
+     color.new(color.black, 80)
+
+f_model_gate_reason(oosR2, dirSkill, dirCoverage, stability, residualQ, signScore, generalization, lagGap, autoLag, unstableFlag, genFail, breakWarning) =>
+    string reason = ""
+    reason := f_append_reason(reason, nz(oosR2, -1.0) <= 0.0, "OOS≤0")
+    reason := f_append_reason(reason, nz(dirSkill, -99.0) <= 0.0, "EDGE≤0")
+    reason := f_append_reason(reason, nz(dirCoverage, 0.0) < 50.0, "DIR COVER")
+    reason := f_append_reason(reason, nz(stability, 0.0) < minStability and not unstableFlag, "STABILITY")
+    reason := f_append_reason(reason, nz(residualQ, 0.0) < 35.0, "RESIDUAL")
+    reason := f_append_reason(reason, nz(signScore, 0.0) < 99.0, "SIGN")
+    reason := f_append_reason(reason, nz(generalization, 0.0) < 25.0, "GENERALIZE")
+    reason := f_append_reason(reason, autoLag and nz(lagGap, 0.0) < minLagGap, "LAG GAP")
+    reason := f_append_reason(reason, unstableFlag and not breakWarning, "UNSTABLE")
+    reason := f_append_reason(reason, genFail and not breakWarning, "GEN FAIL")
+    reason := f_append_reason(reason, breakWarning, "BREAK WARN")
+    str.length(reason) == 0 ? "PASS" : "FAIL: " + reason
+
+// Predictive coherence cap keeps the continuous score semantically ordered:
+// - both OOS and directional edge fail: Evidence cannot exceed 49;
+// - only one predictive dimension fails: Evidence cannot exceed 59;
+// - theoretical sign fails: Evidence cannot exceed 49.
+// This is an interpretability constraint, not a replacement for the hard gate.
+f_predictive_coherence_cap(oosR2, dirSkill, signScore) =>
+    bool oosPositive = nz(oosR2, -1.0) > 0.0
+    bool edgePositive = nz(dirSkill, -99.0) > 0.0
+    float predictiveCap = not oosPositive and not edgePositive ? 49.0 : not oosPositive or not edgePositive ? 59.0 : 100.0
+    nz(signScore, 0.0) >= 99.0 ? predictiveCap : math.min(predictiveCap, 49.0)
+
+// Evidence Score is descriptive and continuous. It never replaces the hard gate.
+f_evidence_score(oosR2, dirSkill, dirCoverage, stability, residualQ, generalization, lagGap, signScore, autoLag) =>
+    float oosScore = f_oos_component(oosR2)
+    float dirScore = f_dir_component(dirSkill)
+    float coverageScore = f_coverage_component(dirCoverage)
+    float lagScore = f_lag_component(lagGap, autoLag)
+    float base = 0.40 * oosScore + 0.22 * dirScore + 0.13 * f_clamp(nz(stability, 0.0), 0.0, 100.0) + 0.10 * f_clamp(nz(residualQ, 0.0), 0.0, 100.0) + 0.07 * f_clamp(nz(generalization, 0.0), 0.0, 100.0) + 0.04 * coverageScore + 0.04 * lagScore
+    float coherenceCap = f_predictive_coherence_cap(oosR2, dirSkill, signScore)
+    f_clamp(math.min(base, coherenceCap), 0.0, 100.0)
+
+f_generalization_score(selectR2, holdR2) =>
+    if na(selectR2) or na(holdR2)
+        0.0
+    else
+        float deterioration = math.max(0.0, selectR2 - holdR2)
+        100.0 * (1.0 - f_clamp(deterioration / 0.20, 0.0, 1.0))
+
+f_data_quality(coverage, freshness, breadth) =>
+    f_min3(f_clamp(100.0 * nz(coverage, 0.0), 0.0, 100.0), f_clamp(nz(freshness, 0.0), 0.0, 100.0), f_clamp(nz(breadth, 0.0), 0.0, 100.0))
+
+f_pressure_bucket(score) =>
+    score >= 80 ? "EXTREME" : score >= 65 ? "HIGH" : score >= 50 ? "ELEVATED" : score >= 35 ? "NEUTRAL" : "EASING"
+
+f_state_color(state) =>
+    state == STATE_VALID ? color.new(color.lime, 65) :
+     state == STATE_WATCH ? color.new(color.orange, 65) :
+     state == STATE_DATA ? color.new(color.red, 65) : color.new(color.gray, 75)
+
+f_pressure_color(score) =>
+    score >= 80 ? color.new(color.purple, 0) :
+     score >= 65 ? color.new(color.red, 0) :
+     score >= 50 ? color.new(color.orange, 0) :
+     score >= 35 ? color.new(color.yellow, 0) : color.new(color.lime, 0)
+
+// Robust cross-sectional center cho 5 channel.
+// Không tạo/sort array trên mỗi bar: khi đủ 5, loại min và max bằng đại số.
+f_trimmed_mean5(a, b, c, d, e) =>
+    float s = 0.0
+    int n = 0
+    float lo = na
+    float hi = na
+    if not na(a)
+        s += a
+        n += 1
+        lo := a
+        hi := a
+    if not na(b)
+        s += b
+        n += 1
+        lo := na(lo) ? b : math.min(lo, b)
+        hi := na(hi) ? b : math.max(hi, b)
+    if not na(c)
+        s += c
+        n += 1
+        lo := na(lo) ? c : math.min(lo, c)
+        hi := na(hi) ? c : math.max(hi, c)
+    if not na(d)
+        s += d
+        n += 1
+        lo := na(lo) ? d : math.min(lo, d)
+        hi := na(hi) ? d : math.max(hi, d)
+    if not na(e)
+        s += e
+        n += 1
+        lo := na(lo) ? e : math.min(lo, e)
+        hi := na(hi) ? e : math.max(hi, e)
+    n == 5 ? (s - lo - hi) / 3.0 : n > 0 ? s / n : na
+
+// =====================================================================
+// 4) LÕI KINH TẾ LƯỢNG
+// =====================================================================
+// Rolling OLS một bước: beta/alpha tại t chỉ dùng x,y tới t-1.
+f_reg_ols_oos(x, y, win) =>
+    float xTrain = x[1]
+    float yTrain = y[1]
+    float corr = ta.correlation(yTrain, xTrain, win)
+    float sdX = ta.stdev(xTrain, win)
+    float sdY = ta.stdev(yTrain, win)
+    float mx = ta.sma(xTrain, win)
+    float my = ta.sma(yTrain, win)
+    float beta = not na(corr) and not na(sdX) and not na(sdY) and sdX != 0 ? corr * sdY / sdX : na
+    float alpha = not na(beta) and not na(mx) and not na(my) ? my - beta * mx : na
+    float prediction = not na(alpha) and not na(beta) ? alpha + beta * x : na
+    float residual = y - prediction
+    [beta, alpha, prediction, residual]
+
+f_sign_score(beta, expectedSign) =>
+    na(beta) ? 0.0 : expectedSign == 0 ? 100.0 : beta * expectedSign > 0 ? 100.0 : 0.0
+
+// Beta của một cửa sổ kết thúc shift bar trước hiện tại; dùng để tránh lấy dấu hiện tại
+// tham gia vào quyết định chọn lag trên calibration window.
+f_beta_shift(x, y, win, shift) =>
+    float corr = ta.correlation(y[1 + shift], x[1 + shift], win)
+    float sdX = ta.stdev(x[1 + shift], win)
+    float sdY = ta.stdev(y[1 + shift], win)
+    not na(corr) and not na(sdX) and not na(sdY) and sdX != 0 ? corr * sdY / sdX : na
+
+// So sánh hai cửa sổ không chồng lấn; shift cho phép dùng riêng calibration/holdout.
+f_stability_score_shift(x, y, halfWin, expectedSign, shift) =>
+    float c1 = ta.correlation(y[1 + shift], x[1 + shift], halfWin)
+    float c0 = ta.correlation(y[1 + shift + halfWin], x[1 + shift + halfWin], halfWin)
+    float sx1 = ta.stdev(x[1 + shift], halfWin)
+    float sy1 = ta.stdev(y[1 + shift], halfWin)
+    float sx0 = ta.stdev(x[1 + shift + halfWin], halfWin)
+    float sy0 = ta.stdev(y[1 + shift + halfWin], halfWin)
+    float b1 = not na(c1) and not na(sx1) and not na(sy1) and sx1 != 0 ? c1 * sy1 / sx1 : na
+    float b0 = not na(c0) and not na(sx0) and not na(sy0) and sx0 != 0 ? c0 * sy0 / sx0 : na
+    float sameSign = not na(b0) and not na(b1) and b0 * b1 > 0 ? 30.0 : 0.0
+    float expected = expectedSign == 0 ? 20.0 : not na(b1) and b1 * expectedSign > 0 ? 20.0 : 0.0
+    float betaDrift = not na(b0) and not na(b1) ? math.abs(b1 - b0) / math.max(0.000001, math.abs(b0) + math.abs(b1)) : 1.0
+    float betaScore = 30.0 * (1.0 - f_clamp(betaDrift, 0.0, 1.0))
+    float corrDrift = not na(c0) and not na(c1) ? math.abs(c1 - c0) : 1.0
+    float corrScore = 20.0 * (1.0 - f_clamp(corrDrift / 0.40, 0.0, 1.0))
+    f_clamp(sameSign + expected + betaScore + corrScore, 0.0, 100.0)
+
+// Benchmark = benchmark tốt hơn giữa zero forecast và rolling historical mean.
+// Điều này khiến OOS R² khó đạt dương hơn, phù hợp với daily changes.
+f_eval_metrics(prediction, residual, y, trainWin, evalWin, shift) =>
+    float meanForecast = ta.sma(y[1], trainWin)
+    float meanError = y - meanForecast
+    float yS = y[shift]
+    float pS = prediction[shift]
+    float rS = residual[shift]
+    float meanErrS = meanError[shift]
+
+    float mseModel = ta.sma(rS * rS, evalWin)
+    float mseMean = ta.sma(meanErrS * meanErrS, evalWin)
+    float mseZero = ta.sma(yS * yS, evalWin)
+    float mseBenchmark = not na(mseMean) and not na(mseZero) ? math.min(mseMean, mseZero) : na
+    float oosR2 = not na(mseBenchmark) and mseBenchmark > 0 ? 1.0 - mseModel / mseBenchmark : na
+
+    float eps = nz(ta.stdev(y[1 + shift], trainWin), 0.0) * DIR_EPS_FRAC
+    float valid = not na(pS) and not na(yS) and math.abs(yS) > eps and math.abs(pS) > eps ? 1.0 : 0.0
+    float hitRaw = valid > 0 and ((pS > 0 and yS > 0) or (pS < 0 and yS < 0)) ? 1.0 : 0.0
+    float validN = f_roll_sum_full(valid, evalWin)
+    float hit = validN > 0 ? 100.0 * f_roll_sum_full(hitRaw, evalWin) / validN : na
+    float upRaw = valid > 0 and yS > 0 ? 1.0 : 0.0
+    float upShare = validN > 0 ? f_roll_sum_full(upRaw, evalWin) / validN : na
+    float naiveHit = not na(upShare) ? 100.0 * math.max(upShare, 1.0 - upShare) : na
+    float dirSkill = not na(hit) and not na(naiveHit) ? hit - naiveHit : na
+    float dirCoverage = 100.0 * validN / evalWin
+
+    float rho1 = math.abs(ta.correlation(rS, rS[1], evalWin))
+    float ySd = ta.stdev(yS, evalWin)
+    float bias = not na(ySd) and ySd > 0 ? math.abs(ta.sma(rS, evalWin)) / ySd : 1.0
+    float hetero = math.abs(ta.correlation(math.abs(rS), math.abs(pS), evalWin))
+    float rhoPenalty = 40.0 * f_clamp(nz(rho1, 1.0) / 0.50, 0.0, 1.0)
+    float biasPenalty = 35.0 * f_clamp(nz(bias, 1.0) / 0.50, 0.0, 1.0)
+    float heteroPenalty = 25.0 * f_clamp(nz(hetero, 1.0) / 0.50, 0.0, 1.0)
+    float residualQ = f_clamp(100.0 - rhoPenalty - biasPenalty - heteroPenalty, 0.0, 100.0)
+
+    EvalMetrics.new(oosR2, hit, naiveHit, dirSkill, dirCoverage, residualQ)
+
+f_candidate(x, y, expectedSign, lagN) =>
+    float xl = f_lag(x, lagN)
+    [beta, alpha, pred, residual] = f_reg_ols_oos(xl, y, LEN_TRAIN)
+    EvalMetrics selection = f_eval_metrics(pred, residual, y, LEN_TRAIN, LEN_SELECT, LEN_HOLDOUT)
+    EvalMetrics holdout = f_eval_metrics(pred, residual, y, LEN_TRAIN, LEN_HOLDOUT, 0)
+    float currentSignScore = f_sign_score(beta, expectedSign)
+    float selectionBeta = f_beta_shift(xl, y, LEN_TRAIN, LEN_HOLDOUT)
+    float selectionSignScore = f_sign_score(selectionBeta, expectedSign)
+    float selectStability = f_stability_score_shift(xl, y, math.floor(LEN_TRAIN / 2), expectedSign, LEN_HOLDOUT)
+    float currentStability = f_stability_score_shift(xl, y, math.floor(LEN_TRAIN / 2), expectedSign, 0)
+    float selectScore = 0.60 * f_oos_component(selection.oosR2) + 0.20 * f_dir_component(selection.dirSkill) + 0.10 * selectStability + 0.10 * selectionSignScore - LAG_PENALTY * lagN
+    Candidate.new(lagN, beta, alpha, pred, residual, f_clamp(selectScore, 0.0, 100.0), selection.oosR2, holdout.oosR2, holdout.hit, holdout.naiveHit, holdout.dirSkill, holdout.dirCoverage, currentStability, holdout.residualQ, currentSignScore, selectionSignScore)
+
+// Lag được chọn trên calibration OOS; holdout gần nhất chỉ dùng để xác nhận.
+f_best_model(x, y, expectedSign, autoLag, lagManual) =>
+    Candidate c0 = f_candidate(x, y, expectedSign, LAG_0)
+    Candidate c1 = f_candidate(x, y, expectedSign, LAG_1)
+    Candidate c3 = f_candidate(x, y, expectedSign, LAG_3)
+    Candidate c5 = f_candidate(x, y, expectedSign, LAG_5)
+
+    Candidate best = c0
+    float second = -1.0
+
+    if autoLag
+        if nz(c1.selectScore, -1.0) > nz(best.selectScore, -1.0)
+            second := best.selectScore
+            best := c1
+        else
+            second := math.max(second, nz(c1.selectScore, -1.0))
+        if nz(c3.selectScore, -1.0) > nz(best.selectScore, -1.0)
+            second := best.selectScore
+            best := c3
+        else
+            second := math.max(second, nz(c3.selectScore, -1.0))
+        if nz(c5.selectScore, -1.0) > nz(best.selectScore, -1.0)
+            second := best.selectScore
+            best := c5
+        else
+            second := math.max(second, nz(c5.selectScore, -1.0))
+    else
+        best := f_candidate(x, y, expectedSign, lagManual)
+        second := best.selectScore
+
+    float lagGap = autoLag ? math.max(0.0, nz(best.selectScore, 0.0) - nz(second, 0.0)) : 100.0
+    float generalization = f_generalization_score(best.selectOosR2, best.holdOosR2)
+    float modelSkill = f_evidence_score(best.holdOosR2, best.holdDirSkill, best.holdDirCoverage, best.stability, best.residualQ, generalization, lagGap, best.signScore, autoLag)
+
+    // Diagnostics are intentionally distinct:
+    // - UNSTABLE: parameter stability is weak.
+    // - GEN FAIL: older calibration had edge, recent holdout deteriorated.
+    // - BREAK WARNING: severe deterioration + sign reversal + very low stability.
+    bool unstableFlag = best.stability < 35.0
+    bool genFail = not na(best.selectOosR2) and best.selectOosR2 > 0.02 and nz(best.holdOosR2, -1.0) < -0.05
+    bool signReversal = best.selectionSignScore >= 99.0 and best.signScore < 99.0
+    bool breakWarning = not na(best.selectOosR2) and best.selectOosR2 > 0.05 and nz(best.holdOosR2, -1.0) < -0.10 and signReversal and best.stability < 25.0
+    bool diagnosticBlock = unstableFlag or genFail or breakWarning
+
+    bool strictPass = nz(best.holdOosR2, -1.0) > 0.0 and nz(best.holdDirSkill, -99.0) > 0.0 and best.holdDirCoverage >= 50.0 and best.stability >= minStability and best.residualQ >= 35.0 and best.signScore >= 99.0 and generalization >= 25.0 and (not autoLag or lagGap >= minLagGap) and not diagnosticBlock
+    bool watchPass = nz(best.holdOosR2, -1.0) > -0.05 and best.holdDirCoverage >= 40.0 and best.stability >= 30.0 and best.signScore >= 99.0 and (nz(best.holdDirSkill, -99.0) > -2.0 or nz(best.holdOosR2, -1.0) > 0.0) and modelSkill >= 20.0 and not diagnosticBlock
+    string diagnostic = f_diagnostic_label(unstableFlag, genFail, breakWarning)
+    string gateReason = f_model_gate_reason(best.holdOosR2, best.holdDirSkill, best.holdDirCoverage, best.stability, best.residualQ, best.signScore, generalization, lagGap, autoLag, unstableFlag, genFail, breakWarning)
+
+    CoreModel.new(best.lag, lagGap, best.beta, best.alpha, best.prediction, best.residual, best.selectScore, best.selectOosR2, best.holdOosR2, best.holdHit, best.holdNaive, best.holdDirSkill, best.holdDirCoverage, best.stability, best.residualQ, best.signScore, generalization, f_clamp(modelSkill, 0.0, 100.0), strictPass, watchPass, diagnosticBlock, unstableFlag, genFail, breakWarning, diagnostic, gateReason)
+
+f_channel_note(state, observed, gateReason) =>
+    state == STATE_DATA ? gateReason :
+     state == STATE_VALID ? (observed >= 65 ? "Áp lực cao được holdout xác nhận" : observed < 35 ? "Áp lực giảm được holdout xác nhận" : "Liên hệ dự báo đạt chuẩn; mức áp lực chưa cực đoan") :
+     state == STATE_WATCH ? "WATCH | " + gateReason :
+     gateReason
+
+f_build_channel(id, name, driver, target, expectedSign, freshness, breadth, driverPressureZ, targetPressureZ, targetMed, targetScale) =>
+    CoreModel core = f_best_model(driver, target, expectedSign, useBestLag, manualLag)
+    float coverage = math.min(f_coverage(driver, LEN_DATA_Q), f_coverage(target, LEN_DATA_Q))
+    float dataQ = f_data_quality(coverage, freshness, breadth)
+    bool dataGate = dataQ >= minDataQ
+    string state = not dataGate ? STATE_DATA : core.strictPass ? STATE_VALID : core.watchPass ? STATE_WATCH : STATE_NONE
+    string gateReason = not dataGate ? "FAIL: DATAQ" : core.gateReason
+
+    // Observed pressure dùng các z-score đã chuẩn hóa sẵn.
+    // Forecast được ánh xạ theo phân phối của target.
+    float driverPressure = f_z_to_score(f_clamp(driverPressureZ, -CLIP_Z, CLIP_Z))
+    float targetPressure = f_z_to_score(f_clamp(targetPressureZ, -CLIP_Z, CLIP_Z))
+    float observed = f_clamp(0.65 * driverPressure + 0.35 * targetPressure, 0.0, 100.0)
+    float forecast = f_target_unit_score(core.prediction, targetMed, targetScale)
+    float validated = state == STATE_VALID ? forecast : na
+    float d1 = observed - observed[1]
+    float d7 = observed - observed[7]
+    string note = f_channel_note(state, observed, gateReason)
+
+    ModelResult.new(id, name, observed, forecast, validated, dataQ, core.modelSkill, state, core.lag, core.lagGap, core.beta, core.selectionOosR2, core.holdOosR2, core.holdHit, core.holdNaive, core.holdDirSkill, core.holdDirCoverage, core.stability, core.residualQ, coverage, freshness, breadth, d1, d7, core.diagnosticBlock, core.diagnostic, gateReason, note)
+
+// =====================================================================
+// 5) TẢI DỮ LIỆU — STATIC REQUEST, LOOKAHEAD OFF
+// =====================================================================
+[yVN10, tVN10] = request.security(symVN10, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[yVN02, tVN02] = request.security(symVN02, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[yJP10, tJP10] = request.security(symJP10, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[yJP02, tJP02] = request.security(symJP02, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[yUS10, tUS10] = request.security(symUS10, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[yUS02, tUS02] = request.security(symUS02, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[yDE10, tDE10] = request.security(symDE10, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[yDE02, tDE02] = request.security(symDE02, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[yGB10, tGB10] = request.security(symGB10, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[yGB02, tGB02] = request.security(symGB02, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[yAU10, tAU10] = request.security(symAU10, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[yCA10, tCA10] = request.security(symCA10, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[usdVnd, tUSDVND] = request.security(symUSDVND, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[vnInbr, tVNINBR] = request.security(symVNINBR, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[dxy, tDXY] = request.security(symDXY, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[usdJpy, tUSDJPY] = request.security(symUSDJPY, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+[vix, tVIX] = request.security(symVIX, TF_DATA, [close, time], barmerge.gaps_off, barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=CALC_BARS)
+
+// =====================================================================
+// 6) BIẾN ĐỔI — TRANSFORM THEN AGGREGATE
+// =====================================================================
+f_bp_change(level) => ta.change(level) * 100.0
+
+float dVN10 = f_smooth(f_bp_change(yVN10), smoothN)
+float dVN02 = f_smooth(f_bp_change(yVN02), smoothN)
+float dJP10 = f_smooth(f_bp_change(yJP10), smoothN)
+float dJP02 = f_smooth(f_bp_change(yJP02), smoothN)
+float dUS10 = f_smooth(f_bp_change(yUS10), smoothN)
+float dUS02 = f_smooth(f_bp_change(yUS02), smoothN)
+float dDE10 = f_smooth(f_bp_change(yDE10), smoothN)
+float dDE02 = f_smooth(f_bp_change(yDE02), smoothN)
+float dGB10 = f_smooth(f_bp_change(yGB10), smoothN)
+float dGB02 = f_smooth(f_bp_change(yGB02), smoothN)
+float dAU10 = f_smooth(f_bp_change(yAU10), smoothN)
+float dCA10 = f_smooth(f_bp_change(yCA10), smoothN)
+float dUSDVND = f_smooth(ta.roc(usdVnd, 1), smoothN)
+float dDXY = f_smooth(ta.roc(dxy, 1), smoothN)
+float dIB = f_smooth(f_bp_change(vnInbr), smoothN)
+float yenStrength = f_smooth(-ta.roc(usdJpy, 1), smoothN)
+float vixChange = f_smooth(ta.roc(vix, 1), smoothN)
+
+// Standard hóa từng thị trường một lần rồi tái sử dụng.
+// Đây là tối ưu lớn vì median/MAD là nhóm phép tính đắt nhất của engine.
+[medVN10, scaleVN10] = f_robust_center_scale(dVN10, LEN_Z)
+float zVN10 = f_robust_z_from(dVN10, medVN10, scaleVN10, CLIP_Z)
+
+float zJP10 = f_robust_z(dJP10, LEN_Z, CLIP_Z)
+float zJP02 = f_robust_z(dJP02, LEN_Z, CLIP_Z)
+float zUS10 = f_robust_z(dUS10, LEN_Z, CLIP_Z)
+float zUS02 = f_robust_z(dUS02, LEN_Z, CLIP_Z)
+float zDE10 = f_robust_z(dDE10, LEN_Z, CLIP_Z)
+float zDE02 = f_robust_z(dDE02, LEN_Z, CLIP_Z)
+float zGB10 = f_robust_z(dGB10, LEN_Z, CLIP_Z)
+float zGB02 = f_robust_z(dGB02, LEN_Z, CLIP_Z)
+float zAU10 = f_robust_z(dAU10, LEN_Z, CLIP_Z)
+float zCA10 = f_robust_z(dCA10, LEN_Z, CLIP_Z)
+float zDXY = f_robust_z(dDXY, LEN_Z, CLIP_Z)
+float zUSDVND = f_robust_z(dUSDVND, LEN_Z, CLIP_Z)
+float zIB = f_robust_z(dIB, LEN_Z, CLIP_Z)
+
+float globalLong = f_mean5(zUS10, zDE10, zGB10, zAU10, zCA10)
+
+float usLevel = f_mean2(zUS10, zUS02)
+float deLevel = f_mean2(zDE10, zDE02)
+float gbLevel = f_mean2(zGB10, zGB02)
+float globalLevel = f_mean3(usLevel, deLevel, gbLevel)
+
+float spreadUS = (yUS10 - yUS02) * 100.0
+float spreadDE = (yDE10 - yDE02) * 100.0
+float spreadGB = (yGB10 - yGB02) * 100.0
+float dSpreadUS = f_smooth(ta.change(spreadUS), smoothN)
+float dSpreadDE = f_smooth(ta.change(spreadDE), smoothN)
+float dSpreadGB = f_smooth(ta.change(spreadGB), smoothN)
+float zCurveUS = f_robust_z(dSpreadUS, LEN_Z, CLIP_Z)
+float zCurveDE = f_robust_z(dSpreadDE, LEN_Z, CLIP_Z)
+float zCurveGB = f_robust_z(dSpreadGB, LEN_Z, CLIP_Z)
+float globalCurve = f_mean3(zCurveUS, zCurveDE, zCurveGB)
+float xLevelCurve = f_mean2(globalLevel * signP3Level, globalCurve * signP3Curve)
+
+float usJp2Spread = (yUS02 - yJP02) * 100.0
+float spreadNarrowing = f_smooth(-ta.change(usJp2Spread), smoothN)
+float zYenStrength = f_robust_z(yenStrength, LEN_Z, CLIP_Z)
+float zVixChange = f_robust_z(vixChange, LEN_Z, CLIP_Z)
+float zSpreadNarrow = f_robust_z(spreadNarrowing, LEN_Z, CLIP_Z)
+float xCarry = f_mean3(zYenStrength, zVixChange, zSpreadNarrow)
+
+float xMon = f_mean2(zUSDVND, zIB)
+float xFXGlobal = f_mean2(zUS02, zDXY)
+
+float dJDriver = jpDriverChoice == "JP02Y" ? dJP02 : dJP10
+float zJDriver = jpDriverChoice == "JP02Y" ? zJP02 : zJP10
+int tJDriver = jpDriverChoice == "JP02Y" ? tJP02 : tJP10
+
+// =====================================================================
+// 7) DATA QUALITY
+// =====================================================================
+float freshVN10 = f_freshness_score(tVN10, freshSoftDays, freshHardDays)
+float freshVN02 = f_freshness_score(tVN02, freshSoftDays, freshHardDays)
+float freshJP = f_freshness_score(tJDriver, freshSoftDays, freshHardDays)
+float freshUSDVND = f_freshness_score(tUSDVND, freshSoftDays, freshHardDays)
+float freshVNINBR = f_freshness_score(tVNINBR, freshSoftDays, freshHardDays)
+float freshDXY = f_freshness_score(tDXY, freshSoftDays, freshHardDays)
+float freshUSDJPY = f_freshness_score(tUSDJPY, freshSoftDays, freshHardDays)
+float freshVIX = f_freshness_score(tVIX, freshSoftDays, freshHardDays)
+float freshUS02 = f_freshness_score(tUS02, freshSoftDays, freshHardDays)
+float freshJP02 = f_freshness_score(tJP02, freshSoftDays, freshHardDays)
+
+float breadthLong = f_breadth5(dUS10, dDE10, dGB10, dAU10, dCA10)
+float freshLong = f_mean5(f_freshness_score(tUS10, freshSoftDays, freshHardDays), f_freshness_score(tDE10, freshSoftDays, freshHardDays), f_freshness_score(tGB10, freshSoftDays, freshHardDays), f_freshness_score(tAU10, freshSoftDays, freshHardDays), f_freshness_score(tCA10, freshSoftDays, freshHardDays)) * breadthLong / 100.0
+
+float breadthLevel = f_breadth3(usLevel, deLevel, gbLevel)
+float breadthCurve = f_breadth3(dSpreadUS, dSpreadDE, dSpreadGB)
+float breadthLevelCurve = math.min(breadthLevel, breadthCurve)
+float freshUSPair = f_min2(f_freshness_score(tUS10, freshSoftDays, freshHardDays), f_freshness_score(tUS02, freshSoftDays, freshHardDays))
+float freshDEPair = f_min2(f_freshness_score(tDE10, freshSoftDays, freshHardDays), f_freshness_score(tDE02, freshSoftDays, freshHardDays))
+float freshGBPair = f_min2(f_freshness_score(tGB10, freshSoftDays, freshHardDays), f_freshness_score(tGB02, freshSoftDays, freshHardDays))
+float freshLevelCurve = f_mean3(freshUSPair, freshDEPair, freshGBPair) * breadthLevelCurve / 100.0
+
+float breadthCarry = f_breadth3(yenStrength, vixChange, spreadNarrowing)
+float freshCarry = f_min4(freshUSDJPY, freshVIX, freshUS02, freshJP02)
+float breadthMon = f_breadth2(dUSDVND, dIB)
+float freshMon = f_min3(freshUSDVND, freshVNINBR, freshVN10)
+
+// =====================================================================
+// 8) P1–P5: CÙNG MỘT CONTRACT KẾT QUẢ
+// =====================================================================
+ModelResult p1 = f_build_channel("P1", "BOJ / JGB → VN10Y", dJDriver, dVN10, signP1, f_min2(freshJP, freshVN10), 100.0, zJDriver * signP1, zVN10, medVN10, scaleVN10)
+ModelResult p2 = f_build_channel("P2", "Global long-end → VN10Y", globalLong, dVN10, signP2, f_min2(freshLong, freshVN10), breadthLong, globalLong * signP2, zVN10, medVN10, scaleVN10)
+// xLevelCurve đã được orient theo hai dấu lý thuyết trước khi ghép; mô hình cuối kỳ vọng dấu +1.
+ModelResult p3 = f_build_channel("P3", "Global level & curve → VN10Y", xLevelCurve, dVN10, 1, f_min2(freshLevelCurve, freshVN10), breadthLevelCurve, xLevelCurve, zVN10, medVN10, scaleVN10)
+ModelResult p4 = f_build_channel("P4", "Yen carry stress → VN10Y", xCarry, dVN10, signP4, f_min2(freshCarry, freshVN10), breadthCarry, xCarry * signP4, zVN10, medVN10, scaleVN10)
+ModelResult p5 = f_build_channel("P5", "FX & liquidity → VN10Y", xMon, dVN10, signP5, freshMon, breadthMon, xMon * signP5, zVN10, medVN10, scaleVN10)
+
+// =====================================================================
+// 9) P6 — TRANSMISSION CHAIN, DIRECT HOLDOUT + WEAKEST LINK
+// =====================================================================
+CoreModel linkA = f_best_model(xFXGlobal, dUSDVND, signA, useBestLag, manualLag)
+CoreModel linkB = f_best_model(dUSDVND, dIB, signB, useBestLag, manualLag)
+CoreModel linkC = f_best_model(dIB, dVN10, signC, useBestLag, manualLag)
+
+float covA = math.min(f_coverage(xFXGlobal, LEN_DATA_Q), f_coverage(dUSDVND, LEN_DATA_Q))
+float covB = math.min(f_coverage(dUSDVND, LEN_DATA_Q), f_coverage(dIB, LEN_DATA_Q))
+float covC = math.min(f_coverage(dIB, LEN_DATA_Q), f_coverage(dVN10, LEN_DATA_Q))
+float dataQA = f_data_quality(covA, f_min3(freshUS02, freshDXY, freshUSDVND), f_breadth2(dUS02, dDXY))
+float dataQB = f_data_quality(covB, f_min2(freshUSDVND, freshVNINBR), 100.0)
+float dataQC = f_data_quality(covC, f_min2(freshVNINBR, freshVN10), 100.0)
+
+int chainLag = linkA.lag + linkB.lag + linkC.lag
+float chainBeta = linkA.beta * linkB.beta * linkC.beta
+float chainAlpha = linkC.alpha + linkC.beta * linkB.alpha + linkC.beta * linkB.beta * linkA.alpha
+float chainPrediction = chainAlpha + chainBeta * f_lag(xFXGlobal, chainLag)
+float chainResidual = dVN10 - chainPrediction
+EvalMetrics chainSelect = f_eval_metrics(chainPrediction, chainResidual, dVN10, LEN_TRAIN, LEN_SELECT, LEN_HOLDOUT)
+EvalMetrics chainHold = f_eval_metrics(chainPrediction, chainResidual, dVN10, LEN_TRAIN, LEN_HOLDOUT, 0)
+
+float directGeneralization = f_generalization_score(chainSelect.oosR2, chainHold.oosR2)
+float chainStability = math.min(linkA.stability, math.min(linkB.stability, linkC.stability))
+float chainSignScore = math.min(linkA.signScore, math.min(linkB.signScore, linkC.signScore))
+float chainLagGap = f_min3(linkA.lagGap, linkB.lagGap, linkC.lagGap)
+float directSkill = f_evidence_score(chainHold.oosR2, chainHold.dirSkill, chainHold.dirCoverage, chainStability, chainHold.residualQ, directGeneralization, chainLagGap, chainSignScore, useBestLag)
+float weakestLinkSkill = math.min(linkA.modelSkill, math.min(linkB.modelSkill, linkC.modelSkill))
+float linkMeanSkill = f_mean3(linkA.modelSkill, linkB.modelSkill, linkC.modelSkill)
+
+float chainDataQ = math.min(dataQA, math.min(dataQB, dataQC))
+bool chainDataGate = chainDataQ >= minDataQ
+bool allLinksStrict = linkA.strictPass and linkB.strictPass and linkC.strictPass
+bool allLinksAtLeastWatch = (linkA.strictPass or linkA.watchPass) and (linkB.strictPass or linkB.watchPass) and (linkC.strictPass or linkC.watchPass)
+string weakestLink = linkA.modelSkill <= linkB.modelSkill and linkA.modelSkill <= linkC.modelSkill ? "A" : linkB.modelSkill <= linkC.modelSkill ? "B" : "C"
+
+float chainSkillRaw = f_clamp(0.50 * directSkill + 0.30 * linkMeanSkill + 0.20 * weakestLinkSkill, 0.0, 100.0)
+float chainDirectCap = f_predictive_coherence_cap(chainHold.oosR2, chainHold.dirSkill, chainSignScore)
+float chainLinkCap = not allLinksAtLeastWatch ? 49.0 : not allLinksStrict ? 59.0 : 100.0
+float chainSkill = math.min(chainSkillRaw, math.min(chainDirectCap, chainLinkCap))
+
+bool directUnstable = chainStability < 35.0
+bool directGenFail = not na(chainSelect.oosR2) and chainSelect.oosR2 > 0.02 and nz(chainHold.oosR2, -1.0) < -0.05
+bool chainUnstable = linkA.unstableFlag or linkB.unstableFlag or linkC.unstableFlag or directUnstable
+bool chainGenFail = linkA.genFail or linkB.genFail or linkC.genFail or directGenFail
+bool chainBreakWarning = linkA.breakWarning or linkB.breakWarning or linkC.breakWarning
+bool chainDiagnosticBlock = chainUnstable or chainGenFail or chainBreakWarning
+string chainDiagnostic = f_diagnostic_label(chainUnstable, chainGenFail, chainBreakWarning)
+
+bool chainStrict = chainDataGate and allLinksStrict and nz(chainHold.oosR2, -1.0) > 0.0 and nz(chainHold.dirSkill, -99.0) > 0.0 and chainHold.dirCoverage >= 50.0 and chainStability >= minStability and chainHold.residualQ >= 35.0 and directGeneralization >= 25.0 and not chainDiagnosticBlock
+bool chainWatch = chainDataGate and allLinksAtLeastWatch and nz(chainHold.oosR2, -1.0) > -0.05 and chainHold.dirCoverage >= 40.0 and chainStability >= 30.0 and chainSkill >= 20.0 and not chainDiagnosticBlock
+string chainState = not chainDataGate ? STATE_DATA : chainStrict ? STATE_VALID : chainWatch ? STATE_WATCH : STATE_NONE
+
+// Dual diagnostics: giữ riêng lỗi của từng mắt xích và lỗi của forecast trực tiếp.
+// Không ghi đè direct gate khi link gate thất bại.
+string chainDirectGateReason = f_model_gate_reason(chainHold.oosR2, chainHold.dirSkill, chainHold.dirCoverage, chainStability, chainHold.residualQ, chainSignScore, directGeneralization, chainLagGap, useBestLag, chainUnstable, chainGenFail, chainBreakWarning)
+float failSkillA = linkA.strictPass ? 101.0 : linkA.modelSkill
+float failSkillB = linkB.strictPass ? 101.0 : linkB.modelSkill
+float failSkillC = linkC.strictPass ? 101.0 : linkC.modelSkill
+string weakestFailLink = failSkillA <= failSkillB and failSkillA <= failSkillC ? "A" : failSkillB <= failSkillC ? "B" : "C"
+string weakestFailReason = weakestFailLink == "A" ? linkA.gateReason : weakestFailLink == "B" ? linkB.gateReason : linkC.gateReason
+string chainLinkGateReason = not chainDataGate ? "FAIL: DATAQ" : allLinksStrict ? "PASS" : "FAIL: LINK " + weakestFailLink + " | " + weakestFailReason
+string chainGateReason = not chainDataGate ? "FAIL: DATAQ" : not allLinksStrict ? "FAIL: LINK " + weakestFailLink : chainDirectGateReason
+
+float chainDriverPressure = f_mean3(f_z_to_score(f_clamp(xFXGlobal * signA, -CLIP_Z, CLIP_Z)), f_z_to_score(f_clamp(zUSDVND * signB, -CLIP_Z, CLIP_Z)), f_z_to_score(f_clamp(zIB * signC, -CLIP_Z, CLIP_Z)))
+float chainTargetPressure = f_z_to_score(zVN10)
+float chainObserved = f_clamp(0.65 * chainDriverPressure + 0.35 * chainTargetPressure, 0.0, 100.0)
+float chainForecast = f_target_unit_score(chainPrediction, medVN10, scaleVN10)
+float chainValidated = chainState == STATE_VALID ? chainForecast : na
+float chainD1 = chainObserved - chainObserved[1]
+float chainD7 = chainObserved - chainObserved[7]
+string chainNote = chainState == STATE_VALID ? "Toàn chuỗi và forecast trực tiếp cùng đạt holdout gate" : chainState == STATE_WATCH ? "WATCH | " + chainGateReason : chainGateReason
+
+ModelResult p6 = ModelResult.new("P6", "Global→FX→IB→VN10Y", chainObserved, chainForecast, chainValidated, chainDataQ, chainSkill, chainState, chainLag, chainLagGap, chainBeta, chainSelect.oosR2, chainHold.oosR2, chainHold.hit, chainHold.naiveHit, chainHold.dirSkill, chainHold.dirCoverage, chainStability, chainHold.residualQ, math.min(covA, math.min(covB, covC)), f_min3(f_min3(freshUS02, freshDXY, freshUSDVND), f_min2(freshUSDVND, freshVNINBR), f_min2(freshVNINBR, freshVN10)), 100.0, chainD1, chainD7, chainDiagnosticBlock, chainDiagnostic, chainGateReason, chainNote)
+
+// =====================================================================
+// 10) OVERVIEW AGGREGATION
+// =====================================================================
+float systemDataQ = f_mean5(p1.dataQ, p2.dataQ, p3.dataQ, p4.dataQ, p5.dataQ)
+float systemSkill = f_mean5(p1.modelSkill, p2.modelSkill, p3.modelSkill, p4.modelSkill, p5.modelSkill)
+
+// Unified display layer: Executive uses the same channel-level EMA everywhere;
+// Research uses raw observations everywhere. The system aggregate is built from
+// those same display-layer channel values, not from a separately smoothed aggregate.
+float p1DisplayEma = ta.ema(p1.observed, displaySmoothN)
+float p2DisplayEma = ta.ema(p2.observed, displaySmoothN)
+float p3DisplayEma = ta.ema(p3.observed, displaySmoothN)
+float p4DisplayEma = ta.ema(p4.observed, displaySmoothN)
+float p5DisplayEma = ta.ema(p5.observed, displaySmoothN)
+float p6DisplayEma = ta.ema(p6.observed, displaySmoothN)
+float p1Display = displayMode == "Executive" ? p1DisplayEma : p1.observed
+float p2Display = displayMode == "Executive" ? p2DisplayEma : p2.observed
+float p3Display = displayMode == "Executive" ? p3DisplayEma : p3.observed
+float p4Display = displayMode == "Executive" ? p4DisplayEma : p4.observed
+float p5Display = displayMode == "Executive" ? p5DisplayEma : p5.observed
+float p6Display = displayMode == "Executive" ? p6DisplayEma : p6.observed
+float systemObservedDisplay = f_trimmed_mean5(p1Display, p2Display, p3Display, p4Display, p5Display)
+
+float validWeightedSum = 0.0
+float validWeight = 0.0
+int validCount = 0
+int watchCount = 0
+if p1.state == STATE_VALID
+    validWeightedSum += p1.forecast * math.max(1.0, p1.modelSkill)
+    validWeight += math.max(1.0, p1.modelSkill)
+    validCount += 1
+else if p1.state == STATE_WATCH
+    watchCount += 1
+if p2.state == STATE_VALID
+    validWeightedSum += p2.forecast * math.max(1.0, p2.modelSkill)
+    validWeight += math.max(1.0, p2.modelSkill)
+    validCount += 1
+else if p2.state == STATE_WATCH
+    watchCount += 1
+if p3.state == STATE_VALID
+    validWeightedSum += p3.forecast * math.max(1.0, p3.modelSkill)
+    validWeight += math.max(1.0, p3.modelSkill)
+    validCount += 1
+else if p3.state == STATE_WATCH
+    watchCount += 1
+if p4.state == STATE_VALID
+    validWeightedSum += p4.forecast * math.max(1.0, p4.modelSkill)
+    validWeight += math.max(1.0, p4.modelSkill)
+    validCount += 1
+else if p4.state == STATE_WATCH
+    watchCount += 1
+if p5.state == STATE_VALID
+    validWeightedSum += p5.forecast * math.max(1.0, p5.modelSkill)
+    validWeight += math.max(1.0, p5.modelSkill)
+    validCount += 1
+else if p5.state == STATE_WATCH
+    watchCount += 1
+
+float systemValidated = validCount >= 2 and validWeight > 0 ? validWeightedSum / validWeight : na
+string systemState = validCount >= 2 ? STATE_VALID : validCount == 1 or watchCount >= 2 ? STATE_WATCH : STATE_NONE
+
+f_high_channel_display(ModelResult a, aValue, ModelResult b, bValue, ModelResult c, cValue, ModelResult d, dValue, ModelResult e, eValue) =>
+    ModelResult high = a
+    float highValue = aValue
+    if bValue > highValue
+        high := b
+        highValue := bValue
+    if cValue > highValue
+        high := c
+        highValue := cValue
+    if dValue > highValue
+        high := d
+        highValue := dValue
+    if eValue > highValue
+        high := e
+    high
+
+f_low_channel_display(ModelResult a, aValue, ModelResult b, bValue, ModelResult c, cValue, ModelResult d, dValue, ModelResult e, eValue) =>
+    ModelResult low = a
+    float lowValue = aValue
+    if bValue < lowValue
+        low := b
+        lowValue := bValue
+    if cValue < lowValue
+        low := c
+        lowValue := cValue
+    if dValue < lowValue
+        low := d
+        lowValue := dValue
+    if eValue < lowValue
+        low := e
+    low
+
+ModelResult mainDriver = f_high_channel_display(p1, p1Display, p2, p2Display, p3, p3Display, p4, p4Display, p5, p5Display)
+ModelResult reliefDriver = f_low_channel_display(p1, p1Display, p2, p2Display, p3, p3Display, p4, p4Display, p5, p5Display)
+float mainDriverDisplay = mainDriver.id == "P1" ? p1Display : mainDriver.id == "P2" ? p2Display : mainDriver.id == "P3" ? p3Display : mainDriver.id == "P4" ? p4Display : p5Display
+float reliefDriverDisplay = reliefDriver.id == "P1" ? p1Display : reliefDriver.id == "P2" ? p2Display : reliefDriver.id == "P3" ? p3Display : reliefDriver.id == "P4" ? p4Display : p5Display
+
+string systemImplication = systemState == STATE_VALID ?
+     (systemValidated >= 65 ? "Nhiều kênh holdout cùng xác nhận áp lực tăng VN10Y" : systemValidated < 35 ? "Nhiều kênh holdout cùng xác nhận áp lực giảm" : "Có predictive edge, nhưng mức forecast chưa cực đoan") :
+     systemState == STATE_WATCH ? "Có tín hiệu phân tán; cần thêm xác nhận holdout" :
+     "Áp lực quan sát không đồng nghĩa predictive transmission"
+
+// =====================================================================
+// 11) CHỌN VIEW
+// =====================================================================
+bool isOverview = viewMode == "Overview"
+ModelResult selected = p1
+if viewMode == "P2 Global→VN"
+    selected := p2
+else if viewMode == "P3 Level & Curve→VN"
+    selected := p3
+else if viewMode == "P4 Yen carry→VN"
+    selected := p4
+else if viewMode == "P5 FX & Liquidity→VN"
+    selected := p5
+else if viewMode == "P6 Transmission chain"
+    selected := p6
+
+float selectedObservedDisplay = selected.id == "P1" ? p1Display : selected.id == "P2" ? p2Display : selected.id == "P3" ? p3Display : selected.id == "P4" ? p4Display : selected.id == "P5" ? p5Display : p6Display
+float plotObserved = isOverview ? systemObservedDisplay : selectedObservedDisplay
+float plotObservedD1 = plotObserved - plotObserved[1]
+float plotObservedD7 = plotObserved - plotObserved[7]
+float plotForecast = isOverview ? systemValidated : selected.forecast
+float plotValidated = isOverview ? systemValidated : selected.validated
+string plotState = isOverview ? systemState : selected.state
+
+// =====================================================================
+// 12) PLOT — THÔNG TIN ÍT NHƯNG PHÂN TÁCH ĐÚNG KHÁI NIỆM
+// =====================================================================
+plot(plotObserved, "Observed pressure", linewidth=2, color=f_pressure_color(plotObserved))
+plot(displayMode == "Research" ? plotForecast : na, "Model forecast", linewidth=1, color=color.new(color.aqua, 10))
+plot(not na(plotValidated) ? plotValidated : na, "Validated pressure", linewidth=3, color=color.new(color.white, 0))
+
+hline(80, "Extreme", color=color.new(color.purple, 60))
+hline(65, "High", color=color.new(color.red, 65))
+hline(50, "Neutral", color=color.new(color.orange, 75))
+hline(35, "Easing", color=color.new(color.lime, 80))
+
+color bg = showBg ? color.new(f_pressure_color(plotObserved), 90) : na
+bgcolor(bg)
+
+var label lastLabel = na
+if barstate.islast
+    if not na(lastLabel)
+        label.delete(lastLabel)
+        lastLabel := na
+    if showLabel and not na(plotObserved)
+        string labelText = "Observed " + f_fmt(plotObserved, FMT_1) + " | " + plotState
+        lastLabel := label.new(bar_index, plotObserved, labelText, style=label.style_label_right, textcolor=color.white, color=color.new(color.black, 45), size=size.small)
+
+// =====================================================================
+// 13) ALERT — CHỈ VALIDATED SIGNAL
+// =====================================================================
+float alertPressure = isOverview ? systemValidated : selected.validated
+bool alertValid = isOverview ? systemState == STATE_VALID : selected.state == STATE_VALID
+bool cross65 = ta.crossover(alertPressure, 65)
+bool cross80 = ta.crossover(alertPressure, 80)
+bool under50 = ta.crossunder(alertPressure, 50)
+alertcondition(alertValid and cross65, "Validated pressure > 65", "Validated pressure vượt 65 sau khi Data Gate và Model Gate cùng đạt.")
+alertcondition(alertValid and cross80, "Validated pressure > 80", "Validated pressure vượt 80 sau khi Data Gate và Model Gate cùng đạt.")
+alertcondition(alertValid and under50, "Validated pressure < 50", "Validated pressure giảm dưới 50 sau khi Data Gate và Model Gate cùng đạt.")
+
+// =====================================================================
+// 14) COMPACT TABLE
+// =====================================================================
+pos = position.bottom_right
+if tablePos == "Trên trái"
+    pos := position.top_left
+else if tablePos == "Trên phải"
+    pos := position.top_right
+else if tablePos == "Dưới trái"
+    pos := position.bottom_left
+else
+    pos := position.bottom_right
+
+int T_COLS = 4
+int T_ROWS = 10
+var table panel = table.new(pos, T_COLS, T_ROWS, border_width=1, frame_width=1, frame_color=color.new(color.gray, 60))
+
+f_cell(row, col, cellText, bgColor) =>
+    table.cell(panel, col, row, cellText, bgcolor=bgColor, text_color=color.white)
+
+f_clear_row(row) =>
+    for col = 0 to T_COLS - 1
+        f_cell(row, col, "", color.new(color.black, 100))
+
+f_render_overview() =>
+    string validatedTxt = na(systemValidated) ? "N/A" : f_fmt(systemValidated, FMT_1)
+    f_cell(0, 0, "V8.2.2 OVERVIEW", color.new(color.black, 0))
+    f_cell(0, 1, "OBS " + f_fmt(plotObserved, FMT_1) + " | " + f_pressure_bucket(plotObserved), color.new(f_pressure_color(plotObserved), 78))
+    f_cell(0, 2, "VALIDATED " + validatedTxt, color.new(color.black, 25))
+    f_cell(0, 3, systemState, f_state_color(systemState))
+
+    f_cell(1, 0, "XU HƯỚNG", color.new(color.black, 80))
+    f_cell(1, 1, "1d " + f_fmt(plotObservedD1, FMT_1), color.new(color.black, 80))
+    f_cell(1, 2, "7d " + f_fmt(plotObservedD7, FMT_1), color.new(color.black, 80))
+    f_cell(1, 3, plotObservedD7 > 2 ? "TĂNG" : plotObservedD7 < -2 ? "GIẢM" : "ĐI NGANG", color.new(color.black, 80))
+
+    f_cell(2, 0, "DRIVER CHÍNH", color.new(color.black, 80))
+    f_cell(2, 1, mainDriver.id + " | " + mainDriver.name, color.new(color.black, 80))
+    f_cell(2, 2, "Obs " + f_fmt(mainDriverDisplay, FMT_1) + " | Ev " + f_fmt(mainDriver.modelSkill, FMT_1), color.new(f_pressure_color(mainDriverDisplay), 82))
+    f_cell(2, 3, mainDriver.state, f_state_color(mainDriver.state))
+
+    f_cell(3, 0, "KÊNH THẤP NHẤT", color.new(color.black, 80))
+    f_cell(3, 1, reliefDriver.id + " | " + reliefDriver.name, color.new(color.black, 80))
+    f_cell(3, 2, "Obs " + f_fmt(reliefDriverDisplay, FMT_1) + " | Ev " + f_fmt(reliefDriver.modelSkill, FMT_1), color.new(f_pressure_color(reliefDriverDisplay), 82))
+    f_cell(3, 3, reliefDriver.state, f_state_color(reliefDriver.state))
+
+    f_cell(4, 0, "BẰNG CHỨNG", color.new(color.black, 80))
+    f_cell(4, 1, "DataQ " + f_fmt(systemDataQ, FMT_1), color.new(color.black, 80))
+    f_cell(4, 2, "Evidence " + f_fmt(systemSkill, FMT_1), color.new(color.black, 80))
+    f_cell(4, 3, "VALID " + str.tostring(validCount) + "/5", color.new(color.black, 80))
+
+    f_cell(5, 0, "CHUỖI P6", color.new(color.black, 80))
+    f_cell(5, 1, chainNote, color.new(color.black, 80))
+    f_cell(5, 2, "Weak " + weakestLink + " | Ev " + f_fmt(weakestLinkSkill, FMT_1), color.new(color.black, 80))
+    f_cell(5, 3, chainDiagnostic, f_diag_color(chainDiagnostic))
+
+    f_cell(6, 0, "HÀM Ý", color.new(color.black, 0))
+    f_cell(6, 1, systemImplication, color.new(color.black, 0))
+    f_cell(6, 2, "", color.new(color.black, 0))
+    f_cell(6, 3, "", color.new(color.black, 0))
+
+    if displayMode == "Research"
+        f_cell(7, 0, "CHANNEL EVIDENCE", color.new(color.black, 80))
+        f_cell(7, 1, "P1 " + f_fmt(p1.modelSkill, FMT_1) + " | P2 " + f_fmt(p2.modelSkill, FMT_1), color.new(color.black, 80))
+        f_cell(7, 2, "P3 " + f_fmt(p3.modelSkill, FMT_1) + " | P4 " + f_fmt(p4.modelSkill, FMT_1), color.new(color.black, 80))
+        f_cell(7, 3, "P5 " + f_fmt(p5.modelSkill, FMT_1), color.new(color.black, 80))
+
+        f_cell(8, 0, "CHAIN LINKS", color.new(color.black, 80))
+        f_cell(8, 1, "A " + f_fmt(linkA.modelSkill, FMT_1) + " | " + linkA.diagnostic, f_diag_color(linkA.diagnostic))
+        f_cell(8, 2, "B " + f_fmt(linkB.modelSkill, FMT_1) + " | " + linkB.diagnostic, f_diag_color(linkB.diagnostic))
+        f_cell(8, 3, "C " + f_fmt(linkC.modelSkill, FMT_1) + " | " + linkC.diagnostic, f_diag_color(linkC.diagnostic))
+
+        f_cell(9, 0, "P6 DUAL GATE", color.new(color.black, 80))
+        f_cell(9, 1, "LINK " + chainLinkGateReason, color.new(color.black, 80))
+        f_cell(9, 2, "DIRECT " + chainDirectGateReason, color.new(color.black, 80))
+        f_cell(9, 3, "Predictive ≠ causal", color.new(color.black, 80))
+    else
+        f_clear_row(7)
+        f_clear_row(8)
+        f_clear_row(9)
+
+f_render_channel(ModelResult r) =>
+    string validatedTxt = na(r.validated) ? "N/A" : f_fmt(r.validated, FMT_1)
+    string forecastTxt = displayMode == "Research" ? "Forecast " + f_fmt(r.forecast, FMT_1) : r.state == STATE_VALID ? "Forecast " + f_fmt(r.forecast, FMT_1) : "Forecast chưa xác nhận"
+
+    f_cell(0, 0, r.id + " | " + r.name, color.new(color.black, 0))
+    f_cell(0, 1, "OBS " + f_fmt(plotObserved, FMT_1), color.new(f_pressure_color(plotObserved), 78))
+    f_cell(0, 2, "VALIDATED " + validatedTxt, color.new(color.black, 25))
+    f_cell(0, 3, r.state, f_state_color(r.state))
+
+    f_cell(1, 0, "ÁP LỰC", color.new(color.black, 80))
+    f_cell(1, 1, "Observed " + f_fmt(plotObserved, FMT_1), color.new(color.black, 80))
+    f_cell(1, 2, forecastTxt, color.new(color.black, 80))
+    f_cell(1, 3, f_pressure_bucket(plotObserved), color.new(color.black, 80))
+
+    f_cell(2, 0, "BẰNG CHỨNG", color.new(color.black, 80))
+    f_cell(2, 1, "DataQ " + f_fmt(r.dataQ, FMT_1), color.new(color.black, 80))
+    f_cell(2, 2, "Evidence " + f_fmt(r.modelSkill, FMT_1), color.new(color.black, 80))
+    f_cell(2, 3, r.diagnostic, f_diag_color(r.diagnostic))
+
+    f_cell(3, 0, "XU HƯỚNG", color.new(color.black, 80))
+    f_cell(3, 1, "1d " + f_fmt(plotObservedD1, FMT_1), color.new(color.black, 80))
+    f_cell(3, 2, "7d " + f_fmt(plotObservedD7, FMT_1), color.new(color.black, 80))
+    f_cell(3, 3, plotObservedD7 > 2 ? "TĂNG" : plotObservedD7 < -2 ? "GIẢM" : "ĐI NGANG", color.new(color.black, 80))
+
+    f_cell(4, 0, "GATE", color.new(color.black, 0))
+    f_cell(4, 1, r.note, color.new(color.black, 0))
+    f_cell(4, 2, "", color.new(color.black, 0))
+    f_cell(4, 3, "", color.new(color.black, 0))
+
+    if displayMode == "Research"
+        f_cell(5, 0, r.id == "P6" ? "CHAIN MODEL" : "LAG MODEL", color.new(color.black, 80))
+        f_cell(5, 1, "Lag " + str.tostring(r.lag) + " | gap " + f_fmt(r.lagGap, FMT_2), color.new(color.black, 80))
+        f_cell(5, 2, "Beta " + f_fmt(r.beta, FMT_3), color.new(color.black, 80))
+        f_cell(5, 3, "Select R² " + f_fmt(r.selectionOosR2, FMT_3), color.new(color.black, 80))
+
+        f_cell(6, 0, r.id == "P6" ? "DIRECT HOLDOUT" : "HOLDOUT OOS", color.new(color.black, 80))
+        f_cell(6, 1, "R² " + f_fmt(r.holdOosR2, FMT_3), color.new(color.black, 80))
+        f_cell(6, 2, "Hit " + f_fmt(r.hit, FMT_1) + "% | naive " + f_fmt(r.naiveHit, FMT_1) + "%", color.new(color.black, 80))
+        f_cell(6, 3, "Edge " + f_fmt(r.dirSkill, FMT_2) + "pp", color.new(color.black, 80))
+
+        if r.id == "P6"
+            f_cell(7, 0, "CHAIN DIAG", color.new(color.black, 80))
+            f_cell(7, 1, "Min stability " + f_fmt(r.stability, FMT_1), color.new(color.black, 80))
+            f_cell(7, 2, "ResidualQ " + f_fmt(r.residualQ, FMT_1), color.new(color.black, 80))
+            f_cell(7, 3, "Dir coverage " + f_fmt(r.dirCoverage, FMT_1) + "%", color.new(color.black, 80))
+
+            f_cell(8, 0, "LINK GATE", color.new(color.black, 80))
+            f_cell(8, 1, chainLinkGateReason, color.new(color.black, 80))
+            f_cell(8, 2, "DIRECT GATE", color.new(color.black, 80))
+            f_cell(8, 3, chainDirectGateReason, color.new(color.black, 80))
+
+            f_cell(9, 0, "LINK EVIDENCE", color.new(color.black, 80))
+            f_cell(9, 1, "A " + f_fmt(linkA.modelSkill, FMT_1) + " | " + linkA.diagnostic, f_diag_color(linkA.diagnostic))
+            f_cell(9, 2, "B " + f_fmt(linkB.modelSkill, FMT_1) + " | " + linkB.diagnostic, f_diag_color(linkB.diagnostic))
+            f_cell(9, 3, "C " + f_fmt(linkC.modelSkill, FMT_1) + " | " + linkC.diagnostic, f_diag_color(linkC.diagnostic))
+        else
+            f_cell(7, 0, "DIAGNOSTICS", color.new(color.black, 80))
+            f_cell(7, 1, "Stability " + f_fmt(r.stability, FMT_1), color.new(color.black, 80))
+            f_cell(7, 2, "ResidualQ " + f_fmt(r.residualQ, FMT_1), color.new(color.black, 80))
+            f_cell(7, 3, "Dir coverage " + f_fmt(r.dirCoverage, FMT_1) + "%", color.new(color.black, 80))
+
+            f_cell(8, 0, "DATA", color.new(color.black, 80))
+            f_cell(8, 1, "Coverage " + f_fmt(100.0 * r.coverage, FMT_1) + "%", color.new(color.black, 80))
+            f_cell(8, 2, "Fresh " + f_fmt(r.freshness, FMT_1), color.new(color.black, 80))
+            f_cell(8, 3, "Breadth " + f_fmt(r.breadth, FMT_1), color.new(color.black, 80))
+
+            f_cell(9, 0, "GATE DIAGNOSTICS", color.new(color.black, 80))
+            f_cell(9, 1, r.gateReason, color.new(color.black, 80))
+            f_cell(9, 2, "Evidence is continuous", color.new(color.black, 80))
+            f_cell(9, 3, "Hard gate unchanged", color.new(color.black, 80))
+    else
+        f_clear_row(5)
+        f_clear_row(6)
+        f_clear_row(7)
+        f_clear_row(8)
+        f_clear_row(9)
+
+if barstate.islast
+    table.clear(panel, 0, 0, T_COLS - 1, T_ROWS - 1)
+    if isOverview
+        f_render_overview()
+    else
+        f_render_channel(selected)

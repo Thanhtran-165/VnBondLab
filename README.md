@@ -132,7 +132,7 @@ Phiên bản: v2.3.0 | Tác giả: VnBondLab
 ### 🔗 05_Bond_Transmission_Monitor
 **Giám sát truyền dẫn trái phiếu từ nước ngoài**
 
-Phiên bản: v6.0.1 | Tác giả: MacroAcademic Team
+Phiên bản: v8.2.2 | Tác giả: MacroAcademic Team
 
 **Mục đích:** Phân tích tác động từ thị trường nước ngoài sang trái phiếu VN thông qua 6 kênh truyền dẫn
 
@@ -157,7 +157,7 @@ Phiên bản: v6.0.1 | Tác giả: MacroAcademic Team
 - Bạn muốn hiểu cơ chế truyền dẫn toàn cầu → VN
 
 **File chính:**
-- `Bond_Transmission_Monitor_v6.0.1.pine`
+- `Bond_Transmission_Monitor_v8.2.2.pine`
 
 📖 **Xem chi tiết:** [README Bond Transmission Monitor](./05_Bond_Transmission_Monitor/)
 
@@ -339,7 +339,7 @@ Tất cả các dự án đều được xây dựng với các chuẩn mực h�
 - **02_Macro_Alert_System:** v7.0.0 (Academic Robustness)
 - **03_Indices_Research_Map:** v3.1.3e (Bounded Global Buffer Fix)
 - **04_YieldCurveLab:** v2.3.0 (Horizon Separation & Sample Power)
-- **05_Bond_Transmission_Monitor:** v6.0.1 (Interpretation Upgrade)
+- **05_Bond_Transmission_Monitor:** v8.2.2 (Research Precision & Dual Chain Diagnostics)
 
 ---
 

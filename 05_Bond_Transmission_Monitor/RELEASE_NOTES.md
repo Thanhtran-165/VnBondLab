@@ -1,6 +1,21 @@
 # Release Notes — VN Bond Transmission Monitor
 
-## 📅 Version 6.0.1 (Current Release)
+## 📅 Version 8.2.2 (Current Release)
+
+**Release Date:** 2026
+**Platform:** TradingView Pine Script v6
+
+### Research Precision & Dual Chain Diagnostics
+
+Bản v8.2.2 nâng cấp từ v6.0.1 lên Research Precision & Dual Chain Diagnostics:
+- Tinh chỉnh inference và độ chính xác nghiên cứu
+- Bổ sung dual chain diagnostics cho chuỗi truyền dẫn
+- Nâng cấp Pine Script v5 → v6
+- Code: 893 dòng (v6.0.1) → 1206 dòng (v8.2.2)
+
+---
+
+## 📅 Version 6.0.1
 
 **Release Date:** 2025
 **Platform:** TradingView Pine Script v5
@@ -327,7 +342,7 @@ Kiểm tra:
 
 - **README.md:** Hướng dẫn sử dụng chi tiết
 - **RELEASE_NOTES.md:** File này (lịch sử phiên bản)
-- **Pine Script Source:** Bond_Transmission_Monitor_v6.0.1.pine
+- **Pine Script Source:** Bond_Transmission_Monitor_v8.2.2.pine
 
 ---
 
@@ -362,7 +377,7 @@ Nếu bạn gặp bugs hoặc có đề xuất tính năng:
 
 ---
 
-**Current Version:** v6.0.1
+**Current Version:** v8.2.2
 **Last Updated:** January 2025
 **Status:** ✅ Stable & Production Ready
 
