@@ -1,0 +1,1617 @@
+//@version=6
+// BUILD: 20260905-V340-EVIDENCE-SEMANTIC — Evidence Expansion + Semantic Integrity on Dual Engine + Late Fusion.
+indicator("VN YieldCurveLab V3.4.0 — Evidence Expansion & Semantic Integrity", shorttitle = "VN YCL 3.4", overlay = false, precision = 4, max_bars_back = 5000, calc_bars_count = 2000, dynamic_requests = false)
+
+// VN YieldCurveLab 3.4.0 — evidence expansion, temporal context and semantic-integrity upgrade.
+// Canonical clock: standard TVC:VN10Y, 1D. No cross-asset prediction engine.
+// Official state is committed only on closed chart bars using source bars whose
+// time_close is not later than the as-of cutoff. Feed revisions remain possible.
+// A source bar timestamp is NOT a publication timestamp or proof of trading.
+// Relative pressure is a descriptive heuristic, NOT probability or a neutral-rate gap.
+// UI delivery: results-first presentation; Bond and Liquidity remain independent until Transmission is ready.
+// See the delivery package README/QA for display semantics and limitations.
+// The pure f_ui_* helpers read existing results; they never modify data or alert gates.
+
+//============================ 01. CONTRACT / INPUTS ============================
+const string VERSION = "3.4.0"
+const string CLOCK_SYMBOL = "TVC:VN10Y"
+const string TZ = "Asia/Ho_Chi_Minh"
+const int DAY_MS = 86400000
+const int REF = 252
+const int LONG_REF = 756
+const int CAP = 840
+const int DIFF_CAP = 63
+const float REF_COVERAGE = 0.90
+const float CHANGE_COVERAGE = 0.80
+const int CONFIRM_N = 3
+const int SHOCK_CONFIRM_N = 2
+const int BROAD_SHOCK_MIN_LEGS = 4
+const int BROAD_SHOCK_CONFIRM_N = 2
+const int MAX_IB_LAG_DAYS = 5
+const float LIQ_MOVE_BP = 25.0
+const float DRIVER_EPS_BP = 0.5
+const float EPS = 0.0000000001
+const int ENV_UNKNOWN = 0
+const int ENV_STABLE = 1
+const int ENV_COOL = 2
+const int ENV_HEAT = 3
+const int ENV_LOCAL_COOL = 4
+const int ENV_LOCAL_HEAT = 5
+const int ENV_MIXED = 6
+
+// Late-fusion transmission states. These never mutate either market engine.
+const int TX_UNKNOWN = 0
+const int TX_READY = 1
+const int TX_BOND_UNAVAILABLE = 2
+const int TX_LIQUIDITY_UNAVAILABLE = 3
+const int TX_HISTORY_LOW = 4
+const int TX_ALIGNMENT_FAIL = 5
+
+const string G_VIEW = "01 · Hiển thị"
+int panel = input.int(1, "Bảng: 1 Tổng quan · 2 Kỳ hạn · 3 Thanh khoản", minval = 1, maxval = 3, group = G_VIEW, display = display.none)
+string graphMode = input.string("Lợi suất (%)", "Đồ thị — không trộn đơn vị", options = ["Lợi suất (%)", "Thay đổi 20 phiên (bp)", "Áp lực tương đối (0–100)"], group = G_VIEW, display = display.none)
+string fontChoice = input.string("Vừa", "Cỡ chữ bảng", options = ["Rất nhỏ", "Nhỏ", "Vừa"], group = G_VIEW, display = display.none)
+string cornerChoice = input.string("Trái", "Vị trí bảng", options = ["Phải", "Trái"], group = G_VIEW, display = display.none)
+bool showMoneyLines = input.bool(true, "Vẽ thêm liên ngân hàng và chính sách", group = G_VIEW, display = display.none)
+bool previewLines = input.bool(false, "Xem thêm đường giá trong phiên (bảng vẫn dùng phiên đã chốt)", group = G_VIEW, tooltip = "Bật: đường giá là LIVE và có thể thay đổi. Bảng phân tích và alert vẫn chỉ dùng snapshot đã chốt. Không dùng preview để kết luận chuyển trạng thái.", display = display.none)
+bool showTable = input.bool(true, "Hiện bảng", group = G_VIEW, display = display.none)
+
+const string G_RULE = "02 · Quy tắc quan sát (không phải ngưỡng dự báo)"
+float minMove5 = input.float(2.0, "Biên nhiễu 5 phiên, bp", minval = 0.5, maxval = 30.0, step = 0.5, group = G_RULE, display = display.none)
+float minMove20 = input.float(5.0, "Biên nhiễu 20 phiên, bp", minval = 1.0, maxval = 60.0, step = 0.5, group = G_RULE, display = display.none)
+float jumpFloor = input.float(25.0, "Cảnh báo nhảy một kỳ hạn, tối thiểu bp", minval = 10.0, maxval = 100.0, step = 5.0, group = G_RULE, tooltip = "Ngưỡng thực tế = max(mức này, 8 × 1.4826 × MAD sai phân 63 phiên). Cú nhảy bị giữ để kiểm tra; sau 2 ngày nguồn mới ổn định tại mặt bằng mới có thể được nhận nguyên giá.", display = display.none)
+int maxPolicyAge = input.int(120, "Tuổi quan sát policy tối đa, ngày lịch", minval = 30, maxval = 1460, group = G_RULE, tooltip = "Là giới hạn xác minh feed, không phải ngày hết hiệu lực pháp lý của lãi suất chính sách. Nguồn policy được kiểm tra riêng, không cần phát sinh bar raw cùng ngày interbank.", display = display.none)
+
+const string G_TEST = "03 · Cảnh báo và tùy chọn nâng cao"
+bool showResearchExports = input.bool(false, "Hiện chỉ số chi tiết trong cửa sổ dữ liệu", group = G_TEST, display = display.none)
+bool enableReportAlert = input.bool(false, "Bật alert() tóm tắt khi có sự kiện đã chốt", group = G_TEST, display = display.none)
+bool runSelfTests = input.bool(false, "Chạy SELF_TEST toán học khi nạp chỉ báo", group = G_TEST, display = display.none)
+
+bool clockOK = timeframe.isdaily and timeframe.multiplier == 1 and ticker.standard(syminfo.tickerid) == CLOCK_SYMBOL and chart.is_standard
+if barstate.isfirst and not clockOK
+    runtime.error("VN YieldCurveLab V3.4: mở TVC:VN10Y, khung 1D, chart chuẩn (nến/đường). V3 cố định lịch Bond để kết quả không phụ thuộc chart cổ phiếu hoặc lịch khác.")
+
+//============================ 02. DATA STRUCTURES ==============================
+type Leg
+    array<float> hist
+    array<float> diffs
+    float good = na
+    int goodKey = na
+
+var array<Leg> legs = array.new<Leg>()
+if barstate.isfirst
+    for j = 0 to 7
+        array.push(legs, Leg.new(array.new_float(), array.new_float()))
+
+f_tail(array<float> xs, int back) =>
+    int idx = array.size(xs) - 1 - back
+    back >= 0 and idx >= 0 ? array.get(xs, idx) : na
+
+f_tail_int(array<int> xs, int back) =>
+    int idx = array.size(xs) - 1 - back
+    back >= 0 and idx >= 0 ? array.get(xs, idx) : na
+
+f_push(array<float> xs, float value, int capacity) =>
+    array.push(xs, value)
+    if array.size(xs) > capacity
+        array.shift(xs)
+    array.size(xs)
+
+f_good(array<Leg> xs, int idx) =>
+    Leg item = array.get(xs, idx)
+    item.good
+
+f_leg_value(array<Leg> xs, int idx, int back) =>
+    Leg item = array.get(xs, idx)
+    f_tail(item.hist, back)
+
+f_day(int stamp) =>
+    na(stamp) ? int(na) : timestamp(TZ, year(stamp, TZ), month(stamp, TZ), dayofmonth(stamp, TZ), 0, 0)
+
+f_age(int dayNow, int sourceDay) =>
+    na(dayNow) or na(sourceDay) ? int(na) : int(math.floor((dayNow - sourceDay) / float(DAY_MS)))
+
+f_date(int stamp) =>
+    na(stamp) ? "NA" : str.format_time(stamp, "dd/MM/yy", TZ)
+
+f_number(float value, string fmt) =>
+    na(value) ? "NA" : str.tostring(value, fmt)
+
+f_integer(int value) =>
+    na(value) ? "NA" : str.tostring(value)
+
+f_rate(float value) =>
+    na(value) ? "NA" : str.tostring(value, "0.0000") + "%"
+
+f_bp(float value) =>
+    na(value) ? "NA" : (value > 0 ? "+" : "") + str.tostring(value, "0.0")
+
+f_pct(float value) =>
+    na(value) ? "NA" : str.tostring(value, "0.0") + "%"
+
+f_valid_count(array<float> xs, int length, int offset) =>
+    int count = 0
+    int n = array.size(xs)
+    if length > 0 and offset >= 0 and n >= length + offset
+        for j = 0 to length - 1
+            if not na(array.get(xs, n - 1 - offset - j))
+                count += 1
+    count
+
+// Midrank ties; exactly 'length' canonical slots; current value excluded via offset=1.
+f_rank(array<float> xs, float value, int length, int offset) =>
+    float result = na
+    int n = array.size(xs)
+    if not na(value) and length > 0 and offset >= 0 and n >= length + offset
+        int count = 0
+        float lower = 0.0
+        float equalN = 0.0
+        for j = 0 to length - 1
+            float v = array.get(xs, n - 1 - offset - j)
+            if not na(v)
+                count += 1
+                lower += v < value - EPS ? 1.0 : 0.0
+                equalN += math.abs(v - value) <= EPS ? 1.0 : 0.0
+        if count >= length * REF_COVERAGE
+            result := 100.0 * (lower + 0.5 * equalN) / count
+    result
+
+// No removal/compression of missing dates. 1pp = 100bp.
+f_delta(array<float> xs, int horizon) =>
+    float result = na
+    int span = horizon + 1
+    if horizon >= 1 and array.size(xs) >= span
+        float current = f_tail(xs, 0)
+        float prior = f_tail(xs, horizon)
+        if not na(current) and not na(prior) and f_valid_count(xs, span, 0) >= span * CHANGE_COVERAGE
+            result := 100.0 * (current - prior)
+    result
+
+// Return the latest non-NA observation on or before targetDate without compressing dates.
+f_value_at_or_before_date(array<float> xs, array<int> dates, int targetDate) =>
+    float outV = na
+    int outD = na
+    int n = math.min(array.size(xs), array.size(dates))
+    if n > 0 and not na(targetDate)
+        for j = 0 to n - 1
+            int idx = n - 1 - j
+            int d = array.get(dates, idx)
+            float v = array.get(xs, idx)
+            if na(outD) and not na(d) and d <= targetDate and not na(v)
+                outV := v
+                outD := d
+    [outV, outD]
+
+f_belly(float y2, float y5, float y10) =>
+    // 5Y is 3/8 of the distance from 2Y to 10Y, not their midpoint.
+    100.0 * (y5 - (0.625 * y2 + 0.375 * y10))
+
+f_pressure(float levelRank, float slopeRank, float bellyRank, float slopeValue) =>
+    float result = na
+    if not na(levelRank) and not na(slopeRank) and not na(bellyRank) and not na(slopeValue)
+        float slopeRisk = slopeValue <= 0 ? 100.0 : 100.0 - slopeRank
+        result := 0.45 * levelRank + 0.45 * slopeRisk + 0.10 * bellyRank
+    result
+
+f_pressure_ref(array<float> levelH, array<float> slopeH, array<float> bellyH, float lev, float slp, float absBelly, int refOffset) =>
+    f_pressure(f_rank(levelH, lev, REF, refOffset), f_rank(slopeH, slp, REF, refOffset), f_rank(bellyH, absBelly, REF, refOffset), slp)
+
+// Fully recomputed winsorized reference, not a rolling chain of clipped points.
+// No zero-volatility or insufficient-history substitution with a zero z-score.
+f_robust_z(array<float> xs, float value) =>
+    float out = na
+    int n = array.size(xs)
+    if n >= REF and not na(value)
+        int count = 0
+        float total = 0.0
+        float squareTotal = 0.0
+        for j = 0 to REF - 1
+            float v = array.get(xs, n - 1 - j)
+            if not na(v)
+                count += 1
+                total += v
+                squareTotal += v * v
+        if count >= REF * REF_COVERAGE
+            float mu = total / count
+            float sd = math.sqrt(math.max(0.0, squareTotal / count - mu * mu))
+            if sd > 0.00000001
+                float sumW = 0.0
+                float sumW2 = 0.0
+                for j = 0 to REF - 1
+                    float v = array.get(xs, n - 1 - j)
+                    if not na(v)
+                        float w = math.max(mu - 2.5 * sd, math.min(mu + 2.5 * sd, v))
+                        sumW += w
+                        sumW2 += w * w
+                float mw = sumW / count
+                float sw = math.sqrt(math.max(0.0, sumW2 / count - mw * mw))
+                if sw > 0.00000001
+                    out := (value - mw) / sw
+    out
+
+f_threshold(array<float> ds, float floorBP) =>
+    array<float> work = array.new_float()
+    int n = array.size(ds)
+    if n > 0
+        for j = 0 to math.min(DIFF_CAP, n) - 1
+            float v = array.get(ds, n - 1 - j)
+            if not na(v)
+                array.push(work, v)
+    float answer = floorBP
+    if array.size(work) >= 20
+        float md = array.median(work)
+        int nw = array.size(work)
+        for j = 0 to nw - 1
+            array.set(work, j, math.abs(array.get(work, j) - md))
+        answer := math.max(floorBP, 8.0 * 1.4826 * array.median(work))
+    answer
+
+f_direction(float changeBP, float thresholdBP) =>
+    na(changeBP) ? 2 : changeBP <= -thresholdBP ? -1 : changeBP >= thresholdBP ? 1 : 0
+
+f_direction_label(int value) =>
+    value == -1 ? "GIẢM" : value == 1 ? "TĂNG" : value == 0 ? "ĐI NGANG" : "THIẾU MẪU"
+
+// Recent observed range for an event ledger. No carry-forward events are fabricated.
+f_recent_range(array<float> xs, int length) =>
+    float lo = na
+    float hi = na
+    float span = na
+    int n = array.size(xs)
+    if length > 0 and n >= length
+        for j = 0 to length - 1
+            float v = array.get(xs, n - 1 - j)
+            if not na(v)
+                lo := na(lo) ? v : math.min(lo, v)
+                hi := na(hi) ? v : math.max(hi, v)
+        span := not na(lo) and not na(hi) ? hi - lo : na
+    [lo, hi, span]
+
+// Algebraic driver of gap change. Descriptive only: it does not claim policy causality.
+f_gap_driver(float dIB, float dPolicy, float dGap) =>
+    string out = "CHƯA ĐỦ DỮ LIỆU"
+    if not na(dIB) and not na(dPolicy) and not na(dGap)
+        bool ibDown = dIB < -DRIVER_EPS_BP
+        bool ibUp = dIB > DRIVER_EPS_BP
+        bool polDown = dPolicy < -DRIVER_EPS_BP
+        bool polUp = dPolicy > DRIVER_EPS_BP
+        if math.abs(dGap) <= DRIVER_EPS_BP
+            out := "GAP ÍT ĐỔI"
+        else if dGap < 0
+            out := ibDown and polUp ? "THU HẸP · IB GIẢM + POLICY TĂNG" : ibDown and not polUp ? "THU HẸP · DO IB GIẢM" : polUp and not ibDown ? "THU HẸP · DO POLICY TĂNG" : "THU HẸP · MIXED"
+        else
+            out := ibUp and polDown ? "MỞ RỘNG · IB TĂNG + POLICY GIẢM" : ibUp and not polDown ? "MỞ RỘNG · DO IB TĂNG" : polDown and not ibUp ? "MỞ RỘNG · DO POLICY GIẢM" : "MỞ RỘNG · MIXED"
+    out
+
+f_liq_market_trend(float d5, float d20) =>
+    string out = "CHƯA ĐỦ DỮ LIỆU"
+    if not na(d5) and not na(d20)
+        out := d20 <= -LIQ_MOVE_BP ? (d5 <= -LIQ_MOVE_BP ? "IB ĐANG GIẢM" : "IB GIẢM 20E · 5E CHƯA THEO") : d20 >= LIQ_MOVE_BP ? (d5 >= LIQ_MOVE_BP ? "IB ĐANG TĂNG" : "IB TĂNG 20E · 5E CHƯA THEO") : math.abs(d5) < LIQ_MOVE_BP ? "IB ÍT ĐỔI" : d5 < 0 ? "IB GIẢM NGẮN HẠN" : "IB TĂNG NGẮN HẠN"
+    out
+
+// Transmission-side Bond direction; separates broad, local, mixed and flat cases.
+f_tx_bond_state(int downN, int upN) =>
+    string out = "BOND ÍT THAY ĐỔI"
+    if downN >= 4 and upN <= 1
+        out := "BOND GIẢM RỘNG"
+    else if upN >= 4 and downN <= 1
+        out := "BOND TĂNG RỘNG"
+    else if downN >= 2 and upN >= 2
+        out := "BOND PHÂN HÓA"
+    else if downN >= 2
+        out := "BOND GIẢM CỤC BỘ"
+    else if upN >= 2
+        out := "BOND TĂNG CỤC BỘ"
+    out
+
+f_group_candidate(float d5, float d20, float threshold5, float threshold20) =>
+    int result = ENV_UNKNOWN
+    if not na(d5) and not na(d20)
+        result := d20 <= -threshold20 ? (d5 <= -threshold5 ? ENV_COOL : ENV_LOCAL_COOL) : d20 >= threshold20 ? (d5 >= threshold5 ? ENV_HEAT : ENV_LOCAL_HEAT) : ENV_STABLE
+    result
+
+f_env_label(int state) =>
+    switch state
+        ENV_COOL => "HẠ NHIỆT RỘNG"
+        ENV_HEAT => "TĂNG TRÊN DIỆN RỘNG"
+        ENV_LOCAL_COOL => "HẠ NHIỆT CỤC BỘ"
+        ENV_LOCAL_HEAT => "TĂNG CỤC BỘ"
+        ENV_MIXED => "PHÂN HÓA"
+        ENV_STABLE => "CHƯA CÓ XU HƯỚNG RỘNG"
+        => "CHƯA ĐỦ DỮ LIỆU"
+
+f_group_label(int candidate, int run) =>
+    string out = "CHƯA ĐỦ DỮ LIỆU"
+    if candidate == ENV_COOL
+        out := run >= CONFIRM_N ? "GIẢM ĐÃ XÁC NHẬN" : "GIẢM — CHỜ ĐỘ BỀN"
+    else if candidate == ENV_HEAT
+        out := run >= CONFIRM_N ? "ĐANG TĂNG" : "TĂNG — CHỜ ĐỘ BỀN"
+    else if candidate == ENV_LOCAL_COOL
+        out := "GIẢM 20P, 5P CHƯA XÁC NHẬN"
+    else if candidate == ENV_LOCAL_HEAT
+        out := "TĂNG 20P, 5P CHƯA XÁC NHẬN"
+    else if candidate == ENV_STABLE
+        out := "CHƯA XÁC NHẬN GIẢM"
+    out
+
+f_shape(float d2, float d10, float thresholdBP) =>
+    string out = "THIẾU MẪU"
+    if not na(d2) and not na(d10)
+        int a = f_direction(d2, thresholdBP)
+        int b = f_direction(d10, thresholdBP)
+        float ds = d10 - d2
+        if a == 0 and b == 0
+            out := "BIẾN ĐỘNG NHỎ"
+        else if a == -1 and b == -1
+            out := ds >= thresholdBP ? "BULL STEEPENING" : ds <= -thresholdBP ? "BULL FLATTENING" : "GIẢM SONG SONG"
+        else if a == 1 and b == 1
+            out := ds >= thresholdBP ? "BEAR STEEPENING" : ds <= -thresholdBP ? "BEAR FLATTENING" : "TĂNG SONG SONG"
+        else if a * b == -1
+            out := "XOẮN / NGƯỢC CHIỀU"
+        else
+            out := a + b < 0 ? "GIẢM MỘT ĐẦU" : "TĂNG MỘT ĐẦU"
+    out
+
+f_broad_shock_dir(int positiveShockLegs, int negativeShockLegs) =>
+    positiveShockLegs >= BROAD_SHOCK_MIN_LEGS and negativeShockLegs == 0 ? 1 : negativeShockLegs >= BROAD_SHOCK_MIN_LEGS and positiveShockLegs == 0 ? -1 : 0
+
+// Policy and interbank have different data-validity horizons.
+// Hysteresis avoids repeated EASY/NORMAL/TIGHT flips on 1-2 percentile points.
+f_liq_state(int previous, float pctl) =>
+    int next = 2
+    if not na(pctl)
+        if previous == 2
+            next := pctl <= 30 ? -1 : pctl >= 70 ? 1 : 0
+        else if pctl <= 25
+            next := -1
+        else if pctl >= 75
+            next := 1
+        else if previous == -1
+            next := pctl <= 35 ? -1 : 0
+        else if previous == 1
+            next := pctl >= 65 ? 1 : 0
+        else
+            next := 0
+    next
+
+f_liq_label(int value) =>
+    value == -1 ? "EASY TƯƠNG ĐỐI" : value == 1 ? "TIGHT TƯƠNG ĐỐI" : value == 0 ? "NORMAL TƯƠNG ĐỐI" : "CHƯA ĐỦ / NGUỒN TRỄ"
+
+f_closed(float v, int srcT, int srcTC, float prevV, int prevT, int prevTC, int cutoff) =>
+    float outV = na
+    int outT = na
+    int outTC = na
+    if not na(v) and not na(srcT) and not na(srcTC) and srcTC <= cutoff
+        outV := v
+        outT := srcT
+        outTC := srcTC
+    else if not na(prevV) and not na(prevT) and not na(prevTC) and prevTC <= cutoff
+        outV := prevV
+        outT := prevT
+        outTC := prevTC
+    [outV, outT, outTC]
+
+f_test(bool condition, string msg) =>
+    if not condition
+        runtime.error("SELF_TEST V3 FAIL: " + msg)
+    condition
+
+var int selfTestCount = 0
+if barstate.isfirst and runSelfTests
+    array<float> a = array.from(1.0, 2.0, 3.0, 100.0)
+    f_test(math.abs(f_rank(a, 100.0, 3, 1) - 100.0) < EPS, "rank prior-only")
+    f_test(math.abs(f_rank(array.from(4.0, 4.0, 4.0, 4.0), 4.0, 3, 1) - 50.0) < EPS, "midrank ties")
+    f_test(na(f_rank(a, 4.0, 5, 1)), "warmup")
+    f_test(math.abs(f_delta(array.from(3.50, 3.55), 1) - 5.0) < 0.000001, "bp units")
+    f_test(na(f_delta(array.from(3.50, float(na), 3.55), 1)), "no missing compression")
+    f_test(math.abs(f_belly(2.0, 5.0, 10.0)) < EPS, "maturity-aware belly")
+    f_test(f_liq_state(-1, 31.0) == -1 and f_liq_state(-1, 36.0) == 0, "liquidity hysteresis")
+    f_test(f_pressure(100.0, 0.0, 100.0, 0.1) == 100.0, "pressure bounds")
+    f_test(f_shape(-5.0, -15.0, 2.0) == "BULL FLATTENING", "falling long end is not always bad")
+    f_test(f_broad_shock_dir(5, 0) == 1 and f_broad_shock_dir(1, 0) == 0 and f_broad_shock_dir(4, 1) == 0, "broad shock classification")
+    array<float> lookupV = array.from(1.0, float(na), 3.0)
+    array<int> lookupD = array.from(100, 200, 300)
+    [lookupValue, lookupDate] = f_value_at_or_before_date(lookupV, lookupD, 250)
+    f_test(lookupValue == 1.0 and lookupDate == 100, "date aligned lookup")
+    f_test(f_gap_driver(-20.0, 0.0, -20.0) == "THU HẸP · DO IB GIẢM", "gap driver IB down")
+    f_test(f_gap_driver(0.0, 20.0, -20.0) == "THU HẸP · DO POLICY TĂNG", "gap driver policy up")
+    f_test(f_tx_bond_state(5, 0) == "BOND GIẢM RỘNG" and f_tx_bond_state(0, 5) == "BOND TĂNG RỘNG" and f_tx_bond_state(2, 2) == "BOND PHÂN HÓA", "transmission bond taxonomy")
+    selfTestCount := 14
+
+//============================ 03. SOURCE ACQUISITION ===========================
+// Eight requests, 48 tuple elements. No nested requests or external libraries.
+[r1, t1, tc1, r1p, t1p, tc1p] = request.security("TVC:VN01Y", "D", [close, time, time_close, close[1], time[1], time_close[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+[r2, t2, tc2, r2p, t2p, tc2p] = request.security("TVC:VN02Y", "D", [close, time, time_close, close[1], time[1], time_close[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+[r3, t3, tc3, r3p, t3p, tc3p] = request.security("TVC:VN03Y", "D", [close, time, time_close, close[1], time[1], time_close[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+[r5, t5, tc5, r5p, t5p, tc5p] = request.security("TVC:VN05Y", "D", [close, time, time_close, close[1], time[1], time_close[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+[r7, t7, tc7, r7p, t7p, tc7p] = request.security("TVC:VN07Y", "D", [close, time, time_close, close[1], time[1], time_close[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+[r10, t10, tc10, r10p, t10p, tc10p] = request.security("TVC:VN10Y", "D", [close, time, time_close, close[1], time[1], time_close[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+[ri, ti, tci, rip, tip, tcip] = request.security("ECONOMICS:VNINBR", "D", [close, time, time_close, close[1], time[1], time_close[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+[rp, tp, tcp, rpp, tpp, tcpp] = request.security("ECONOMICS:VNINTR", "D", [close, time, time_close, close[1], time[1], time_close[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+
+int cutoff = barstate.isrealtime ? math.min(timenow, time_close) : time_close
+int clockDay = f_day(time)
+[c1, k1, kc1] = f_closed(r1, t1, tc1, r1p, t1p, tc1p, cutoff)
+[c2, k2, kc2] = f_closed(r2, t2, tc2, r2p, t2p, tc2p, cutoff)
+[c3, k3, kc3] = f_closed(r3, t3, tc3, r3p, t3p, tc3p, cutoff)
+[c5, k5, kc5] = f_closed(r5, t5, tc5, r5p, t5p, tc5p, cutoff)
+[c7, k7, kc7] = f_closed(r7, t7, tc7, r7p, t7p, tc7p, cutoff)
+[c10, k10, kc10] = f_closed(r10, t10, tc10, r10p, t10p, tc10p, cutoff)
+[ci, ki, kci] = f_closed(ri, ti, tci, rip, tip, tcip, cutoff)
+[cp, kp, kcp] = f_closed(rp, tp, tcp, rpp, tpp, tcpp, cutoff)
+array<float> candidateValues = array.from(c1, c2, c3, c5, c7, c10, ci, cp)
+array<int> candidateDates = array.from(f_day(k1), f_day(k2), f_day(k3), f_day(k5), f_day(k7), f_day(k10), f_day(ki), f_day(kp))
+array<float> rawValues = array.from(r1, r2, r3, r5, r7, r10, ri, rp)
+array<int> rawDates = array.from(f_day(t1), f_day(t2), f_day(t3), f_day(t5), f_day(t7), f_day(t10), f_day(ti), f_day(tp))
+
+//============================ 04. COMMITTED STORAGE ============================
+var array<float> levelHist = array.new_float()
+var array<float> slopeHist = array.new_float()
+var array<float> bellyHist = array.new_float()
+var array<float> gapHist = array.new_float()
+// Distinct interbank-source observations for liquidity analytics.
+// A carried source value may remain usable for up to MAX_IB_LAG_DAYS,
+// but it is never appended here again as a new observation.
+var array<float> ibObsHist = array.new_float()
+var array<float> policyAtIBObsHist = array.new_float()
+var array<int> ibObsDateHist = array.new_int()
+// Liquidity events advance only when a fresh IB source observation arrives or the policy level changes.
+// Carry-forward alone never creates an event. This ledger drives gap rank/state and aligned Bond comparison.
+var array<float> liqEventIBHist = array.new_float()
+var array<float> liqEventPolicyHist = array.new_float()
+var array<float> liqEventGapHist = array.new_float()
+var array<int> liqEventDateHist = array.new_int()
+var array<int> clockHist = array.new_int()
+var array<int> ibDateHist = array.new_int()
+var array<float> groupHistS = array.new_float()
+var array<float> groupHistM = array.new_float()
+var array<float> groupHistL = array.new_float()
+var array<float> change1 = array.new_float(6, na)
+var array<float> change5 = array.new_float(6, na)
+var array<float> change20 = array.new_float(6, na)
+var array<float> change60 = array.new_float(6, na)
+var array<float> groupNow = array.new_float(3, na)
+var array<float> group5 = array.new_float(3, na)
+var array<float> group20 = array.new_float(3, na)
+var array<float> group60 = array.new_float(3, na)
+var array<int> groupCandidates = array.new_int(3, ENV_UNKNOWN)
+var array<int> groupRuns = array.new_int(3, 0)
+var array<float> pendingCurve = array.new_float(6, na)
+var array<float> currentThresholds = array.new_float(6, na)
+var int pendingCount = 0
+var int pendingBroadDir = 0
+var int pendingBroadCount = 0
+var int lastSeenCurveKey = na
+var int lastCurveKey = na
+var int lastClockProcessed = na
+var int lastIBSeen = na
+var int lastLiquidityObsKey = na
+var float lastLiquidityPolicyValue = na
+var int pendingIBCount = 0
+var float pendingIB = na
+var string curveQuality = "BUILDING"
+var string ibQuality = "BUILDING"
+var string policyQuality = "BUILDING"
+var bool curveAccepted = false
+var bool liquidityUsable = false
+var int shockLegs = 0
+var int totalQuarantines = 0
+var int totalMissing = 0
+var int totalAccepted = 0
+var int totalConfirmedShocks = 0
+var float levelNow = na
+var float slopeNow = na
+var float bellyNow = na
+var float pLevel = na
+var float pSlope = na
+var float pBelly = na
+var float pLong = na
+var float relativePressure = na
+var float pressureOldRefNow = na
+var float pressureOldRefOld = na
+var float movementComponent = na
+var float referenceComponent = na
+var float pressureChange20 = na
+var float levelChange20 = na
+var float slopeChange20 = na
+var float dispersion = na
+var string coherence = "INSUFFICIENT"
+var string regime = "BUILDING"
+var int down5 = 0
+var int up5 = 0
+var int down20 = 0
+var int up20 = 0
+var int validChangeN = 0
+var int environmentCandidate = ENV_UNKNOWN
+var int environmentRun = 0
+var int environmentConfirmed = ENV_UNKNOWN
+var int confirmedOn = na
+var float gapNow = na
+var float pGap = na
+var float gapChange5 = na
+var float gapChange20 = na
+var int liquidityState = 2
+var int ibAge = na
+var int policyAge = na
+var string concordance = "CHƯA ĐỦ DỮ LIỆU"
+var string insight = "CHƯA CÓ ĐIỂM MỚI RÕ"
+var string shape5 = "THIẾU MẪU"
+var string shape20 = "THIẾU MẪU"
+var float shortCoverage = na
+var float refCoverage = na
+var int refN = 0
+var int longN = 0
+var int alignedWindowStart = na
+var int alignedWindowEnd = na
+var int alignedBondDown = 0
+var int alignedBondUp = 0
+var int alignedBondValidN = 0
+
+bool eventCool = false
+bool eventHeat = false
+bool eventLiquidity = false
+bool eventData = false
+bool eventRecovery = false
+Leg ibLeg = array.get(legs, 6)
+Leg policyLeg = array.get(legs, 7)
+bool commit = clockOK and barstate.isconfirmed and (na(lastClockProcessed) or lastClockProcessed != time)
+
+if commit
+    bool priorCurveOK = curveAccepted
+    int priorEnv = environmentConfirmed
+    int priorLiquidity = liquidityState
+    array.push(clockHist, clockDay)
+    if array.size(clockHist) > CAP
+        array.shift(clockHist)
+
+    //-------------- synchronized six-tenor cohort and anomaly quarantine -------
+    bool allPresent = true
+    bool rangeOK = true
+    bool sameDay = true
+    shockLegs := 0
+    int positiveShockLegs = 0
+    int negativeShockLegs = 0
+    for j = 0 to 5
+        float v = array.get(candidateValues, j)
+        int dk = array.get(candidateDates, j)
+        allPresent := allPresent and not na(v) and not na(dk)
+        rangeOK := rangeOK and not na(v) and v >= -5.0 and v <= 30.0
+        sameDay := sameDay and not na(dk) and dk == clockDay
+        Leg item = array.get(legs, j)
+        float thresholdBP = jumpFloor
+        if not na(v) and not na(item.good) and math.abs(v - item.good) * 100.0 > jumpFloor
+            thresholdBP := f_threshold(item.diffs, jumpFloor)
+        array.set(currentThresholds, j, thresholdBP)
+        if not na(v) and not na(item.good) and math.abs(v - item.good) * 100.0 > thresholdBP
+            shockLegs += 1
+            float moveBP = (v - item.good) * 100.0
+            positiveShockLegs += moveBP > 0 ? 1 : 0
+            negativeShockLegs += moveBP < 0 ? 1 : 0
+    int broadShockDir = f_broad_shock_dir(positiveShockLegs, negativeShockLegs)
+    bool newCohort = na(lastSeenCurveKey) or clockDay > lastSeenCurveKey
+    curveAccepted := false
+    if not allPresent or not rangeOK or not sameDay
+        curveQuality := not allPresent ? "MISSING" : not rangeOK ? "RANGE_ERROR" : "WAIT_SAME_DATE"
+        pendingCount := 0
+        pendingBroadDir := 0
+        pendingBroadCount := 0
+        totalMissing += 1
+    else if not newCohort
+        curveQuality := "REPEATED_SOURCE_DAY"
+    else
+        lastSeenCurveKey := clockDay
+        if shockLegs == 0
+            curveAccepted := true
+            curveQuality := "PASS"
+            pendingCount := 0
+            pendingBroadDir := 0
+            pendingBroadCount := 0
+        else if broadShockDir != 0
+            // A curve-wide move is treated differently from an isolated bad print.
+            // Two consecutive broad shocks in the same direction confirm the new level,
+            // even if the market continues moving between the two source days.
+            pendingBroadCount := pendingBroadDir == broadShockDir ? pendingBroadCount + 1 : 1
+            pendingBroadDir := broadShockDir
+            pendingCount := 0
+            if pendingBroadCount >= BROAD_SHOCK_CONFIRM_N
+                curveAccepted := true
+                curveQuality := "PASS_AFTER_BROAD_SHOCK"
+                totalConfirmedShocks += 1
+                pendingBroadDir := 0
+                pendingBroadCount := 0
+            else
+                curveQuality := "QUARANTINE_BROAD_SHOCK"
+                totalQuarantines += 1
+        else
+            pendingBroadDir := 0
+            pendingBroadCount := 0
+            // Isolated/mixed jumps retain the stricter stable-level confirmation path.
+            bool pendingMatches = pendingCount > 0
+            for j = 0 to 5
+                float pv = array.get(pendingCurve, j)
+                float v = array.get(candidateValues, j)
+                float tol = math.max(10.0, array.get(currentThresholds, j) * 0.5)
+                pendingMatches := pendingMatches and not na(pv) and math.abs(v - pv) * 100.0 <= tol
+            pendingCount := pendingMatches ? pendingCount + 1 : 1
+            for j = 0 to 5
+                array.set(pendingCurve, j, array.get(candidateValues, j))
+            if pendingCount >= SHOCK_CONFIRM_N
+                curveAccepted := true
+                curveQuality := "PASS_AFTER_SHOCK"
+                totalConfirmedShocks += 1
+                pendingCount := 0
+            else
+                curveQuality := "QUARANTINE"
+                totalQuarantines += 1
+    if curveAccepted
+        lastCurveKey := clockDay
+        totalAccepted += 1
+    eventData := not curveAccepted and priorCurveOK
+    eventRecovery := curveAccepted and not priorCurveOK and totalAccepted > 1
+
+    //-------------- interbank: distinct observation and own anomaly check ------
+    int ibKey = array.get(candidateDates, 6)
+    bool ibCandidateOK = not na(ci) and ci >= -5.0 and ci <= 100.0 and not na(ibKey) and ibKey <= clockDay
+    ibQuality := "MISSING"
+    bool ibSuspect = false
+    if ibCandidateOK
+        bool newIB = na(lastIBSeen) or ibKey > lastIBSeen
+        if newIB
+            bool ibJump = not na(ibLeg.good) and math.abs(ci - ibLeg.good) * 100.0 > 300.0
+            if ibJump
+                bool agrees = pendingIBCount > 0 and not na(pendingIB) and math.abs(ci - pendingIB) * 100.0 <= 75.0
+                pendingIBCount := agrees ? pendingIBCount + 1 : 1
+                pendingIB := ci
+                if pendingIBCount >= SHOCK_CONFIRM_N
+                    ibLeg.good := ci
+                    ibLeg.goodKey := ibKey
+                    pendingIBCount := 0
+                    ibQuality := "PASS_AFTER_SHOCK"
+                else
+                    ibSuspect := true
+                    ibQuality := "QUARANTINE"
+            else
+                ibLeg.good := ci
+                ibLeg.goodKey := ibKey
+                pendingIBCount := 0
+                ibQuality := "ASOF_OK"
+            lastIBSeen := ibKey
+        else
+            ibSuspect := pendingIBCount > 0 or (not na(ibLeg.good) and not na(ibLeg.goodKey) and ibKey == ibLeg.goodKey and math.abs(ci - ibLeg.good) > EPS)
+            ibQuality := ibSuspect ? "REVISED_OR_PENDING" : "ASOF_CARRIED"
+    else
+        pendingIBCount := 0
+    ibAge := f_age(clockDay, ibLeg.goodKey)
+    bool ibUsable = not na(ibLeg.good) and not na(ibAge) and ibAge >= 0 and ibAge <= MAX_IB_LAG_DAYS and not ibSuspect and ibCandidateOK
+    if not na(ibAge) and ibAge > MAX_IB_LAG_DAYS
+        ibQuality := "SOURCE_OLD"
+
+    // Policy is an as-of level. Same value on new dates is valid; no daily raw coincidence needed.
+    int policyKey = array.get(candidateDates, 7)
+    bool policyCandidateOK = not na(cp) and cp >= -5.0 and cp <= 100.0 and not na(policyKey) and policyKey <= clockDay
+    if policyCandidateOK
+        policyLeg.good := cp
+        policyLeg.goodKey := policyKey
+    policyAge := f_age(clockDay, policyLeg.goodKey)
+    bool policyUsable = policyCandidateOK and not na(policyAge) and policyAge >= 0 and policyAge <= maxPolicyAge
+    policyQuality := not policyCandidateOK ? "MISSING" : policyUsable ? "ASOF_OK" : "CHECK_POLICY_FEED"
+    liquidityUsable := ibUsable and policyUsable
+
+    // A 0-5 calendar-day IB lag is an accepted as-of condition. It can describe
+    // the current liquidity environment, but a carried IB value is not a new IB observation.
+    bool newLiquidityObservation = liquidityUsable and not na(ibLeg.goodKey) and (na(lastLiquidityObsKey) or ibLeg.goodKey > lastLiquidityObsKey)
+    if newLiquidityObservation
+        f_push(ibObsHist, ibLeg.good, CAP)
+        f_push(policyAtIBObsHist, policyLeg.good, CAP)
+        array.push(ibObsDateHist, ibLeg.goodKey)
+        if array.size(ibObsDateHist) > CAP
+            array.shift(ibObsDateHist)
+        lastLiquidityObsKey := ibLeg.goodKey
+
+    // The gap is an input pair. A policy-level change must refresh the gap/state even
+    // when IB is merely carried; this does not fabricate a new IB observation.
+    bool policyValueChanged = liquidityUsable and not na(policyLeg.good) and (na(lastLiquidityPolicyValue) or math.abs(policyLeg.good - lastLiquidityPolicyValue) > EPS)
+    bool newLiquidityEvent = liquidityUsable and (newLiquidityObservation or policyValueChanged)
+    if newLiquidityEvent
+        int liquidityEventKey = math.max(ibLeg.goodKey, policyLeg.goodKey)
+        f_push(liqEventIBHist, ibLeg.good, CAP)
+        f_push(liqEventPolicyHist, policyLeg.good, CAP)
+        f_push(liqEventGapHist, ibLeg.good - policyLeg.good, CAP)
+        array.push(liqEventDateHist, liquidityEventKey)
+        if array.size(liqEventDateHist) > CAP
+            array.shift(liqEventDateHist)
+        lastLiquidityPolicyValue := policyLeg.good
+
+    //-------------- append every clock slot; NA is never removed ---------------
+    for j = 0 to 5
+        Leg item = array.get(legs, j)
+        float priorValue = f_tail(item.hist, 0)
+        float v = curveAccepted ? array.get(candidateValues, j) : na
+        float diffBP = not na(v) and not na(priorValue) ? 100.0 * (v - priorValue) : na
+        f_push(item.diffs, diffBP, DIFF_CAP)
+        f_push(item.hist, v, CAP)
+        if curveAccepted
+            item.good := v
+            item.goodKey := clockDay
+    f_push(ibLeg.hist, ibUsable ? ibLeg.good : na, CAP)
+    f_push(policyLeg.hist, policyUsable ? policyLeg.good : na, CAP)
+    array.push(ibDateHist, ibUsable ? ibLeg.goodKey : int(na))
+    if array.size(ibDateHist) > CAP
+        array.shift(ibDateHist)
+
+    float lev = curveAccepted ? (c2 + c5 + c10) / 3.0 : na
+    float slp = curveAccepted ? c10 - c2 : na
+    float bnd = curveAccepted ? f_belly(c2, c5, c10) : na
+    float gs = curveAccepted ? (c1 + c2) / 2.0 : na
+    float gm = curveAccepted ? (c3 + c5) / 2.0 : na
+    float gl = curveAccepted ? (c7 + c10) / 2.0 : na
+    f_push(levelHist, lev, CAP)
+    f_push(slopeHist, slp, CAP)
+    f_push(bellyHist, math.abs(bnd), CAP)
+    f_push(groupHistS, gs, CAP)
+    f_push(groupHistM, gm, CAP)
+    f_push(groupHistL, gl, CAP)
+    float thisGap = liquidityUsable ? ibLeg.good - policyLeg.good : na
+    f_push(gapHist, thisGap, CAP)
+
+    //-------------- liquidity analytics uses DISTINCT SOURCE EVENTS --------------
+    // gapHist remains the chart-aligned as-of ledger for transparent display only.
+    // Rank/state advance when either a fresh IB observation arrives or policy changes.
+    gapNow := thisGap
+    bool liquidityStateRefreshed = newLiquidityEvent
+    if liquidityStateRefreshed
+        pGap := f_rank(liqEventGapHist, thisGap, REF, 1)
+        gapChange5 := f_delta(liqEventGapHist, 5)
+        gapChange20 := f_delta(liqEventGapHist, 20)
+        liquidityState := f_liq_state(liquidityState, pGap)
+    eventLiquidity := liquidityStateRefreshed and liquidityState == 1 and priorLiquidity != 1 and priorLiquidity != 2
+
+    int slots20 = math.min(20, array.size(levelHist))
+    shortCoverage := slots20 > 0 ? 100.0 * f_valid_count(levelHist, slots20, 0) / slots20 : na
+    refN := f_valid_count(levelHist, REF, 1)
+    longN := f_valid_count(levelHist, LONG_REF, 1)
+    refCoverage := array.size(levelHist) >= REF + 1 ? 100.0 * refN / REF : na
+
+    if curveAccepted
+        levelNow := lev
+        slopeNow := slp
+        bellyNow := bnd
+        pLevel := f_rank(levelHist, lev, REF, 1)
+        pSlope := f_rank(slopeHist, slp, REF, 1)
+        pBelly := f_rank(bellyHist, math.abs(bnd), REF, 1)
+        pLong := f_rank(levelHist, lev, LONG_REF, 1)
+        relativePressure := f_pressure(pLevel, pSlope, pBelly, slp)
+        // Exact 20-session decomposition with the PREVIOUS 252-session reference frozen.
+        // P_t - P_(t-20) = [F_old(x_t)-F_old(x_old)] + [F_now(x_t)-F_old(x_t)].
+        pressureOldRefNow := f_pressure_ref(levelHist, slopeHist, bellyHist, lev, slp, math.abs(bnd), 21)
+        pressureOldRefOld := f_pressure_ref(levelHist, slopeHist, bellyHist, f_tail(levelHist, 20), f_tail(slopeHist, 20), f_tail(bellyHist, 20), 21)
+        movementComponent := pressureOldRefNow - pressureOldRefOld
+        referenceComponent := relativePressure - pressureOldRefNow
+        pressureChange20 := relativePressure - pressureOldRefOld
+        levelChange20 := f_delta(levelHist, 20)
+        slopeChange20 := f_delta(slopeHist, 20)
+        regime := na(pLevel) or na(pSlope) ? "BUILDING" : pLevel >= 80 ? (slp <= 0 or pSlope < 80 ? "YC4" : "YC3") : pLevel <= 20 ? (slp > 0 and pSlope >= 80 ? "YC2" : "YC1") : "YC0"
+        down5 := 0
+        up5 := 0
+        down20 := 0
+        up20 := 0
+        validChangeN := 0
+        array<float> zs = array.new_float()
+        for j = 0 to 5
+            Leg item = array.get(legs, j)
+            float d1 = f_delta(item.hist, 1)
+            float d5 = f_delta(item.hist, 5)
+            float d20 = f_delta(item.hist, 20)
+            float d60 = f_delta(item.hist, 60)
+            array.set(change1, j, d1)
+            array.set(change5, j, d5)
+            array.set(change20, j, d20)
+            array.set(change60, j, d60)
+            down5 += not na(d5) and d5 <= -minMove5 ? 1 : 0
+            up5 += not na(d5) and d5 >= minMove5 ? 1 : 0
+            down20 += not na(d20) and d20 <= -minMove20 ? 1 : 0
+            up20 += not na(d20) and d20 >= minMove20 ? 1 : 0
+            validChangeN += not na(d5) and not na(d20) ? 1 : 0
+            float z = f_robust_z(item.hist, item.good)
+            if not na(z)
+                array.push(zs, z)
+        dispersion := array.size(zs) == 6 ? array.stdev(zs, true) : na
+        coherence := na(dispersion) ? "INSUFFICIENT" : dispersion < 0.30 ? "COHERENT" : dispersion > 0.70 ? "DISPERSED" : "MIXED"
+        int groupDown = 0
+        int groupUp = 0
+        for j = 0 to 2
+            array<float> gh = j == 0 ? groupHistS : j == 1 ? groupHistM : groupHistL
+            float d5 = f_delta(gh, 5)
+            float d20 = f_delta(gh, 20)
+            array.set(groupNow, j, f_tail(gh, 0))
+            array.set(group5, j, d5)
+            array.set(group20, j, d20)
+            array.set(group60, j, f_delta(gh, 60))
+            int prev = array.get(groupCandidates, j)
+            int nxt = f_group_candidate(d5, d20, minMove5, minMove20)
+            int nr = nxt == ENV_UNKNOWN ? 0 : nxt == prev ? array.get(groupRuns, j) + 1 : 1
+            array.set(groupCandidates, j, nxt)
+            array.set(groupRuns, j, nr)
+            groupDown += not na(d20) and d20 <= -minMove20 ? 1 : 0
+            groupUp += not na(d20) and d20 >= minMove20 ? 1 : 0
+        int nextEnv = ENV_UNKNOWN
+        if validChangeN == 6
+            if down20 >= 4 and up20 == 0 and groupDown >= 2 and down5 >= 3 and up5 <= 1
+                nextEnv := ENV_COOL
+            else if up20 >= 4 and down20 == 0 and groupUp >= 2 and up5 >= 3 and down5 <= 1
+                nextEnv := ENV_HEAT
+            else if down20 >= 2 and up20 >= 2
+                nextEnv := ENV_MIXED
+            else if down20 >= 2
+                nextEnv := ENV_LOCAL_COOL
+            else if up20 >= 2
+                nextEnv := ENV_LOCAL_HEAT
+            else
+                nextEnv := ENV_STABLE
+        environmentRun := nextEnv == ENV_UNKNOWN ? 0 : nextEnv == environmentCandidate ? environmentRun + 1 : 1
+        environmentCandidate := nextEnv
+        if environmentRun >= CONFIRM_N
+            if environmentConfirmed != nextEnv
+                confirmedOn := clockDay
+            environmentConfirmed := nextEnv
+        shape5 := f_shape(array.get(change5, 1), array.get(change5, 5), minMove5)
+        shape20 := f_shape(array.get(change20, 1), array.get(change20, 5), minMove5)
+    else
+        // Data gaps are breaks in evidence, not additional persistence days.
+        environmentCandidate := ENV_UNKNOWN
+        environmentRun := 0
+        for j = 0 to 2
+            array.set(groupCandidates, j, ENV_UNKNOWN)
+            array.set(groupRuns, j, 0)
+
+    eventCool := curveAccepted and environmentConfirmed == ENV_COOL and priorEnv != ENV_COOL
+    eventHeat := curveAccepted and environmentConfirmed == ENV_HEAT and priorEnv != ENV_HEAT
+
+    //-------------- Bond-only special insight -----------------------------------
+    // Cross-market statements belong exclusively to the Transmission Engine below.
+    insight := "CHƯA CÓ ĐIỂM MỚI RÕ"
+    if curveAccepted and not na(referenceComponent) and not na(movementComponent) and referenceComponent <= -3.0 and math.abs(movementComponent) < 1.0 and not na(levelChange20) and math.abs(levelChange20) < minMove20
+        insight := "SCORE GIẢM CHỦ YẾU DO MỐC SO SÁNH; CHƯA PHẢI LÃI SUẤT GIẢM"
+    if curveAccepted and not na(slopeChange20) and slopeChange20 >= minMove5 and array.get(change20, 1) > -minMove5 and array.get(change20, 5) >= minMove5
+        insight := "DỐC LÊN CHỦ YẾU DO 10Y TĂNG, KHÔNG DO 2Y HẠ"
+    if not curveAccepted
+        insight := "SNAPSHOT ĐANG GIỮ LẠI — CHƯA KẾT LUẬN BOND MỚI"
+    lastClockProcessed := time
+
+//============================ 05. BOND ENGINE OUTPUT ===========================
+// Bond Engine owns curve state only. No Liquidity input is allowed in this contract.
+bool bondEngineUsable = curveAccepted
+int bondEngineAsOf = lastCurveKey
+int bondEngineState = environmentCandidate
+int bondEngineConfirmedState = environmentConfirmed
+int bondEngineRun = environmentRun
+float bondEngineLevel = levelNow
+float bondEngineSlope = slopeNow
+float bondEnginePressure = relativePressure
+int bondEngineDown5 = down5
+int bondEngineUp5 = up5
+int bondEngineDown20 = down20
+int bondEngineUp20 = up20
+string bondEngineCoherence = coherence
+string bondEngineQuality = curveAccepted ? "READY" : curveQuality
+
+// Explicit clock windows for AI audit. These are chart-clock slots; f_delta() still
+// decides whether coverage inside each window is sufficient for a numeric change.
+int bondWindowEnd = array.size(clockHist) >= 1 ? f_tail_int(clockHist, 0) : na
+int bondWindow5Start = array.size(clockHist) >= 6 ? f_tail_int(clockHist, 5) : na
+int bondWindow20Start = array.size(clockHist) >= 21 ? f_tail_int(clockHist, 20) : na
+int bondWindow60Start = array.size(clockHist) >= 61 ? f_tail_int(clockHist, 60) : na
+
+string bondEarlyObservation = "CHƯA CÓ DẤU HIỆU RỘNG"
+if bondEngineUsable
+    if bondEngineState == ENV_COOL and bondEngineRun < CONFIRM_N
+        bondEarlyObservation := "GIẢM RỘNG ĐANG HÌNH THÀNH · XÁC NHẬN " + str.tostring(bondEngineRun) + "/" + str.tostring(CONFIRM_N)
+    else if bondEngineState == ENV_HEAT and bondEngineRun < CONFIRM_N
+        bondEarlyObservation := "TĂNG RỘNG ĐANG HÌNH THÀNH · XÁC NHẬN " + str.tostring(bondEngineRun) + "/" + str.tostring(CONFIRM_N)
+    else if bondEngineState == ENV_LOCAL_COOL or (bondEngineDown20 > 0 and bondEngineDown20 < 4)
+        bondEarlyObservation := "GIẢM ĐANG HÌNH THÀNH · TUẦN ↓" + str.tostring(bondEngineDown5) + "/6 · THÁNG ↓" + str.tostring(bondEngineDown20) + "/6"
+    else if bondEngineState == ENV_LOCAL_HEAT or (bondEngineUp20 > 0 and bondEngineUp20 < 4)
+        bondEarlyObservation := "TĂNG ĐANG HÌNH THÀNH · TUẦN ↑" + str.tostring(bondEngineUp5) + "/6 · THÁNG ↑" + str.tostring(bondEngineUp20) + "/6"
+    else if bondEngineState == ENV_MIXED
+        bondEarlyObservation := "PHÂN HÓA ĐANG DIỄN RA · CHƯA CÓ HƯỚNG RỘNG"
+
+//============================ 06. LIQUIDITY ENGINE OUTPUT ======================
+// Liquidity Engine owns IB/policy/gap only. No Bond state is allowed in this contract.
+bool liquidityEngineUsable = liquidityUsable
+int liquidityEngineIBAsOf = ibLeg.goodKey
+int liquidityEnginePolicyAsOf = policyLeg.goodKey
+float liquidityEngineIB = ibLeg.good
+float liquidityEnginePolicy = policyLeg.good
+float liquidityEngineGap = gapNow
+float liquidityEngineRank = pGap
+int liquidityEngineState = liquidityState
+int liquidityEngineLagDays = ibAge
+string liquidityEngineQuality = liquidityUsable ? "READY" : ibQuality
+
+float liquidityIBChange5 = f_delta(liqEventIBHist, 5)
+float liquidityIBChange20 = f_delta(liqEventIBHist, 20)
+float liquidityPolicyChange5 = f_delta(liqEventPolicyHist, 5)
+float liquidityPolicyChange20 = f_delta(liqEventPolicyHist, 20)
+float liquidityGapChange5 = f_delta(liqEventGapHist, 5)
+float liquidityGapChange20 = f_delta(liqEventGapHist, 20)
+string liquidityGapDriver5 = f_gap_driver(liquidityIBChange5, liquidityPolicyChange5, liquidityGapChange5)
+string liquidityGapDriver20 = f_gap_driver(liquidityIBChange20, liquidityPolicyChange20, liquidityGapChange20)
+string liquidityIBTrend = f_liq_market_trend(liquidityIBChange5, liquidityIBChange20)
+string liquidityGapStateLabel = liquidityEngineUsable ? f_liq_label(liquidityEngineState) : "SNAPSHOT THAM CHIẾU"
+
+int liquidityWindowEnd = array.size(liqEventDateHist) >= 1 ? f_tail_int(liqEventDateHist, 0) : na
+int liquidityWindow5Start = array.size(liqEventDateHist) >= 6 ? f_tail_int(liqEventDateHist, 5) : na
+int liquidityWindow20Start = array.size(liqEventDateHist) >= 21 ? f_tail_int(liqEventDateHist, 20) : na
+[liquidityIBLow5, liquidityIBHigh5, liquidityIBRange5] = f_recent_range(liqEventIBHist, 6)
+[liquidityIBLow20, liquidityIBHigh20, liquidityIBRange20] = f_recent_range(liqEventIBHist, 21)
+[liquidityGapLow5, liquidityGapHigh5, liquidityGapRange5] = f_recent_range(liqEventGapHist, 6)
+[liquidityGapLow20, liquidityGapHigh20, liquidityGapRange20] = f_recent_range(liqEventGapHist, 21)
+
+//============================ 07. TRANSMISSION ENGINE ==========================
+// Read-only late fusion. This section may read both engine outputs, but must never
+// mutate Bond Engine or Liquidity Engine state. No combined numeric score is created.
+int transmissionState = TX_UNKNOWN
+bool transmissionReady = false
+string transmissionMessage = "CHƯA ĐỐI CHIẾU"
+string transmissionInsight = ""
+int transmissionWindowStart = na
+int transmissionWindowEnd = na
+int transmissionBondDown = 0
+int transmissionBondUp = 0
+int transmissionBondValidN = 0
+float transmissionLiquidityMove = na
+int transmissionMaxLagDays = 0
+string transmissionAlignmentLabel = "N/A"
+string transmissionBondDirection = "N/A"
+string transmissionGapDriver = liquidityGapDriver5
+
+// Persist the most recent valid late-fusion result so a stale current source does not
+// erase useful historical context. It is explicitly historical, never current state.
+var int lastValidTransmissionAsOf = na
+var int lastValidTransmissionStart = na
+var int lastValidTransmissionEnd = na
+var string lastValidTransmissionMessage = "NONE"
+var string lastValidTransmissionAlignment = "N/A"
+var string lastValidTransmissionBondDirection = "N/A"
+var string lastValidTransmissionGapDriver = "N/A"
+var int lastValidTransmissionBondDown = 0
+var int lastValidTransmissionBondUp = 0
+var float lastValidTransmissionLiquidityMove = na
+
+if not bondEngineUsable
+    transmissionState := TX_BOND_UNAVAILABLE
+    transmissionMessage := "CHƯA ĐỐI CHIẾU · BOND CHƯA SẴN SÀNG"
+else if not liquidityEngineUsable
+    transmissionState := TX_LIQUIDITY_UNAVAILABLE
+    transmissionMessage := "CHƯA ĐỐI CHIẾU · THANH KHOẢN CHƯA SẴN SÀNG"
+else if array.size(liqEventDateHist) < 6
+    transmissionState := TX_HISTORY_LOW
+    transmissionMessage := "CHƯA ĐỐI CHIẾU · CHƯA ĐỦ LỊCH SỬ"
+else
+    transmissionWindowStart := f_tail_int(liqEventDateHist, 5)
+    transmissionWindowEnd := f_tail_int(liqEventDateHist, 0)
+    bool transmissionWindowOK = not na(transmissionWindowStart) and not na(transmissionWindowEnd) and transmissionWindowEnd > transmissionWindowStart
+    if transmissionWindowOK
+        for j = 0 to 5
+            Leg transmissionLeg = array.get(legs, j)
+            [txStartV, txStartD] = f_value_at_or_before_date(transmissionLeg.hist, clockHist, transmissionWindowStart)
+            [txEndV, txEndD] = f_value_at_or_before_date(transmissionLeg.hist, clockHist, transmissionWindowEnd)
+            int txStartLag = f_age(transmissionWindowStart, txStartD)
+            int txEndLag = f_age(transmissionWindowEnd, txEndD)
+            bool txDatesOK = not na(txStartV) and not na(txEndV) and not na(txStartD) and not na(txEndD) and not na(txStartLag) and not na(txEndLag) and txStartLag >= 0 and txStartLag <= MAX_IB_LAG_DAYS and txEndLag >= 0 and txEndLag <= MAX_IB_LAG_DAYS
+            if txDatesOK
+                float txMoveBP = 100.0 * (txEndV - txStartV)
+                transmissionBondDown += txMoveBP <= -minMove5 ? 1 : 0
+                transmissionBondUp += txMoveBP >= minMove5 ? 1 : 0
+                transmissionBondValidN += 1
+                transmissionMaxLagDays := math.max(transmissionMaxLagDays, math.max(txStartLag, txEndLag))
+    transmissionLiquidityMove := liquidityGapChange5
+    transmissionBondDirection := f_tx_bond_state(transmissionBondDown, transmissionBondUp)
+    transmissionAlignmentLabel := transmissionBondValidN == 6 ? (transmissionMaxLagDays == 0 ? "EXACT" : "AS-OF ≤" + str.tostring(transmissionMaxLagDays) + "D") : "UNAVAILABLE"
+    if transmissionWindowOK and transmissionBondValidN == 6 and not na(transmissionLiquidityMove)
+        transmissionState := TX_READY
+        transmissionReady := true
+        int txLiqDir = transmissionLiquidityMove <= -LIQ_MOVE_BP ? -1 : transmissionLiquidityMove >= LIQ_MOVE_BP ? 1 : 0
+        bool ibActuallyDown = not na(liquidityIBChange5) and liquidityIBChange5 <= -LIQ_MOVE_BP
+        bool ibActuallyUp = not na(liquidityIBChange5) and liquidityIBChange5 >= LIQ_MOVE_BP
+        if txLiqDir == -1
+            if transmissionBondDirection == "BOND GIẢM RỘNG"
+                transmissionMessage := ibActuallyDown ? "ĐỒNG THUẬN HẠ NHIỆT" : "GAP THU HẸP · BOND GIẢM RỘNG"
+            else if transmissionBondDirection == "BOND TĂNG RỘNG"
+                transmissionMessage := "PHÂN KỲ NGƯỢC CHIỀU · GAP THU HẸP / BOND TĂNG RỘNG"
+                transmissionInsight := "Hai thị trường đi ngược chiều trong cùng cửa sổ; cần nghiên cứu thêm, không suy ra nhân quả."
+            else if transmissionBondDirection == "BOND PHÂN HÓA"
+                transmissionMessage := "GAP THU HẸP · BOND PHÂN HÓA"
+            else if transmissionBondDirection == "BOND GIẢM CỤC BỘ"
+                transmissionMessage := "GAP THU HẸP · BOND HẠ CỤC BỘ"
+            else if transmissionBondDirection == "BOND TĂNG CỤC BỘ"
+                transmissionMessage := "PHÂN KỲ CỤC BỘ · GAP THU HẸP / BOND TĂNG CỤC BỘ"
+            else
+                transmissionMessage := ibActuallyDown ? "ÁP LỰC LNH DỊU · BOND CHƯA THEO" : "GAP THU HẸP · BOND CHƯA THEO"
+        else if txLiqDir == 1
+            if transmissionBondDirection == "BOND TĂNG RỘNG"
+                transmissionMessage := ibActuallyUp ? "ÁP LỰC ĐỒNG THUẬN" : "GAP MỞ RỘNG · BOND TĂNG RỘNG"
+            else if transmissionBondDirection == "BOND GIẢM RỘNG"
+                transmissionMessage := "PHÂN KỲ NGƯỢC CHIỀU · GAP MỞ RỘNG / BOND GIẢM RỘNG"
+                transmissionInsight := "Hai thị trường đi ngược chiều trong cùng cửa sổ; cần nghiên cứu thêm, không suy ra nhân quả."
+            else if transmissionBondDirection == "BOND PHÂN HÓA"
+                transmissionMessage := "GAP MỞ RỘNG · BOND PHÂN HÓA"
+            else if transmissionBondDirection == "BOND TĂNG CỤC BỘ"
+                transmissionMessage := "GAP MỞ RỘNG · BOND TĂNG CỤC BỘ"
+            else if transmissionBondDirection == "BOND GIẢM CỤC BỘ"
+                transmissionMessage := "PHÂN KỲ CỤC BỘ · GAP MỞ RỘNG / BOND GIẢM CỤC BỘ"
+            else
+                transmissionMessage := ibActuallyUp ? "ÁP LỰC LNH TĂNG · BOND CHƯA THEO" : "GAP MỞ RỘNG · BOND CHƯA THEO"
+        else
+            if transmissionBondDirection == "BOND GIẢM RỘNG"
+                transmissionMessage := "BOND DẪN HẠ NHIỆT · GAP ÍT ĐỔI"
+            else if transmissionBondDirection == "BOND TĂNG RỘNG"
+                transmissionMessage := "BOND DẪN TĂNG ÁP LỰC · GAP ÍT ĐỔI"
+            else if transmissionBondDirection == "BOND PHÂN HÓA"
+                transmissionMessage := "BOND PHÂN HÓA · GAP ÍT ĐỔI"
+            else if transmissionBondDirection == "BOND GIẢM CỤC BỘ"
+                transmissionMessage := "BOND HẠ CỤC BỘ · GAP ÍT ĐỔI"
+            else if transmissionBondDirection == "BOND TĂNG CỤC BỘ"
+                transmissionMessage := "BOND TĂNG CỤC BỘ · GAP ÍT ĐỔI"
+            else
+                transmissionMessage := "HAI THỊ TRƯỜNG ÍT THAY ĐỔI"
+    else
+        transmissionState := TX_ALIGNMENT_FAIL
+        transmissionMessage := "CHƯA ĐỐI CHIẾU · CHƯA ĐỦ ĐỒNG BỘ"
+
+if transmissionReady and not na(transmissionWindowEnd) and (na(lastValidTransmissionAsOf) or transmissionWindowEnd > lastValidTransmissionAsOf)
+    lastValidTransmissionAsOf := transmissionWindowEnd
+    lastValidTransmissionStart := transmissionWindowStart
+    lastValidTransmissionEnd := transmissionWindowEnd
+    lastValidTransmissionMessage := transmissionMessage
+    lastValidTransmissionAlignment := transmissionAlignmentLabel
+    lastValidTransmissionBondDirection := transmissionBondDirection
+    lastValidTransmissionGapDriver := transmissionGapDriver
+    lastValidTransmissionBondDown := transmissionBondDown
+    lastValidTransmissionBondUp := transmissionBondUp
+    lastValidTransmissionLiquidityMove := transmissionLiquidityMove
+
+// Research triggers tell the AI what external evidence would be useful to investigate.
+// They are questions/search directions, never causal conclusions.
+string researchTrigger = "NONE · KHÔNG CÓ TRIGGER NỔI BẬT"
+float researchShort20 = array.size(group20) >= 1 ? array.get(group20, 0) : na
+float researchLong20 = array.size(group20) >= 3 ? array.get(group20, 2) : na
+if transmissionReady and str.contains(transmissionMessage, "PHÂN KỲ")
+    researchTrigger := "CROSS-MARKET DIVERGENCE → CHECK FLOWS / BOND SUPPLY-DEMAND / MONEY-MARKET CONDITIONS"
+else if bondEngineUsable and not na(researchLong20) and researchLong20 >= minMove20 and (na(researchShort20) or researchShort20 < minMove20)
+    researchTrigger := "LONG-END RISING → CHECK AUCTION / ISSUANCE / INFLATION / FX CONTEXT"
+else if liquidityEngineUsable and not na(liquidityEngineRank) and liquidityEngineRank >= 70 and str.contains(liquidityIBTrend, "TĂNG")
+    researchTrigger := "IB + GAP ELEVATED → CHECK OMO / SYSTEM LIQUIDITY / FUNDING CONDITIONS"
+else if bondEngineUsable and bondEngineDown20 >= 4 and (na(liquidityIBChange20) or liquidityIBChange20 > -LIQ_MOVE_BP)
+    researchTrigger := "BOND COOLING / IB STICKY → CHECK DEPOSIT-LENDING TRANSMISSION / CREDIT CONDITIONS"
+
+// Backward-compatible descriptive alias for alerts/exports only.
+concordance := transmissionMessage
+alignedWindowStart := transmissionWindowStart
+alignedWindowEnd := transmissionWindowEnd
+alignedBondDown := transmissionBondDown
+alignedBondUp := transmissionBondUp
+alignedBondValidN := transmissionBondValidN
+
+//============================ 08. CLOSED-OBSERVATION ALERTS =====================
+alertcondition(eventCool, "V3: Hạ nhiệt diện rộng đã xác nhận", "VN YieldCurveLab 3.4: hạ nhiệt diện rộng đã vượt điều kiện 5/20 phiên và độ bền 3 phiên. Không phải dự báo.")
+alertcondition(eventHeat, "V3: Lợi suất tăng rộng đã xác nhận", "VN YieldCurveLab 3.4: lợi suất tăng trên diện rộng; quan sát đã chốt, không phải lệnh giao dịch.")
+alertcondition(eventLiquidity, "V3: Thanh khoản căng trở lại", "VN YieldCurveLab 3.4: chênh lệch liên ngân hàng - chính sách trở lại vùng căng so với lịch sử.")
+alertcondition(eventData, "V3: Bond chờ cập nhật", "VN YieldCurveLab 3.4: cohort Bond mới chưa đủ tin cậy; Bond Engine giữ snapshot cũ và không xác nhận diễn biến mới.")
+alertcondition(eventRecovery, "V3: Bond cập nhật lại", "VN YieldCurveLab 3.4: Bond Engine đã nhận lại cohort hợp lệ. Đây là cập nhật dữ liệu, không phải tín hiệu kinh tế hồi phục.")
+if enableReportAlert and commit and (eventCool or eventHeat or eventLiquidity or eventData or eventRecovery)
+    string liqAlertState = liquidityEngineUsable ? f_liq_label(liquidityEngineState) : "LIQ STALE/NA"
+    string alertMsg = "VN YieldCurveLab " + VERSION + " | Bond " + f_date(bondEngineAsOf) + " " + f_env_label(bondEngineConfirmedState) + " | Liq " + f_date(liquidityEngineIBAsOf) + " " + liqAlertState + " | Transmission " + transmissionMessage + " | Quan sát, không dự báo."
+    alert(alertMsg, alert.freq_once_per_bar_close)
+
+//============================ 09. UNIT-SEPARATED CHARTS =========================
+bool rateView = graphMode == "Lợi suất (%)"
+bool deltaView = graphMode == "Thay đổi 20 phiên (bp)"
+bool scoreView = graphMode == "Áp lực tương đối (0–100)"
+// Official lines hold the last accepted value; an explicit HOLD banner identifies gaps.
+// The underlying calculation history receives NA, not a repeated imputed observation.
+plot(rateView ? (previewLines ? r1 : f_good(legs, 0)) : na, "1Y (%)", color.new(color.gray, 20), 1, display = rateView ? display.all : display.none)
+plot(rateView ? (previewLines ? r2 : f_good(legs, 1)) : na, "2Y (%)", color.blue, 2, display = rateView ? display.all : display.none)
+plot(rateView ? (previewLines ? r3 : f_good(legs, 2)) : na, "3Y (%)", color.orange, 1, display = rateView ? display.all : display.none)
+plot(rateView ? (previewLines ? r5 : f_good(legs, 3)) : na, "5Y (%)", color.green, 2, display = rateView ? display.all : display.none)
+plot(rateView ? (previewLines ? r7 : f_good(legs, 4)) : na, "7Y (%)", color.purple, 1, display = rateView ? display.all : display.none)
+plot(rateView ? (previewLines ? r10 : f_good(legs, 5)) : na, "10Y (%)", color.red, 2, display = rateView ? display.all : display.none)
+plot(rateView and showMoneyLines ? (previewLines ? ri : f_good(legs, 6)) : na, "Liên ngân hàng (%)", color.yellow, 1, display = rateView ? display.all : display.none)
+plot(rateView and showMoneyLines ? (previewLines ? rp : f_good(legs, 7)) : na, "Chính sách tham chiếu (%)", color.teal, 1, display = rateView ? display.all : display.none)
+plot(deltaView and curveAccepted ? array.get(group20, 0) : na, "Ngắn 1Y–2Y: thay đổi tháng (bp)", color.blue, 2, plot.style_linebr, display = deltaView ? display.all : display.none)
+plot(deltaView and curveAccepted ? array.get(group20, 1) : na, "Trung 3Y–5Y: thay đổi tháng (bp)", color.orange, 2, plot.style_linebr, display = deltaView ? display.all : display.none)
+plot(deltaView and curveAccepted ? array.get(group20, 2) : na, "Dài 7Y–10Y: thay đổi tháng (bp)", color.purple, 2, plot.style_linebr, display = deltaView ? display.all : display.none)
+plot(deltaView ? 0.0 : na, "Mốc không đổi", color.new(color.gray, 60), 1, display = deltaView ? display.all : display.none)
+plot(scoreView and curveAccepted ? relativePressure : na, "Áp lực tương đối (0–100)", color.orange, 2, plot.style_linebr, display = scoreView ? display.all : display.none)
+plot(scoreView and curveAccepted ? pLevel : na, "Mặt bằng so với 1 năm (0–100)", color.red, 1, plot.style_linebr, display = scoreView ? display.all : display.none)
+plot(scoreView and curveAccepted ? pLong : na, "Mặt bằng so với 3 năm (0–100)", color.purple, 1, plot.style_linebr, display = scoreView ? display.all : display.none)
+plot(scoreView ? 0.0 : na, "Mốc 0", color.new(color.gray, 85), 1, display = scoreView ? display.all : display.none)
+plot(scoreView ? 100.0 : na, "Mốc 100", color.new(color.gray, 85), 1, display = scoreView ? display.all : display.none)
+bgcolor(not curveAccepted and not na(lastCurveKey) ? color.new(color.orange, 93) : na, title = "Đang dùng số liệu cũ")
+// Numeric export fields, separate from visible line units.
+plot(curveAccepted ? levelNow : na, "EXPORT CoreLevel_pct", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? slopeNow * 100.0 : na, "EXPORT Slope10Y2Y_bp", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? bellyNow : na, "EXPORT Belly5Y_bp", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? relativePressure : na, "EXPORT RelativePressure", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? movementComponent : na, "EXPORT PressureChange20_value_component", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? referenceComponent : na, "EXPORT PressureChange20_reference_component", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? down20 : na, "EXPORT BreadthDown20_count6", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? up20 : na, "EXPORT BreadthUp20_count6", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? environmentConfirmed : na, "EXPORT EnvironmentConfirmed_code", display = showResearchExports ? display.data_window : display.none)
+plot(liquidityUsable ? gapNow : na, "EXPORT LiquidityGap_pp", display = showResearchExports ? display.data_window : display.none)
+plot(liquidityUsable ? pGap : na, "EXPORT LiquidityRank", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? 1 : 0, "EXPORT CurveAccepted_flag", display = showResearchExports ? display.data_window : display.none)
+plot(bondEngineUsable ? 1 : 0, "EXPORT BondEngineUsable_flag", display = showResearchExports ? display.data_window : display.none)
+plot(liquidityEngineUsable ? 1 : 0, "EXPORT LiquidityEngineUsable_flag", display = showResearchExports ? display.data_window : display.none)
+plot(transmissionState, "EXPORT TransmissionState_code", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? pLevel : na, "EXPORT LevelRank252", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? pSlope : na, "EXPORT SlopeRank252", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? pBelly : na, "EXPORT BellyRank252", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? pLong : na, "EXPORT LevelRank756", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? array.get(group60, 0) : na, "EXPORT ShortGroup60_bp", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? array.get(group60, 1) : na, "EXPORT MidGroup60_bp", display = showResearchExports ? display.data_window : display.none)
+plot(curveAccepted ? array.get(group60, 2) : na, "EXPORT LongGroup60_bp", display = showResearchExports ? display.data_window : display.none)
+plot(liquidityEngineUsable ? liquidityIBChange20 : na, "EXPORT LiquidityIBChange20_bp", display = showResearchExports ? display.data_window : display.none)
+plot(liquidityEngineUsable ? liquidityGapChange20 : na, "EXPORT LiquidityGapChange20_bp", display = showResearchExports ? display.data_window : display.none)
+plot(liquidityIBRange20 * 100.0, "EXPORT LiquidityIBRange20_bp", display = showResearchExports ? display.data_window : display.none)
+plot(transmissionReady ? transmissionMaxLagDays : na, "EXPORT TransmissionMaxLag_days", display = showResearchExports ? display.data_window : display.none)
+plot(not na(lastValidTransmissionAsOf) ? 1 : 0, "EXPORT LastValidTransmission_flag", display = showResearchExports ? display.data_window : display.none)
+
+// Live anomaly diagnostics never mutate the closed-snapshot ledger.
+int previewJumpCount = 0
+if barstate.islast
+    for j = 0 to 5
+        float liveV = array.get(rawValues, j)
+        float acceptedV = f_good(legs, j)
+        float thresholdV = array.get(currentThresholds, j)
+        float minimumV = na(thresholdV) ? jumpFloor : math.max(jumpFloor, thresholdV)
+        if not na(liveV) and not na(acceptedV) and math.abs(liveV - acceptedV) * 100.0 > minimumV
+            previewJumpCount += 1
+
+//============================ 10. RESULTS DISPLAY =============================
+// Presentation only. Bond and Liquidity are displayed independently; Transmission is late fusion.
+color UI_TITLE = color.rgb(19, 31, 45)
+color UI_HEAD = color.rgb(36, 49, 63)
+color UI_A = color.rgb(25, 32, 42)
+color UI_B = color.rgb(30, 38, 49)
+color UI_MUTED = color.rgb(161, 174, 189)
+color UI_TEXT = color.rgb(237, 242, 247)
+color UI_UP = color.rgb(250, 151, 136)
+color UI_DOWN = color.rgb(102, 220, 179)
+color UI_WARN_TEXT = color.rgb(250, 207, 122)
+color UI_HIGH_BG = color.rgb(111, 44, 48)
+color UI_LOW_BG = color.rgb(24, 83, 67)
+color UI_WARN_BG = color.rgb(98, 70, 28)
+// V3.4 evidence zones: high information density, explicit market separation.
+color UI_BOND_HEAD = color.rgb(30, 57, 78)
+color UI_BOND_ZONE = color.rgb(23, 36, 49)
+color UI_BOND_ALT = color.rgb(27, 42, 56)
+color UI_LIQ_HEAD = color.rgb(82, 63, 28)
+color UI_LIQ_ZONE = color.rgb(49, 41, 28)
+color UI_LIQ_ALT = color.rgb(57, 47, 30)
+color UI_TX_HEAD = color.rgb(57, 45, 78)
+color UI_TX_ZONE = color.rgb(42, 34, 58)
+color UI_SPACER = color.new(color.black, 100)
+string uiFont = fontChoice == "Vừa" ? size.normal : fontChoice == "Rất nhỏ" ? size.tiny : size.small
+string uiTitleFont = fontChoice == "Vừa" ? size.large : size.normal
+string uiPosition = cornerChoice == "Trái" ? position.top_left : position.top_right
+int uiCols = panel == 1 ? 9 : panel == 2 ? 6 : 4
+int uiRows = panel == 1 ? 25 : panel == 2 ? 17 : 19
+var table dashboard = table.new(uiPosition, uiCols, uiRows, bgcolor = color.new(UI_A, 100), frame_color = UI_HEAD, frame_width = 1, border_width = 0)
+
+f_ui_bond_headline(bool hasSnapshot, bool accepted, int state, int run, float levelRank) =>
+    string msg = "CHƯA ĐỦ DỮ LIỆU ĐỂ ĐỌC BOND"
+    if hasSnapshot and not accepted
+        msg := "ĐANG DÙNG SỐ BOND CŨ · CHỜ CẬP NHẬT"
+    else if accepted
+        if state == ENV_COOL
+            msg := run >= CONFIRM_N ? "HẠ NHIỆT DIỆN RỘNG ĐÃ XÁC NHẬN" : "CÓ NHỊP GIẢM RỘNG · CHƯA XÁC NHẬN"
+        else if state == ENV_HEAT
+            msg := run >= CONFIRM_N ? "LỢI SUẤT ĐANG TĂNG TRÊN DIỆN RỘNG" : "LỢI SUẤT TĂNG RỘNG · CHỜ XÁC NHẬN"
+        else if state == ENV_LOCAL_COOL
+            msg := "HẠ NHIỆT CỤC BỘ · CHƯA LAN RỘNG"
+        else if state == ENV_LOCAL_HEAT
+            msg := "MỘT SỐ KỲ HẠN ĐANG TĂNG"
+        else if state == ENV_MIXED
+            msg := "CÁC KỲ HẠN ĐANG PHÂN HÓA"
+        else if state == ENV_UNKNOWN
+            msg := "CHƯA ĐỦ LỊCH SỬ ĐỂ ĐÁNH GIÁ BOND"
+        else
+            msg := not na(levelRank) and levelRank >= 80.0 ? "MẶT BẰNG CAO · CHƯA HẠ NHIỆT RỘNG" : not na(levelRank) and levelRank <= 20.0 ? "MẶT BẰNG THẤP · CHƯA CÓ XU HƯỚNG RỘNG" : "CHƯA CÓ XU HƯỚNG TRÊN DIỆN RỘNG"
+    msg
+
+f_ui_bond_status(bool hasSnapshot, bool accepted, bool closed, bool preview, int liveJumps) =>
+    string msg = "CHỜ DỮ LIỆU"
+    if hasSnapshot and not accepted
+        msg := "SỐ CŨ · CHƯA CÓ KẾT LUẬN MỚI"
+    else if accepted
+        msg := "ĐÃ CẬP NHẬT"
+        if not closed
+            msg := "DÙNG PHIÊN ĐÃ CHỐT"
+        if preview
+            msg := "BẢNG DÙNG PHIÊN ĐÃ CHỐT"
+        if liveJumps > 0
+            msg := "GIÁ LIVE BẤT THƯỜNG · GIỮ SNAPSHOT"
+    msg
+
+f_ui_liq(int state, bool usable) =>
+    string msg = "CHƯA THỂ CẬP NHẬT"
+    if usable
+        msg := state == -1 ? "BỚT CĂNG" : state == 0 ? "BÌNH THƯỜNG" : state == 1 ? "CĂNG" : "CHƯA ĐỦ LỊCH SỬ"
+    msg
+
+f_ui_liq_source_status(float ibValue, int sourceAge, int policySourceAge, bool usable) =>
+    string msg = "KHÔNG CÓ DỮ LIỆU LNH"
+    if not na(ibValue)
+        if usable
+            msg := sourceAge > 0 ? "HỢP LỆ · LỆCH " + str.tostring(sourceAge) + " NGÀY" : "ĐÃ CẬP NHẬT"
+        else if not na(sourceAge) and sourceAge > MAX_IB_LAG_DAYS
+            msg := "NGUỒN TRỄ " + str.tostring(sourceAge) + " NGÀY"
+        else if not na(policySourceAge) and policySourceAge > maxPolicyAge
+            msg := "NGUỒN CHÍNH SÁCH TRỄ"
+        else
+            msg := "ĐANG KIỂM TRA NGUỒN"
+    msg
+
+f_ui_liquidity_status(int state, bool usable, float ibValue, int sourceAge, int policySourceAge) =>
+    usable ? f_ui_liq(state, true) : f_ui_liq_source_status(ibValue, sourceAge, policySourceAge, false)
+
+f_ui_ib_lag_note(int sourceAge) =>
+    string msg = ""
+    if not na(sourceAge) and sourceAge > 0
+        msg := sourceAge <= MAX_IB_LAG_DAYS ? " · lệch " + str.tostring(sourceAge) + " ngày" : " · trễ " + str.tostring(sourceAge) + " ngày"
+    msg
+
+f_ui_coherence(string state) =>
+    state == "COHERENT" ? "NHẤT QUÁN" : state == "DISPERSED" ? "PHÂN TÁN" : state == "MIXED" ? "CHƯA ĐỒNG ĐỀU" : "CHƯA ĐỦ LỊCH SỬ"
+
+f_ui_group(int state, int run, bool accepted) =>
+    string msg = "CHƯA ĐỦ DỮ LIỆU"
+    if not accepted
+        msg := "SỐ LIỆU CŨ"
+    else if state == ENV_COOL
+        msg := run >= CONFIRM_N ? "GIẢM ĐÃ XÁC NHẬN" : "GIẢM · CHỜ XÁC NHẬN"
+    else if state == ENV_HEAT
+        msg := run >= CONFIRM_N ? "ĐANG TĂNG" : "TĂNG · CHỜ XÁC NHẬN"
+    else if state == ENV_LOCAL_COOL
+        msg := "GIẢM THÁNG; TUẦN CHƯA THEO"
+    else if state == ENV_LOCAL_HEAT
+        msg := "TĂNG THÁNG; TUẦN CHƯA THEO"
+    else if state == ENV_STABLE
+        msg := "CHƯA CÓ XU HƯỚNG"
+    msg
+
+f_ui_bond_insight(string internalMessage, bool accepted) =>
+    string msg = ""
+    if accepted
+        if internalMessage == "SCORE GIẢM CHỦ YẾU DO MỐC SO SÁNH; CHƯA PHẢI LÃI SUẤT GIẢM"
+            msg := "Điểm áp lực hạ, nhưng lợi suất chưa giảm rõ."
+        else if internalMessage == "DỐC LÊN CHỦ YẾU DO 10Y TĂNG, KHÔNG DO 2Y HẠ"
+            msg := "Độ dốc tăng do 10Y tăng; 2Y chưa giảm."
+    msg
+
+f_ui_shape(string internalShape) =>
+    string msg = "Chưa đủ dữ liệu về hình dạng."
+    if internalShape == "BULL STEEPENING"
+        msg := "Hai đầu cùng giảm; 2Y giảm nhanh hơn."
+    else if internalShape == "BULL FLATTENING"
+        msg := "Hai đầu cùng giảm; 10Y giảm nhanh hơn."
+    else if internalShape == "BEAR STEEPENING"
+        msg := "Hai đầu cùng tăng; 10Y tăng nhanh hơn."
+    else if internalShape == "BEAR FLATTENING"
+        msg := "Hai đầu cùng tăng; 2Y tăng nhanh hơn."
+    else if internalShape == "GIẢM SONG SONG"
+        msg := "Hai đầu cùng giảm với mức tương tự."
+    else if internalShape == "TĂNG SONG SONG"
+        msg := "Hai đầu cùng tăng với mức tương tự."
+    else if internalShape == "XOẮN / NGƯỢC CHIỀU"
+        msg := "2Y và 10Y đang đi ngược chiều."
+    else if internalShape == "GIẢM MỘT ĐẦU"
+        msg := "Một đầu giảm; đầu còn lại ít thay đổi."
+    else if internalShape == "TĂNG MỘT ĐẦU"
+        msg := "Một đầu tăng; đầu còn lại ít thay đổi."
+    else if internalShape == "BIẾN ĐỘNG NHỎ"
+        msg := "Hai đầu ít thay đổi."
+    msg
+
+f_ui_num(float value, string fmt) =>
+    na(value) ? "—" : str.replace_all(str.tostring(value, fmt), ".", ",")
+
+f_ui_rate(float value) =>
+    na(value) ? "—" : f_ui_num(value, "0.00") + "%"
+
+f_ui_signed(float value) =>
+    na(value) ? "—" : (value > 0.049999 ? "+" : "") + f_ui_num(math.abs(value) < 0.05 ? 0.0 : value, "0.0")
+
+f_ui_move_color(float value, float noise, bool valid) =>
+    not valid or na(value) ? UI_MUTED : value >= noise ? UI_UP : value <= -noise ? UI_DOWN : UI_TEXT
+
+f_ui_level_color(float value, bool valid) =>
+    not valid or na(value) ? UI_HEAD : value >= 80.0 ? UI_HIGH_BG : value <= 20.0 ? UI_LOW_BG : UI_HEAD
+
+f_ui_level_label(float value) =>
+    na(value) ? "CHƯA ĐỦ LỊCH SỬ" : value >= 80.0 ? "CAO" : value <= 20.0 ? "THẤP" : "TRUNG BÌNH"
+
+f_ui_slope_label(float value, float rankValue) =>
+    na(value) ? "CHƯA ĐỦ DỮ LIỆU" : value <= 0 ? "ĐẢO NGƯỢC" : na(rankValue) ? "DƯƠNG" : rankValue <= 20 ? "PHẲNG" : rankValue >= 80 ? "DỐC" : "DỐC VỪA"
+
+f_ui_head_bg(bool valid, int state, int run, float rankValue) =>
+    not valid ? UI_WARN_BG : state == ENV_COOL and run >= CONFIRM_N ? UI_LOW_BG : state == ENV_HEAT and run >= CONFIRM_N ? UI_HIGH_BG : state == ENV_STABLE and not na(rankValue) and rankValue >= 80 ? UI_HIGH_BG : UI_HEAD
+
+f_ui_liq_bg(int state, bool usable) =>
+    not usable or state == 2 ? UI_WARN_BG : state == 1 ? UI_HIGH_BG : state == -1 ? UI_LOW_BG : UI_HEAD
+
+f_ui_tx_bg(int state) =>
+    state == TX_READY ? UI_HEAD : UI_WARN_BG
+
+f_ui_wrap(string msg, int limit) =>
+    string out = ""
+    string line = ""
+    array<string> words = str.split(msg, " ")
+    int n = array.size(words)
+    if n > 0
+        for j = 0 to n - 1
+            string word = array.get(words, j)
+            if str.length(line) > 0 and str.length(line) + 1 + str.length(word) > limit
+                out := out + (str.length(out) > 0 ? "\n" : "") + line
+                line := word
+            else
+                line := line + (str.length(line) > 0 ? " " : "") + word
+    out + (str.length(out) > 0 and str.length(line) > 0 ? "\n" : "") + line
+
+f_ui_cell(table tbl, int col, int row, string content, color bg, color ink, string align, string tip) =>
+    table.cell(tbl, col, row, content, text_color = ink, bgcolor = bg, text_size = uiFont, text_halign = align, tooltip = tip)
+
+f_ui_full(table tbl, int row, string content, color bg, color ink, bool title, string tip) =>
+    table.cell(tbl, 0, row, f_ui_wrap(content, 88), text_color = ink, bgcolor = bg, text_size = title ? uiTitleFont : uiFont, text_halign = text.align_left, tooltip = tip)
+
+// Paint a real empty column between the two market engines on the overview.
+f_ui_spacer_col(table tbl, int firstRow, int lastRow) =>
+    if lastRow >= firstRow
+        for row = firstRow to lastRow
+            table.cell(tbl, 4, row, "", text_color = UI_MUTED, bgcolor = UI_SPACER, text_size = uiFont)
+    true
+
+var array<string> uiNames = array.from("1Y", "2Y", "3Y", "5Y", "7Y", "10Y")
+var array<string> uiGroupNames = array.from("NGẮN 1Y–2Y", "TRUNG 3Y–5Y", "DÀI 7Y–10Y")
+if barstate.isfirst
+    if panel == 1
+        table.merge_cells(dashboard, 0, 0, 8, 0)
+        // Two independent market zones, separated by column 4.
+        for row = 1 to 3
+            table.merge_cells(dashboard, 0, row, 3, row)
+            table.merge_cells(dashboard, 5, row, 8, row)
+        // Evidence rows that are easier for AI to parse as one labeled record.
+        for row = 7 to 17
+            table.merge_cells(dashboard, 0, row, 3, row)
+            table.merge_cells(dashboard, 5, row, 8, row)
+        // Late Fusion, historical context, research trigger and active contract are downstream.
+        for row = 18 to 24
+            table.merge_cells(dashboard, 0, row, 8, row)
+    else if panel == 2
+        table.merge_cells(dashboard, 0, 0, 1, 0)
+        table.merge_cells(dashboard, 2, 0, 5, 0)
+        table.merge_cells(dashboard, 0, 1, 5, 1)
+        table.merge_cells(dashboard, 0, 2, 5, 2)
+        table.merge_cells(dashboard, 0, 14, 5, 14)
+        table.merge_cells(dashboard, 0, 15, 5, 15)
+        table.merge_cells(dashboard, 0, 16, 5, 16)
+    else
+        table.merge_cells(dashboard, 0, 0, 1, 0)
+        table.merge_cells(dashboard, 2, 0, 3, 0)
+        table.merge_cells(dashboard, 0, 1, 3, 1)
+        table.merge_cells(dashboard, 0, 2, 3, 2)
+        table.merge_cells(dashboard, 0, 7, 3, 7)
+        table.merge_cells(dashboard, 0, 9, 3, 9)
+        table.merge_cells(dashboard, 0, 15, 3, 15)
+        table.merge_cells(dashboard, 0, 17, 3, 17)
+        table.merge_cells(dashboard, 0, 18, 3, 18)
+
+if barstate.islast and showTable
+    bool uiHasBondSnapshot = not na(bondEngineAsOf)
+    string uiBondHeadline = f_ui_bond_headline(uiHasBondSnapshot, bondEngineUsable, bondEngineState, bondEngineRun, pLevel)
+    string uiBondStatus = f_ui_bond_status(uiHasBondSnapshot, bondEngineUsable, barstate.isconfirmed, previewLines and rateView, previewJumpCount)
+    string uiLiqSource = f_ui_liq_source_status(liquidityEngineIB, liquidityEngineLagDays, policyAge, liquidityEngineUsable)
+    string uiLiquidityStatus = f_ui_liquidity_status(liquidityEngineState, liquidityEngineUsable, liquidityEngineIB, liquidityEngineLagDays, policyAge)
+    string uiFreshnessLabel = liquidityEngineUsable ? "FRESH" : not na(liquidityEngineLagDays) and liquidityEngineLagDays > MAX_IB_LAG_DAYS ? "STALE" : "CHECK"
+    string uiBondInsight = f_ui_bond_insight(insight, bondEngineUsable)
+    string uiInsight = str.length(transmissionInsight) > 0 ? "TRANSMISSION INSIGHT · " + transmissionInsight : str.length(uiBondInsight) > 0 ? "BOND INSIGHT · " + uiBondInsight : ""
+    float uiIB5 = f_delta(liqEventIBHist, 5)
+    float uiIB20 = f_delta(liqEventIBHist, 20)
+    float uiPolicy5 = f_delta(liqEventPolicyHist, 5)
+    float uiPolicy20 = f_delta(liqEventPolicyHist, 20)
+    string uiTxDetail = ""
+    if transmissionReady
+        uiTxDetail := "Cửa sổ chung " + f_date(transmissionWindowStart) + " → " + f_date(transmissionWindowEnd) + " · Bond ↓" + str.tostring(transmissionBondDown) + "/6 · ↑" + str.tostring(transmissionBondUp) + "/6"
+    else
+        uiTxDetail := transmissionState == TX_BOND_UNAVAILABLE ? "Bond Engine chưa sẵn sàng; không hợp nhất." : transmissionState == TX_LIQUIDITY_UNAVAILABLE ? "Liquidity Engine chưa sẵn sàng; giữ hai kết luận độc lập." : transmissionState == TX_HISTORY_LOW ? "Chưa đủ lịch sử chung để đối chiếu." : transmissionState == TX_ALIGNMENT_FAIL ? "Hai engine chưa căn được cùng cửa sổ thời gian." : "Chưa đủ điều kiện để đối chiếu."
+    color uiInk = bondEngineUsable ? UI_TEXT : UI_MUTED
+    color uiBanner = f_ui_head_bg(bondEngineUsable, bondEngineState, bondEngineRun, pLevel)
+    float uiGapLast = not na(liquidityEngineIB) and not na(liquidityEnginePolicy) ? liquidityEngineIB - liquidityEnginePolicy : na
+    string uiIBLag = f_ui_ib_lag_note(liquidityEngineLagDays)
+    string uiPanelName = panel == 1 ? "TỔNG QUAN" : panel == 2 ? "BOND" : "THANH KHOẢN"
+    string uiHistoryTip = "Cao/thấp so với 252 phiên trước. Không phải xác suất dự báo."
+    string uiChangeTip = "Tuần = 5 phiên; tháng = 20 phiên theo lịch Bond. 1 điểm phần trăm = 100 bp."
+    string uiPressureTip = "Điểm áp lực tương đối 0–100; không phải xác suất."
+    string uiLiqTip = "Thanh khoản là engine độc lập từ LNH + chính sách. LNH lệch 0–5 ngày lịch vẫn hợp lệ as-of; carry-forward không tạo mẫu mới."
+    string uiTxTip = "Transmission chỉ so hai engine khi cùng đủ dữ liệu và căn được cùng khoảng ngày. Không tạo combined score."
+    string uiCoherenceTip = "Nhất quán mô tả độ phân tán chuẩn hóa; không chứng nhận dữ liệu đúng."
+    string uiCloseTip = "Bond và thanh khoản có ngày nguồn riêng. Nguồn có thể được điều chỉnh lại."
+    string uiConfirmedTip = "Xác nhận 3 phiên là độ bền của trạng thái Bond, không phải dự báo."
+    bool uiCoolConfirmed = bondEngineUsable and bondEngineState == ENV_COOL and bondEngineRun >= CONFIRM_N and bondEngineConfirmedState == ENV_COOL
+    string uiCooling = not bondEngineUsable ? "CHƯA CẬP NHẬT" : bondEngineState == ENV_UNKNOWN ? "CHƯA ĐỦ LỊCH SỬ" : uiCoolConfirmed ? "ĐÃ XÁC NHẬN" : "CHƯA XÁC NHẬN"
+    string uiPersistence = "—"
+    if bondEngineUsable and bondEngineState != ENV_UNKNOWN
+        uiPersistence := bondEngineState == ENV_COOL ? "Xác nhận " + str.tostring(math.min(bondEngineRun, CONFIRM_N)) + "/" + str.tostring(CONFIRM_N) : "Duy trì " + str.tostring(bondEngineRun) + " phiên"
+
+    if panel == 1
+        f_ui_full(dashboard, 0, "VN YIELDCURVELAB 3.4 · EVIDENCE EXPANSION · DUAL MARKET ANALYSIS", UI_TITLE, UI_TEXT, true, "Bond và Liquidity được đọc độc lập trước khi Late Fusion.")
+    else
+        int uiTopRightCol = 2
+        f_ui_cell(dashboard, 0, 0, "VN YIELDCURVELAB 3.4", UI_TITLE, UI_TEXT, text.align_left, "Dual Engine + Late Fusion")
+        f_ui_cell(dashboard, uiTopRightCol, 0, uiPanelName, UI_TITLE, UI_MUTED, text.align_right, uiCloseTip)
+        f_ui_full(dashboard, 1, panel == 3 ? "THANH KHOẢN · CHI TIẾT" : "BOND · " + uiBondHeadline, panel == 3 ? UI_HEAD : uiBanner, UI_TEXT, true, panel == 3 ? uiLiqTip : uiConfirmedTip)
+
+    if panel == 1
+        // High information density, explicit visual zoning, minimal semantic redundancy.
+        f_ui_spacer_col(dashboard, 1, 17)
+
+        string uiBondAsOf = "BOND AS-OF · " + f_date(bondEngineAsOf) + " · " + uiBondStatus
+        string uiLiqAsOf = "LIQUIDITY AS-OF · LNH " + f_date(liquidityEngineIBAsOf) + " · Policy " + f_date(liquidityEnginePolicyAsOf)
+        string uiBondRanks = "RANK L/S/B/LONG · " + f_ui_num(pLevel, "0.0") + " / " + f_ui_num(pSlope, "0.0") + " / " + f_ui_num(pBelly, "0.0") + " / " + f_ui_num(pLong, "0.0")
+        string uiPressureDecomp = "PRESSURE Δ1M · VALUE " + f_ui_signed(movementComponent) + " · REF " + f_ui_signed(referenceComponent) + " · TOTAL " + f_ui_signed(pressureChange20)
+        string uiBondWindows = "WINDOWS · 1W " + f_date(bondWindow5Start) + "→" + f_date(bondWindowEnd) + " · 1M " + f_date(bondWindow20Start) + "→" + f_date(bondWindowEnd) + " · 3M " + f_date(bondWindow60Start) + "→" + f_date(bondWindowEnd)
+        string uiBreadthConfirm = "BREADTH / XÁC NHẬN · Tuần ↓" + str.tostring(bondEngineDown5) + "/6 ↑" + str.tostring(bondEngineUp5) + "/6 · Tháng ↓" + str.tostring(bondEngineDown20) + "/6 ↑" + str.tostring(bondEngineUp20) + "/6 · " + f_ui_coherence(bondEngineCoherence) + " · " + uiPersistence
+        string uiLiqEvidence = "EVENT BUFFER · " + str.tostring(array.size(liqEventDateHist)) + " STORED" + (array.size(liqEventDateHist) >= CAP ? " · FULL" : "") + " · RANK GAP " + (na(liquidityEngineRank) ? "—" : f_ui_num(liquidityEngineRank, "0.0") + "/100")
+        string uiLiqState = "IB STATE · " + liquidityIBTrend + " · REL GAP STATE · " + liquidityGapStateLabel
+        string uiGapDriver5 = "GAP DRIVER 5E · " + liquidityGapDriver5 + " · ΔIB " + f_ui_signed(liquidityIBChange5) + " · ΔPolicy " + f_ui_signed(liquidityPolicyChange5) + " · ΔGap " + f_ui_signed(liquidityGapChange5) + " bp"
+        string uiGapDriver20 = "GAP DRIVER 20E · " + liquidityGapDriver20 + " · ΔIB " + f_ui_signed(liquidityIBChange20) + " · ΔPolicy " + f_ui_signed(liquidityPolicyChange20) + " · ΔGap " + f_ui_signed(liquidityGapChange20) + " bp"
+        string uiLiqWindow5 = "5E WINDOW · " + f_date(liquidityWindow5Start) + "→" + f_date(liquidityWindowEnd) + " · IB RANGE " + f_ui_num(liquidityIBRange5 * 100.0, "0.0") + "bp · GAP RANGE " + f_ui_num(liquidityGapRange5 * 100.0, "0.0") + "bp"
+        string uiLiqWindow20 = "20E WINDOW · " + f_date(liquidityWindow20Start) + "→" + f_date(liquidityWindowEnd) + " · IB RANGE " + f_ui_num(liquidityIBRange20 * 100.0, "0.0") + "bp · GAP RANGE " + f_ui_num(liquidityGapRange20 * 100.0, "0.0") + "bp"
+        string uiTxEvidence = transmissionReady ? "CURRENT EVIDENCE · WINDOW " + f_date(transmissionWindowStart) + "→" + f_date(transmissionWindowEnd) + " · ALIGN " + transmissionAlignmentLabel + " · " + transmissionBondDirection + " · GAP Δ " + f_ui_signed(transmissionLiquidityMove) + "bp · " + transmissionGapDriver : "CURRENT EVIDENCE · NOT READY · " + uiTxDetail
+        string uiLastValidTx = na(lastValidTransmissionAsOf) ? "LAST VALID TRANSMISSION · NONE STORED" : "LAST VALID TRANSMISSION · AS-OF " + f_date(lastValidTransmissionAsOf) + " · WINDOW " + f_date(lastValidTransmissionStart) + "→" + f_date(lastValidTransmissionEnd) + " · " + lastValidTransmissionMessage + " · ALIGN " + lastValidTransmissionAlignment + " · " + lastValidTransmissionGapDriver
+        string uiActiveContract = "ACTIVE CONTRACT · 5P ≥" + f_ui_num(minMove5, "0.0") + "bp · 20P ≥" + f_ui_num(minMove20, "0.0") + "bp · CONFIRM " + str.tostring(CONFIRM_N) + " · IB LAG ≤" + str.tostring(MAX_IB_LAG_DAYS) + "d · REF " + str.tostring(REF) + " · LONG " + str.tostring(LONG_REF) + " · LIQ MOVE " + f_ui_num(LIQ_MOVE_BP, "0") + "bp"
+
+        // ① BOND ENGINE — current state plus the evidence needed to audit it.
+        f_ui_cell(dashboard, 0, 1, "① BOND ENGINE — EVIDENCE PACKAGE", UI_BOND_HEAD, UI_TEXT, text.align_left, "Bond Engine không phụ thuộc Liquidity Engine.")
+        f_ui_cell(dashboard, 0, 2, "BOND KẾT LUẬN · " + uiBondHeadline, uiBanner, UI_TEXT, text.align_left, uiConfirmedTip)
+        f_ui_cell(dashboard, 0, 3, uiBondAsOf, UI_BOND_ZONE, bondEngineUsable ? UI_TEXT : UI_WARN_TEXT, text.align_left, uiCloseTip)
+        f_ui_cell(dashboard, 0, 4, "MẶT BẰNG", UI_BOND_ZONE, UI_TEXT, text.align_left, "Trung bình 2Y, 5Y, 10Y.")
+        f_ui_cell(dashboard, 1, 4, f_ui_num(bondEngineLevel, "0.0000") + "%", UI_BOND_ZONE, uiInk, text.align_right, uiHistoryTip)
+        f_ui_cell(dashboard, 2, 4, f_ui_signed(levelChange20) + " bp/1M", UI_BOND_ZONE, f_ui_move_color(levelChange20, minMove20, bondEngineUsable), text.align_right, uiChangeTip)
+        f_ui_cell(dashboard, 3, 4, f_ui_level_label(pLevel), f_ui_level_color(pLevel, bondEngineUsable), uiInk, text.align_center, uiHistoryTip)
+        f_ui_cell(dashboard, 0, 5, "ĐỘ DỐC 10Y–2Y", UI_BOND_ALT, UI_TEXT, text.align_left, uiChangeTip)
+        f_ui_cell(dashboard, 1, 5, f_ui_num(bondEngineSlope, "0.0000") + " đ.%", UI_BOND_ALT, uiInk, text.align_right, "Đơn vị điểm phần trăm.")
+        f_ui_cell(dashboard, 2, 5, f_ui_signed(slopeChange20) + " bp/1M", UI_BOND_ALT, uiInk, text.align_right, f_ui_shape(shape20))
+        f_ui_cell(dashboard, 3, 5, f_ui_slope_label(bondEngineSlope, pSlope), UI_BOND_ALT, uiInk, text.align_center, "Đọc cùng hướng 2Y/10Y.")
+        f_ui_cell(dashboard, 0, 6, "ÁP LỰC", UI_BOND_ZONE, UI_TEXT, text.align_left, uiPressureTip)
+        f_ui_cell(dashboard, 1, 6, f_ui_num(bondEnginePressure, "0.0") + "/100", UI_BOND_ZONE, uiInk, text.align_right, uiPressureTip)
+        f_ui_cell(dashboard, 2, 6, f_ui_signed(pressureChange20) + " điểm/1M", UI_BOND_ZONE, uiInk, text.align_right, uiPressureTip)
+        f_ui_cell(dashboard, 3, 6, f_ui_level_label(bondEnginePressure), f_ui_level_color(bondEnginePressure, bondEngineUsable), uiInk, text.align_center, uiPressureTip)
+        f_ui_cell(dashboard, 0, 7, uiBondRanks, UI_BOND_ALT, uiInk, text.align_left, "Cho phép AI tính lại pressure từ source.")
+        f_ui_cell(dashboard, 0, 8, uiPressureDecomp, UI_BOND_ZONE, uiInk, text.align_left, "VALUE = thay đổi dưới reference cũ; REF = dịch chuyển mốc; TOTAL = tổng thay đổi score.")
+        f_ui_cell(dashboard, 0, 9, uiBondWindows, UI_BOND_ALT, UI_MUTED, text.align_left, uiChangeTip)
+
+        // Six tenor rows: enough evidence to recalculate breadth and locate the leading tenor.
+        for j = 0 to 5
+            int uiRow = 10 + j
+            string tenorName = array.get(uiNames, j)
+            string tenorEvidence = tenorName + " · " + f_ui_num(f_good(legs, j), "0.0000") + "% · 1D bp " + f_ui_signed(array.get(change1, j)) + " · 1W bp " + f_ui_signed(array.get(change5, j)) + " · 1M bp " + f_ui_signed(array.get(change20, j)) + " · 3M bp " + f_ui_signed(array.get(change60, j))
+            f_ui_cell(dashboard, 0, uiRow, tenorEvidence, j % 2 == 0 ? UI_BOND_ZONE : UI_BOND_ALT, uiInk, text.align_left, "Accepted snapshot + 1/5/20/60-slot changes.")
+        f_ui_cell(dashboard, 0, 16, uiBreadthConfirm, UI_BOND_ALT, uiInk, text.align_left, uiConfirmedTip)
+        f_ui_cell(dashboard, 0, 17, "EARLY OBSERVATION · " + bondEarlyObservation, UI_BOND_ZONE, UI_MUTED, text.align_left, "Quan sát ban đầu; không thay thế confirmed state.")
+
+        // ② LIQUIDITY ENGINE — separate market-rate and relative-gap semantics.
+        f_ui_cell(dashboard, 5, 1, "② LIQUIDITY ENGINE — EVIDENCE PACKAGE", UI_LIQ_HEAD, UI_TEXT, text.align_left, "Liquidity Engine dùng LNH + policy với đồng hồ riêng.")
+        f_ui_cell(dashboard, 5, 2, "LIQUIDITY KẾT LUẬN · " + uiLiquidityStatus, f_ui_liq_bg(liquidityEngineState, liquidityEngineUsable), UI_TEXT, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 5, 3, uiLiqAsOf, UI_LIQ_ZONE, UI_TEXT, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 5, 4, "LNH", UI_LIQ_ZONE, UI_TEXT, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 6, 4, f_ui_num(liquidityEngineIB, "0.0000") + "%", UI_LIQ_ZONE, not na(liquidityEngineIB) ? UI_TEXT : UI_MUTED, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 7, 4, "AS-OF", UI_LIQ_ZONE, UI_MUTED, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 8, 4, f_date(liquidityEngineIBAsOf), UI_LIQ_ZONE, UI_TEXT, text.align_center, uiLiqTip)
+        f_ui_cell(dashboard, 5, 5, "CHÍNH SÁCH", UI_LIQ_ALT, UI_TEXT, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 6, 5, f_ui_num(liquidityEnginePolicy, "0.0000") + "%", UI_LIQ_ALT, not na(liquidityEnginePolicy) ? UI_TEXT : UI_MUTED, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 7, 5, "AS-OF", UI_LIQ_ALT, UI_MUTED, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 8, 5, f_date(liquidityEnginePolicyAsOf), UI_LIQ_ALT, UI_TEXT, text.align_center, uiLiqTip)
+        f_ui_cell(dashboard, 5, 6, "GAP LNH–CS", UI_LIQ_ZONE, UI_TEXT, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 6, 6, f_ui_num(uiGapLast, "0.00") + " đ.%", UI_LIQ_ZONE, not na(uiGapLast) ? UI_TEXT : UI_MUTED, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 7, 6, "RANK GAP", UI_LIQ_ZONE, UI_MUTED, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 8, 6, na(liquidityEngineRank) ? "—" : f_ui_num(liquidityEngineRank, "0.0") + "/100", UI_LIQ_ZONE, liquidityEngineUsable ? UI_TEXT : UI_MUTED, text.align_center, uiLiqTip)
+        f_ui_cell(dashboard, 5, 7, uiLiqState, UI_LIQ_ALT, UI_TEXT, text.align_left, "IB level/momentum and relative gap are separate semantics.")
+        f_ui_cell(dashboard, 5, 8, uiGapDriver5, UI_LIQ_ZONE, UI_TEXT, text.align_left, "ΔGap = ΔIB - ΔPolicy; descriptive arithmetic driver.")
+        f_ui_cell(dashboard, 5, 9, uiGapDriver20, UI_LIQ_ALT, UI_TEXT, text.align_left, "ΔGap = ΔIB - ΔPolicy; descriptive arithmetic driver.")
+        f_ui_cell(dashboard, 5, 10, uiLiqWindow5, UI_LIQ_ZONE, UI_MUTED, text.align_left, "6 endpoints define a 5-event change window.")
+        f_ui_cell(dashboard, 5, 11, uiLiqWindow20, UI_LIQ_ALT, UI_MUTED, text.align_left, "21 endpoints define a 20-event change window.")
+        f_ui_cell(dashboard, 5, 12, "FRESHNESS · " + uiFreshnessLabel + " · LAG " + (na(liquidityEngineLagDays) ? "—" : str.tostring(liquidityEngineLagDays) + " ngày"), UI_LIQ_ZONE, liquidityEngineUsable ? UI_TEXT : UI_WARN_TEXT, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 5, 13, "SNAPSHOT · GAP " + f_ui_num(uiGapLast, "0.00") + " đ.% · " + liquidityGapStateLabel, UI_LIQ_ALT, UI_TEXT, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 5, 14, uiLiqEvidence, UI_LIQ_ZONE, UI_MUTED, text.align_left, "Stored buffer, not total lifetime sample size.")
+        f_ui_cell(dashboard, 5, 15, "USAGE · " + (liquidityEngineUsable ? "CURRENT · ELIGIBLE FOR LATE FUSION" : "REFERENCE ONLY · WAIT FOR NEW SOURCE"), UI_LIQ_ALT, UI_MUTED, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 5, 16, "SOURCE META · IB " + ibQuality + " · POLICY " + policyQuality, UI_LIQ_ZONE, UI_MUTED, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 5, 17, "RANGE 20E · IB LOW/HIGH " + f_ui_num(liquidityIBLow20, "0.00") + "/" + f_ui_num(liquidityIBHigh20, "0.00") + "% · GAP LOW/HIGH " + f_ui_num(liquidityGapLow20, "0.00") + "/" + f_ui_num(liquidityGapHigh20, "0.00") + " đ.%", UI_LIQ_ALT, UI_MUTED, text.align_left, "Biên độ quan sát của event ledger.")
+
+        // ③ TRANSMISSION — late fusion is only downstream of two complete engine outputs.
+        f_ui_full(dashboard, 18, "③ TRANSMISSION — LATE FUSION", UI_TX_HEAD, UI_TEXT, false, uiTxTip)
+        f_ui_full(dashboard, 19, transmissionMessage, UI_TX_ZONE, UI_TEXT, true, uiTxTip)
+        f_ui_full(dashboard, 20, uiTxEvidence, UI_TX_ZONE, UI_MUTED, false, uiTxTip)
+        f_ui_full(dashboard, 21, uiLastValidTx, UI_TX_ZONE, UI_MUTED, false, "Historical last-valid snapshot; never current state when present data is stale.")
+        f_ui_full(dashboard, 22, "RESEARCH TRIGGER · " + researchTrigger, UI_TX_ZONE, UI_WARN_TEXT, false, "Search direction only; not a causal conclusion.")
+        f_ui_full(dashboard, 23, uiActiveContract, UI_HEAD, UI_MUTED, false, "Actual runtime thresholds/contract used to generate this screenshot.")
+        f_ui_full(dashboard, 24, str.length(uiInsight) > 0 ? uiInsight : "INTERPRETATION CONTRACT · OBSERVATIONAL · CURRENT ≠ LAST VALID · NO CAUSAL INFERENCE", UI_TX_ZONE, str.length(uiInsight) > 0 ? UI_WARN_TEXT : UI_MUTED, false, "AI/report discipline.")
+
+    else if panel == 2
+        f_ui_full(dashboard, 2, "BOND · " + f_date(bondEngineAsOf) + " · " + uiBondStatus, bondEngineUsable ? UI_A : UI_WARN_BG, bondEngineUsable ? UI_MUTED : UI_WARN_TEXT, false, uiCloseTip)
+        array<string> uiHeaders = array.from("KỲ HẠN", "LỢI SUẤT %", "NGÀY bp", "TUẦN bp", "THÁNG bp", "DIỄN BIẾN THÁNG")
+        for j = 0 to 5
+            f_ui_cell(dashboard, j, 3, array.get(uiHeaders, j), UI_HEAD, UI_MUTED, j == 0 or j == 5 ? text.align_left : text.align_right, uiChangeTip)
+        for j = 0 to 5
+            int uiRow = 4 + j
+            float uiMonth = array.get(change20, j)
+            int uiDir = f_direction(uiMonth, minMove20)
+            string uiMove = not bondEngineUsable ? "SỐ LIỆU CŨ" : uiDir == 2 ? "CHƯA ĐỦ DỮ LIỆU" : uiDir == -1 ? "ĐANG GIẢM" : uiDir == 1 ? "ĐANG TĂNG" : "ÍT THAY ĐỔI"
+            color uiBg = j % 2 == 0 ? UI_A : UI_B
+            f_ui_cell(dashboard, 0, uiRow, array.get(uiNames, j), uiBg, UI_TEXT, text.align_left, uiChangeTip)
+            f_ui_cell(dashboard, 1, uiRow, f_ui_num(f_good(legs, j), "0.00"), uiBg, uiInk, text.align_right, "Chi tiết: " + f_ui_num(f_good(legs, j), "0.0000") + "%")
+            f_ui_cell(dashboard, 2, uiRow, f_ui_signed(array.get(change1, j)), uiBg, f_ui_move_color(array.get(change1, j), 0.5, bondEngineUsable), text.align_right, uiChangeTip)
+            f_ui_cell(dashboard, 3, uiRow, f_ui_signed(array.get(change5, j)), uiBg, f_ui_move_color(array.get(change5, j), minMove5, bondEngineUsable), text.align_right, uiChangeTip)
+            f_ui_cell(dashboard, 4, uiRow, f_ui_signed(uiMonth), uiBg, f_ui_move_color(uiMonth, minMove20, bondEngineUsable), text.align_right, uiChangeTip)
+            f_ui_cell(dashboard, 5, uiRow, uiMove, uiBg, f_ui_move_color(uiMonth, minMove20, bondEngineUsable), text.align_left, uiChangeTip)
+        array<string> uiGroupHeads = array.from("NHÓM", "TRUNG BÌNH %", "", "TUẦN bp", "THÁNG bp", "XÁC NHẬN")
+        for j = 0 to 5
+            f_ui_cell(dashboard, j, 10, array.get(uiGroupHeads, j), UI_HEAD, UI_MUTED, j == 0 or j == 5 ? text.align_left : text.align_right, uiChangeTip)
+        for j = 0 to 2
+            int uiRow = 11 + j
+            string uiGroupResult = f_ui_group(array.get(groupCandidates, j), array.get(groupRuns, j), bondEngineUsable)
+            f_ui_cell(dashboard, 0, uiRow, array.get(uiGroupNames, j), UI_A, UI_TEXT, text.align_left, uiChangeTip)
+            f_ui_cell(dashboard, 1, uiRow, f_ui_num(array.get(groupNow, j), "0.00"), UI_A, uiInk, text.align_right, uiChangeTip)
+            f_ui_cell(dashboard, 2, uiRow, "", UI_A, uiInk, text.align_right, "")
+            f_ui_cell(dashboard, 3, uiRow, f_ui_signed(array.get(group5, j)), UI_A, f_ui_move_color(array.get(group5, j), minMove5, bondEngineUsable), text.align_right, uiChangeTip)
+            f_ui_cell(dashboard, 4, uiRow, f_ui_signed(array.get(group20, j)), UI_A, f_ui_move_color(array.get(group20, j), minMove20, bondEngineUsable), text.align_right, uiChangeTip)
+            f_ui_cell(dashboard, 5, uiRow, f_ui_wrap(uiGroupResult, 23), UI_A, uiInk, text.align_left, uiConfirmedTip)
+        string uiBreadth = bondEngineUsable and validChangeN == 6 ? "Trong tháng: " + str.tostring(bondEngineDown20) + "/6 kỳ hạn giảm · " + str.tostring(bondEngineUp20) + "/6 kỳ hạn tăng" : "Chưa đủ dữ liệu để đánh giá toàn bộ kỳ hạn."
+        f_ui_full(dashboard, 14, uiBreadth, UI_HEAD, uiInk, false, uiChangeTip)
+        f_ui_full(dashboard, 15, "ĐƯỜNG CONG · " + (bondEngineUsable ? f_ui_shape(shape20) : "Chưa có dữ liệu mới."), UI_B, uiInk, false, "Đối chiếu 2Y và 10Y trong 20 phiên.")
+        f_ui_full(dashboard, 16, "Bond Engine độc lập · Tuần 5 phiên · Tháng 20 phiên", UI_A, UI_MUTED, false, uiChangeTip)
+
+    else
+        // PANEL 3 — LIQUIDITY ONLY
+        string uiLiqDates = "LNH " + f_date(liquidityEngineIBAsOf) + " · Chính sách " + f_date(liquidityEnginePolicyAsOf)
+        f_ui_full(dashboard, 2, uiLiqDates + " · FRESHNESS " + uiFreshnessLabel + (not na(liquidityEngineLagDays) ? " · lag " + str.tostring(liquidityEngineLagDays) + " ngày" : ""), UI_A, liquidityEngineUsable ? UI_MUTED : UI_TEXT, false, uiLiqTip)
+        array<string> uiHeaders = array.from("CHỈ TIÊU", "HIỆN TẠI", "5 SỰ KIỆN bp", "20 SỰ KIỆN bp")
+        for j = 0 to 3
+            f_ui_cell(dashboard, j, 3, array.get(uiHeaders, j), UI_HEAD, UI_MUTED, j == 0 ? text.align_left : text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 0, 4, "LIÊN NGÂN HÀNG", UI_A, UI_TEXT, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 1, 4, f_ui_rate(liquidityEngineIB), UI_A, not na(liquidityEngineIB) ? UI_TEXT : UI_MUTED, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 2, 4, f_ui_signed(uiIB5), UI_A, f_ui_move_color(uiIB5, 25.0, liquidityEngineUsable), text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 3, 4, f_ui_signed(uiIB20), UI_A, f_ui_move_color(uiIB20, 25.0, liquidityEngineUsable), text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 0, 5, "CHÍNH SÁCH THAM CHIẾU", UI_B, UI_TEXT, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 1, 5, f_ui_rate(liquidityEnginePolicy), UI_B, not na(liquidityEnginePolicy) ? UI_TEXT : UI_MUTED, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 2, 5, f_ui_signed(uiPolicy5), UI_B, UI_TEXT, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 3, 5, f_ui_signed(uiPolicy20), UI_B, UI_TEXT, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 0, 6, "GAP LNH–CHÍNH SÁCH", UI_A, UI_TEXT, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 1, 6, f_ui_num(uiGapLast, "0.00") + " đ.%", UI_A, not na(uiGapLast) ? UI_TEXT : UI_MUTED, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 2, 6, f_ui_signed(gapChange5), UI_A, f_ui_move_color(gapChange5, 25.0, liquidityEngineUsable), text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 3, 6, f_ui_signed(gapChange20), UI_A, f_ui_move_color(gapChange20, 25.0, liquidityEngineUsable), text.align_right, uiLiqTip)
+        f_ui_full(dashboard, 7, "TRẠNG THÁI THANH KHOẢN · " + uiLiquidityStatus, f_ui_liq_bg(liquidityEngineState, liquidityEngineUsable), UI_TEXT, false, uiLiqTip)
+        f_ui_cell(dashboard, 0, 8, "NGUỒN", UI_HEAD, UI_MUTED, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 1, 8, "LNH " + f_date(liquidityEngineIBAsOf), UI_HEAD, UI_MUTED, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 2, 8, "Policy " + f_date(liquidityEnginePolicyAsOf), UI_HEAD, UI_MUTED, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 3, 8, "Buffer " + str.tostring(array.size(liqEventDateHist)) + " stored", UI_HEAD, UI_MUTED, text.align_right, uiLiqTip)
+        f_ui_full(dashboard, 9, "5 SỰ KIỆN THANH KHOẢN GẦN NHẤT", UI_B, UI_MUTED, false, "IB mới hoặc policy đổi; carry-forward thuần không tạo sự kiện.")
+        int uiEventN = math.min(5, array.size(liqEventDateHist))
+        for j = 0 to 4
+            int uiRow = 10 + j
+            int back = 4 - j
+            bool hasEvent = back < uiEventN
+            f_ui_cell(dashboard, 0, uiRow, hasEvent ? f_date(f_tail_int(liqEventDateHist, back)) : "—", UI_A, UI_MUTED, text.align_left, uiLiqTip)
+            f_ui_cell(dashboard, 1, uiRow, hasEvent ? f_ui_num(f_tail(liqEventIBHist, back), "0.00") : "—", UI_A, UI_TEXT, text.align_right, uiLiqTip)
+            f_ui_cell(dashboard, 2, uiRow, hasEvent ? f_ui_num(f_tail(liqEventPolicyHist, back), "0.00") : "—", UI_A, UI_TEXT, text.align_right, uiLiqTip)
+            f_ui_cell(dashboard, 3, uiRow, hasEvent ? f_ui_num(f_tail(liqEventGapHist, back), "0.00") : "—", UI_A, UI_TEXT, text.align_right, uiLiqTip)
+        f_ui_full(dashboard, 15, "Liquidity Engine độc lập · LNH trễ 0–5 ngày vẫn hợp lệ as-of · >5 ngày là stale", UI_B, UI_MUTED, false, uiLiqTip)
+        f_ui_cell(dashboard, 0, 16, "RANK GAP", UI_A, UI_TEXT, text.align_left, uiLiqTip)
+        f_ui_cell(dashboard, 1, 16, na(liquidityEngineRank) ? "—" : f_ui_num(liquidityEngineRank, "0.0") + "/100", UI_A, UI_TEXT, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 2, 16, "SNAPSHOT", UI_A, UI_MUTED, text.align_right, uiLiqTip)
+        f_ui_cell(dashboard, 3, 16, liquidityEngineUsable ? f_ui_liq(liquidityEngineState, true) : "THAM CHIẾU", UI_A, UI_TEXT, text.align_center, uiLiqTip)
+        f_ui_full(dashboard, 17, "Không dùng Bond để quyết định trạng thái thanh khoản.", UI_A, UI_MUTED, false, uiLiqTip)
+        f_ui_full(dashboard, 18, "Transmission chỉ xuất hiện ở Tổng quan khi hai engine đủ đồng bộ.", UI_A, UI_MUTED, false, uiTxTip)
+else if barstate.islast
+    table.clear(dashboard, 0, 0, uiCols - 1, uiRows - 1)

@@ -1,0 +1,5 @@
+# Trạng thái công cụ quét bảo mật (không thuộc dự án)
+.mimosa/
+
+# macOS
+.DS_Store

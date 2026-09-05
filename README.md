@@ -15,10 +15,10 @@
 | **01** | MacroAcademic Engine | **v3.2.1** | Semantic Clarity Patch — 4 trụ cột vĩ mô → Risk Score B0–B4 | 944 dòng |
 | **02** | Macro Alert System | **v7.0.0** | Academic Robustness — vá 9 điểm yếu audit (Welch df, empirical percentile, freshness) | 1.509 dòng |
 | **03** | Indices Research Map | **v3.1.3e** | Bounded Global Buffer Fix — map Risk Score → indices/sectors với Wilson CI, OOS | 2.434 dòng |
-| **04** | YieldCurveLab | **v2.3.0** | Horizon Separation — Tactical 1W + Strategic 4W, episode-aware sampling, Dev/Val | 1.180 dòng |
+| **04** | YieldCurveLab | **v3.4.0** | Evidence Expansion & Semantic Integrity — Dual Engine + Late Fusion, per-tenor evidence, Gap Driver | 1.617 dòng |
 | **05** | Bond Transmission Monitor | **v8.2.2** | Research Precision + Dual Chain — 6 kênh truyền dẫn, **FINAL BASELINE LOCKED** 16/07/2026 | 1.206 dòng |
 
-**Tổng:** 7.273 dòng Pine Script v6.
+**Tổng:** 7.710 dòng Pine Script v6.
 
 ---
 
@@ -35,7 +35,7 @@
   02_Macro Alert   03_Indices Map (Script B)
   (7.0.0 robust)   (3.1.3e Wilson CI / OOS)
 
-  04_YieldCurveLab (2.3.0)     05_Bond Transmission (8.2.2)
+  04_YieldCurveLab (3.4.0)     05_Bond Transmission (8.2.2)
   Độc lập — YC regime          Độc lập — 6 kênh quốc tế → VN
 ```
 
@@ -71,13 +71,14 @@ Bản vá **9 điểm yếu** audit phát hiện ở v6.0.1:
 - **Bonferroni family-wise correction** cho 11 ngành.
 - Fix lỗi compile **RE10067 / RE10143 / CE10013** (bounded global buffer `max_bars_back=120`).
 
-### 04 YieldCurveLab → v2.3.0 (Horizon Separation & Sample Power)
-- Tách **Macro State** khỏi **Predictive Evidence**.
-- **Tactical 1W** + **Strategic 4W** với outcome không chồng lấn.
-- **Episode-aware sampling** (regime-entry + cooldown) chống pseudo-replication.
-- **Development/Validation** + hard gate (Welch t ≥ 1.96, CI 95%).
-- **Adaptive Sample Power**: STANDARD (52w) hoặc HIGH (104w).
-- `NO SIGNAL` / `INCONCLUSIVE` / `EPISODE N LOW` là **output hợp lệ**, không phải lỗi.
+### 04 YieldCurveLab → v3.4.0 (Evidence Expansion & Semantic Integrity)
+- **Dual Engine + Late Fusion**: Bond Engine (1Y–10Y) + Liquidity Engine (IB/policy/gap) + Transmission Engine read-only.
+- **Per-tenor evidence**: Yield + 1D/1W/1M/3M cho 6 tenor; Rank Level/Slope/Belly/Long + Pressure decomposition (VALUE + REF = TOTAL).
+- **Liquidity semantics**: tách market-rate state khỏi relative-gap state; Gap Driver `ΔGap = ΔIB − ΔPolicy`; cửa sổ sự kiện 5/20.
+- **Transmission taxonomy đầy đủ**: đồng thuận / phân kỳ ngược chiều / Bond dẫn; Alignment quality (EXACT hoặc AS-OF ≤Nd); Last Valid Transmission tách khỏi Current.
+- **AI-verifiable evidence**: Early Observation, Active Contract, Research Trigger; IB lag contract 0–5 ngày.
+- Không VNINDEX, không forecast probability, không combined score, không causal attribution.
+- Nhập nguyên trạng từ GITHUB_HANDOFF 05/09/2026 (SHA-256 verified `c6c3358d…`); các bản v2.3.1–v3.3.1 phát triển ngoài repo này (baseline v3.3.1 lưu tại `tests/fixtures/`).
 
 ### 05 Bond Transmission Monitor → v8.2.2 (FINAL BASELINE LOCKED)
 - **Patch v8.2.1** vá 2 bug: format mask (`#.1`/`#.3`) + P6 ghi đè direct gate.
@@ -99,7 +100,7 @@ Bản vá **9 điểm yếu** audit phát hiện ở v6.0.1:
 2. **03 Indices Research Map** (Script B) → AvgR / Win% / DD theo bucket × indices/sectors
 
 ### Workflow 3 — Nghiên cứu trái phiếu
-1. **04 YieldCurveLab** → YC regime + Tactical/Strategic Bias
+1. **04 YieldCurveLab** → YC evidence (per-tenor 1D–3M) + Liquidity Gap Driver + transmission matrix
 2. **05 Bond Transmission Monitor** → 6 kênh truyền dẫn quốc tế → VN10Y
 
 ---
@@ -112,7 +113,7 @@ Bản vá **9 điểm yếu** audit phát hiện ở v6.0.1:
 |---|---|---|
 | Nhà đầu tư chứng khoán | **02 Macro Alert System** | Panel Macro Weather + Sector Rotation |
 | Quản lý danh mục | **01 MacroAcademic Engine** | Risk Score → asset allocation |
-| Bond trader | **05 Bond Transmission Monitor** + **04 YieldCurveLab** | Timing TPCP + YC regime |
+| Bond trader | **05 Bond Transmission Monitor** + **04 YieldCurveLab** | Timing TPCP + YC evidence |
 | Researcher | Cả 5 dự án | Macro-finance linkage, regime-based, sector rotation |
 
 ### Cài đặt (mỗi indicator)
@@ -222,7 +223,7 @@ Mô hình phải **tự implement** (vd: 02 tự viết Welch-Satterthwaite, 04 
 - **01_MacroAcademic_Engine:** v3.2.1 (Semantic Clarity Patch)
 - **02_Macro_Alert_System:** v7.0.0 (Academic Robustness)
 - **03_Indices_Research_Map:** v3.1.3e (Bounded Global Buffer Fix)
-- **04_YieldCurveLab:** v2.3.0 (Horizon Separation & Sample Power)
+- **04_YieldCurveLab:** v3.4.0 (Evidence Expansion & Semantic Integrity)
 - **05_Bond_Transmission_Monitor:** v8.2.2 (Research Precision & Dual Chain Diagnostics — **FINAL BASELINE LOCKED** 16/07/2026)
 
 ---
@@ -232,7 +233,7 @@ Mô hình phải **tự implement** (vd: 02 tự viết Welch-Satterthwaite, 04 
 - 📖 [01_MacroAcademic_Engine README](./01_MacroAcademic_Engine/)
 - 📖 [02_Macro_Alert_System README](./02_Macro_Alert_System/) — Review Methodology (9 điểm vá)
 - 📖 [03_Indices_Research_Map README](./03_Indices_Research_Map/) — 13 mục đầy đủ
-- 📖 [04_YieldCurveLab README](./04_YieldCurveLab/) — 19 mục chính thức
+- 📖 [04_YieldCurveLab README](./04_YieldCurveLab/) — v3.4.0 + CHANGELOG + QA/runtime evidence
 - 📖 [05_Bond_Transmission_Monitor README](./05_Bond_Transmission_Monitor/) — FINAL v8.2.2 (16 mục)
 - 📄 [05 METHOD_v8.2.2.md](./05_Bond_Transmission_Monitor/METHOD_v8.2.2.md)
 - 📄 [05 QA_v8.2.2.json](./05_Bond_Transmission_Monitor/QA_v8.2.2.json)
