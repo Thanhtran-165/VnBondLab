@@ -2,7 +2,7 @@
 
 ## 📅 Version 8.2.2 (Current Release)
 
-**Release Date:** 2026
+**Release Date:** 16/07/2026
 **Platform:** TradingView Pine Script v6
 **SHA-256:** `e6db0e36b7870225a9bddfff94303aa4dce19e564a9b17fed88b8cf4f46a56e3`
 
@@ -376,17 +376,9 @@ Kiểm tra:
 
 ---
 
-## 🔮 Roadmap (Future versions)
+## 🔮 Roadmap
 
-**v5.3 (Planned):**
-- Thêm kênh commodities (gold, oil)
-- Machine learning để optimize weights
-- Backtest module
-
-**v6.0 (Long-term):**
-- Real-time alerts
-- Cloud-based data storage
-- Multi-market support
+_Roadmap cũ từ thời v5.2 (dự kiến v5.3: kênh commodities, ML, backtest; v6.0: real-time alerts, cloud) đã bị vượt qua bởi các nhánh V6–V8 thực tế. Chưa có roadmap chính thức cho giai đoạn sau V8.2.2._
 
 ---
 
@@ -400,7 +392,7 @@ Nếu bạn gặp bugs hoặc có đề xuất tính năng:
 ---
 
 **Current Version:** v8.2.2
-**Last Updated:** January 2025
+**Last Updated:** 16/07/2026 (khóa baseline v8.2.2)
 **Status:** ✅ Stable & Production Ready
 
 *Happy Monitoring! 📊🚀*

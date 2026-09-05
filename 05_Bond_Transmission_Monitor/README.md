@@ -33,10 +33,10 @@ Bản này đã hoàn tất:
 
 | Tệp | Vai trò |
 |---|---|
-| `MacroAcademic_v8_2_2_Research_Precision_Dual_Chain_Diagnostics.pine` | Mã nguồn Pine Script hoàn chỉnh |
-| `MacroAcademic_v8_2_2_METHOD.md` | Phương pháp luận và phạm vi bản vá |
-| `MacroAcademic_v8_2_2_QA.json` | Kết quả static QA |
-| `README_MacroAcademic_v8_2_2_FINAL.md` | Hướng dẫn vận hành, đọc ảnh và khóa phiên bản |
+| `Bond_Transmission_Monitor_v8.2.2.pine` | Mã nguồn Pine Script hoàn chỉnh |
+| `METHOD_v8.2.2.md` | Phương pháp luận và phạm vi bản vá |
+| `QA_v8.2.2.json` | Kết quả static QA |
+| `README.md` | Hướng dẫn vận hành, đọc ảnh và khóa phiên bản |
 
 ### SHA-256
 
