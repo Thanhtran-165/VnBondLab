@@ -1,0 +1,808 @@
+//@version=6
+indicator("VN YieldCurveLab NEW 2.1 — Bond Research", shorttitle="VN YCL 2.1", overlay=false, precision=4, max_bars_back=5000, calc_bars_count=0, dynamic_requests=false)
+// BUILD NEW2-20260924-02. Six government-bond yields only. Bond dynamics and descriptive peer comparison.
+// Observational only. No probability, causality, term-premium or VNINDEX model.
+const string TZ = "Asia/Ho_Chi_Minh"
+const int DAY_MS = 86400000
+const int CAP = 840
+const int REF = 252
+const int LONG_REF = 756
+const int DIFF_CAP = 63
+const float EPS = 0.0000000001
+const float REF_COVERAGE = 0.90
+const float CHANGE_COVERAGE = 0.80
+float noise5 = input.float(2.0, "Biên 5 phiên (bp)", minval=0.5, maxval=30, step=0.5, display=display.none)
+float noise20 = input.float(5.0, "Biên 20 phiên (bp)", minval=1, maxval=60, step=0.5, display=display.none)
+float jumpMin = input.float(25.0, "Sàn kiểm tra nhảy Bond (bp)", minval=10, maxval=100, display=display.none)
+string textSize = input.string("Vừa", "Cỡ chữ", options=["Nhỏ","Vừa"], display=display.none)
+string evidenceView = input.string("Báo cáo", "Chế độ bằng chứng", options=["Báo cáo","Nghiên cứu"], display=display.none)
+bool clockValid = ticker.standard(syminfo.tickerid) == "TVC:VN10Y" and timeframe.isdaily and timeframe.multiplier == 1 and chart.is_standard
+if barstate.isfirst and not clockValid
+    runtime.error("YCL NEW: yêu cầu TVC:VN10Y, 1D, chart chuẩn.")
+type Ledger
+    array<float> values
+    array<float> diffs
+    float accepted = na
+    int sourceDay = na
+
+f_day(int stamp) =>
+    na(stamp) ? int(na) : timestamp(TZ, year(stamp, TZ), month(stamp, TZ), dayofmonth(stamp, TZ), 0, 0)
+
+f_age(int dayNow, int sourceDay) =>
+    na(dayNow) or na(sourceDay) ? int(na) : int(math.floor((dayNow - sourceDay) / float(DAY_MS)))
+
+f_date(int stamp) =>
+    na(stamp) ? "NA" : str.format_time(stamp, "dd/MM/yy", TZ)
+
+f_tail(array<float> xs, int back) =>
+    int idx = array.size(xs) - 1 - back
+    back >= 0 and idx >= 0 ? array.get(xs, idx) : na
+
+f_tail_int(array<int> xs, int back) =>
+    int idx = array.size(xs) - 1 - back
+    back >= 0 and idx >= 0 ? array.get(xs, idx) : na
+
+f_push(array<float> xs, float value, int capacity) =>
+    array.push(xs, value)
+    if array.size(xs) > capacity
+        array.shift(xs)
+    array.size(xs)
+
+f_valid_count(array<float> xs, int length, int offset) =>
+    int count = 0
+    int n = array.size(xs)
+    if length > 0 and offset >= 0 and n >= length + offset
+        for j = 0 to length - 1
+            if not na(array.get(xs, n - 1 - offset - j))
+                count += 1
+    count
+
+f_rank(array<float> xs, float value, int length, int offset) =>
+    float result = na
+    int n = array.size(xs)
+    if not na(value) and length > 0 and offset >= 0 and n >= length + offset
+        int count = 0
+        float lower = 0.0
+        float equalN = 0.0
+        for j = 0 to length - 1
+            float v = array.get(xs, n - 1 - offset - j)
+            if not na(v)
+                count += 1
+                lower += v < value - EPS ? 1.0 : 0.0
+                equalN += math.abs(v - value) <= EPS ? 1.0 : 0.0
+        if count >= length * REF_COVERAGE
+            result := 100.0 * (lower + 0.5 * equalN) / count
+    result
+
+f_delta(array<float> xs, int horizon) =>
+    float result = na
+    int span = horizon + 1
+    if horizon >= 1 and array.size(xs) >= span
+        float current = f_tail(xs, 0)
+        float prior = f_tail(xs, horizon)
+        if not na(current) and not na(prior) and f_valid_count(xs, span, 0) >= span * CHANGE_COVERAGE
+            result := 100.0 * (current - prior)
+    result
+
+// For series that are already measured in bp, retain the units.
+f_bp_difference(array<float> xs, int horizon) =>
+    float result = na
+    int span = horizon + 1
+    if horizon >= 1 and array.size(xs) >= span
+        float current = f_tail(xs, 0)
+        float prior = f_tail(xs, horizon)
+        if not na(current) and not na(prior) and f_valid_count(xs, span, 0) >= span * CHANGE_COVERAGE
+            result := current - prior
+    result
+
+// Both changes must clear the predeclared 20-bar noise floor. Descriptive, not a signal.
+f_curve_motion(float levelMove, float slopeMove, float threshold) =>
+    string label = "CHƯA PHÂN LOẠI ΔLEVEL/ΔDỐC"
+    if not na(levelMove) and not na(slopeMove) and math.abs(levelMove) >= threshold and math.abs(slopeMove) >= threshold
+        label := (levelMove > 0 ? "MẶT BẰNG TĂNG" : "MẶT BẰNG GIẢM") + " + " + (slopeMove > 0 ? "CHÊNH 10Y−2Y TĂNG" : "CHÊNH 10Y−2Y GIẢM")
+    label
+
+f_belly(float y2, float y5, float y10) =>
+    // 5Y is 3/8 of the distance from 2Y to 10Y, not their midpoint.
+    100.0 * (y5 - (0.625 * y2 + 0.375 * y10))
+
+f_pressure(float levelRank, float slopeRank, float bellyRank, float slopeValue) =>
+    float result = na
+    if not na(levelRank) and not na(slopeRank) and not na(bellyRank) and not na(slopeValue)
+        float slopeRisk = slopeValue <= 0 ? 100.0 : 100.0 - slopeRank
+        result := 0.45 * levelRank + 0.45 * slopeRisk + 0.10 * bellyRank
+    result
+
+f_pressure_ref(array<float> levelH, array<float> slopeH, array<float> bellyH, float lev, float slp, float absBelly, int refOffset) =>
+    f_pressure(f_rank(levelH, lev, REF, refOffset), f_rank(slopeH, slp, REF, refOffset), f_rank(bellyH, absBelly, REF, refOffset), slp)
+
+f_robust_z(array<float> xs, float value) =>
+    float out = na
+    int n = array.size(xs)
+    if n >= REF and not na(value)
+        int count = 0
+        float total = 0.0
+        float squareTotal = 0.0
+        for j = 0 to REF - 1
+            float v = array.get(xs, n - 1 - j)
+            if not na(v)
+                count += 1
+                total += v
+                squareTotal += v * v
+        if count >= REF * REF_COVERAGE
+            float mu = total / count
+            float sd = math.sqrt(math.max(0.0, squareTotal / count - mu * mu))
+            if sd > 0.00000001
+                float sumW = 0.0
+                float sumW2 = 0.0
+                for j = 0 to REF - 1
+                    float v = array.get(xs, n - 1 - j)
+                    if not na(v)
+                        float w = math.max(mu - 2.5 * sd, math.min(mu + 2.5 * sd, v))
+                        sumW += w
+                        sumW2 += w * w
+                float mw = sumW / count
+                float sw = math.sqrt(math.max(0.0, sumW2 / count - mw * mw))
+                if sw > 0.00000001
+                    out := (value - mw) / sw
+    out
+
+f_threshold(array<float> ds, float floorBP) =>
+    array<float> work = array.new_float()
+    int n = array.size(ds)
+    if n > 0
+        for j = 0 to math.min(DIFF_CAP, n) - 1
+            float v = array.get(ds, n - 1 - j)
+            if not na(v)
+                array.push(work, v)
+    float answer = floorBP
+    if array.size(work) >= 20
+        float md = array.median(work)
+        int nw = array.size(work)
+        for j = 0 to nw - 1
+            array.set(work, j, math.abs(array.get(work, j) - md))
+        answer := math.max(floorBP, 8.0 * 1.4826 * array.median(work))
+    answer
+
+f_closed(float v, int srcT, int srcTC, float prevV, int prevT, int prevTC, int cutoff) =>
+    float outV = na
+    int outT = na
+    int outTC = na
+    if not na(v) and not na(srcT) and not na(srcTC) and srcTC <= cutoff
+        outV := v
+        outT := srcT
+        outTC := srcTC
+    else if not na(prevV) and not na(prevT) and not na(prevTC) and prevTC <= cutoff
+        outV := prevV
+        outT := prevT
+        outTC := prevTC
+    [outV, outT, outTC]
+
+// Independent state classifier proven in the NEW Native Probe.
+stability(int a, int b, int c, int p, int q, int r) =>
+    int answer = -1
+    if a != 0 and b != 0 and c != 0
+        answer := 0
+        if a == b and b == c
+            answer := 1
+            if p >= 3 and q >= 3 and r >= 3
+                answer := 2
+    answer
+
+environment(int n, int dm, int um, int gd, int gu, int dw, int uw) =>
+    int answer = 0
+    if n == 6
+        answer := 1
+        if dm >= 4 and um == 0 and gd >= 2 and dw >= 3 and uw <= 1
+            answer := 2
+        else if um >= 4 and dm == 0 and gu >= 2 and uw >= 3 and dw <= 1
+            answer := 3
+        else if dm >= 2 and um >= 2
+            answer := 6
+        else if dm >= 2
+            answer := 4
+        else if um >= 2
+            answer := 5
+    answer
+
+breadthClass(int dn, int up) =>
+    int answer = 99
+    if dn >= 0 and up >= 0 and dn + up <= 6
+        answer := 0
+        if dn >= 4 and up <= 1
+            answer := -3
+        else if up >= 4 and dn <= 1
+            answer := 3
+        else if dn > 0 and up > 0
+            answer := 9
+        else if dn >= 2
+            answer := -2
+        else if up >= 2
+            answer := 2
+        else if dn == 1
+            answer := -1
+        else if up == 1
+            answer := 1
+    answer
+
+nextRun(int candidate, int previous, int previousRun) =>
+    candidate == 0 ? 0 : candidate == previous ? previousRun + 1 : 1
+
+ageOK(int age, int limit) =>
+    not na(age) and age >= 0 and age <= limit
+
+windowOK(int valid, int slots, int lag, int forward) =>
+    slots >= 2 and valid <= slots and valid >= slots * 0.8 and lag >= 0 and lag <= 5 and forward > 0
+
+stateText(int state) =>
+    switch state
+        1 => "CHƯA CÓ XU HƯỚNG RỘNG"
+        2 => "GIẢM RỘNG"
+        3 => "TĂNG RỘNG"
+        4 => "GIẢM CỤC BỘ"
+        5 => "TĂNG CỤC BỘ"
+        6 => "PHÂN HÓA"
+        => "THIẾU DỮ LIỆU"
+
+breadthText(int state) =>
+    switch state
+        -3 => "BOND GIẢM RỘNG"
+        3 => "BOND TĂNG RỘNG"
+        -2 => "BOND GIẢM CỤC BỘ"
+        2 => "BOND TĂNG CỤC BỘ"
+        -1 => "BOND GIẢM 1 KỲ HẠN"
+        1 => "BOND TĂNG 1 KỲ HẠN"
+        9 => "BOND PHÂN HÓA"
+        0 => "BOND ÍT ĐỔI"
+        => "BOND THIẾU DỮ LIỆU"
+
+num(float v, string fmt) =>
+    na(v) ? "NA" : str.tostring(v, fmt)
+
+signed(float v) =>
+    na(v) ? "NA" : (v > 0 ? "+" : "") + str.tostring(v,"0.0")
+
+// Episode audit is descriptive. Confirm on day 3; forward windows start then.
+// Each configuration has a global 20-clock-slot exclusion, across all states.
+// No optimization, p-values, accuracy or causal claims. Current data vintages only.
+type Outcome
+    array<float> changes
+    array<float> early
+    array<float> late
+
+type Episode
+    int startIndex = na
+    int sourceDate = na
+    int state = 0
+    int entered = 0
+    int overlapSkipped = 0
+    int invalid = 0
+
+canEnter(int state, int run, int index, int lastEntry) =>
+    state > 0 and run == 3 and (na(lastEntry) or index-lastEntry > 20)
+
+sampleSlot(int config, int state, int horizonIndex) =>
+    (config*7+state)*3+horizonIndex
+
+historicalDelta(array<float> xs, int horizon, int offset) =>
+    float answer = na
+    if array.size(xs) >= horizon+offset+1 and f_valid_count(xs,horizon+1,offset) >= (horizon+1)*CHANGE_COVERAGE
+        float a = f_tail(xs,offset+horizon)
+        float b = f_tail(xs,offset)
+        if not na(a) and not na(b)
+            answer := 100*(b-a)
+    answer
+
+outcomeText(Outcome o) =>
+    int n = array.size(o.changes)
+    n == 0 ? "n=0 · CHƯA CÓ" : "n=" + str.tostring(n) + " · TB " + signed(array.avg(o.changes)) + "bp · TV " + signed(array.median(o.changes)) + "bp"
+
+periodText(Outcome o) =>
+    "TRƯỚC 2023 n=" + str.tostring(array.size(o.early)) + ":" + signed(array.avg(o.early)) + " | TỪ 2023 n=" + str.tostring(array.size(o.late)) + ":" + signed(array.avg(o.late)) + "bp"
+
+check(bool condition, string name) =>
+    if not condition
+        runtime.error("YCL NEW TEST FAIL: " + name)
+    condition
+
+var int testCount = 0
+if barstate.isfirst
+    check(breadthClass(0,0) == 0, "no move")
+    check(breadthClass(1,0) == -1, "one falling tenor is concentrated")
+    check(breadthClass(0,1) == 1, "one rising tenor is concentrated")
+    check(breadthClass(1,1) == 9, "opposed singleton moves are mixed")
+    check(breadthClass(2,0) == -2, "local cooling")
+    check(breadthClass(0,3) == 2, "local heating")
+    check(breadthClass(4,1) == -3, "broad cooling")
+    check(breadthClass(1,5) == 3, "broad heating")
+    check(breadthClass(2,2) == 9, "two sided breadth")
+    check(breadthClass(-1,0) == 99, "invalid counts do not look flat")
+    check(breadthClass(4,4) == 99, "invalid total")
+    check(windowOK(0,0,0,1) == false, "missing observation invalidates window")
+    check(windowOK(8,10,0,1) == true, "80 percent coverage passes")
+    check(windowOK(7,10,0,1) == false, "below 80 percent fails")
+    check(windowOK(8,10,5,1) == true, "lag five passes")
+    check(windowOK(10,10,6,1) == false, "lag six fails")
+    check(windowOK(10,10,0,0) == false, "same endpoint rejected")
+    check(windowOK(10,10,-1,1) == false, "negative lag rejected")
+    check(ageOK(-1,5) == false, "future source rejected")
+    check(ageOK(5,5) == true, "age threshold inclusive")
+    check(ageOK(6,5) == false, "source expires")
+    check(ageOK(int(na),5) == false, "unknown source age rejected")
+    check(environment(6,0,0,0,0,0,0) == 1, "base stable environment")
+    check(environment(6,4,0,2,0,3,1) == 2, "broad down needs week support")
+    check(environment(6,4,0,2,0,2,0) == 4, "month down without week support is local")
+    check(environment(6,0,4,0,2,0,3) == 3, "broad up")
+    check(environment(6,2,2,1,1,2,2) == 6, "mixed environment")
+    check(environment(5,4,0,2,0,3,0) == 0, "missing tenor prevents environment")
+    check(environment(0,0,0,0,0,0,0) == 0, "month insufficient dominates")
+    check(nextRun(0,1,8) == 0, "state invalid resets persistence")
+    check(nextRun(1,1,8) == 9, "same state extends persistence")
+    check(nextRun(2,1,8) == 1, "changed state resets to one")
+    check(stability(1,1,1,8,8,8) == 2, "fully stable sensitivity")
+    check(stability(2,2,2,3,3,2) == 1, "same candidate but unconfirmed")
+    check(stability(1,4,4,8,3,3) == 0, "threshold sensitive")
+    check(stability(0,0,0,0,0,0) == -1, "missing sensitivity is not disagreement")
+    check(stability(1,1,1,1,1,1) == 1, "fractional minimum prevents spurious stability")
+    check(math.abs(f_rank(array.from(1.0,2.0,3.0,100.0),100.0,3,1)-100) < 0.000001, "prior rank")
+    check(math.abs(f_rank(array.from(4.0,4.0,4.0,4.0),4.0,3,1)-50) < 0.000001, "rank ties")
+    check(na(f_rank(array.from(1.0,2.0),2.0,3,1)), "rank warmup")
+    check(math.abs(f_delta(array.from(3.5,3.55),1)-5) < 0.000001, "bp units")
+    check(na(f_delta(array.from(3.5,float(na),3.55),1)), "no missing compression")
+    check(math.abs(f_belly(2,5,10)) < 0.000001, "maturity interpolation")
+    check(math.abs(f_bp_difference(array.from(10.0,11.0,14.0),2)-4.0) < 0.000001, "signed-belly bp change")
+    check(na(f_bp_difference(array.from(10.0,float(na),14.0),2)), "signed-belly missing endpoint")
+    check(f_curve_motion(6,6,5) == "MẶT BẰNG TĂNG + CHÊNH 10Y−2Y TĂNG", "rising spread")
+    check(f_curve_motion(-6,-6,5) == "MẶT BẰNG GIẢM + CHÊNH 10Y−2Y GIẢM", "falling spread")
+    check(f_curve_motion(4,6,5) == "CHƯA PHÂN LOẠI ΔLEVEL/ΔDỐC", "small level not classified")
+    check(canEnter(1,3,100,int(na)), "first confirmed episode enters")
+    check(not canEnter(1,2,100,int(na)), "no entry before confirmation")
+    check(not canEnter(1,4,100,int(na)), "one entry per candidate run")
+    check(not canEnter(1,3,120,100), "shared 20th endpoint excluded")
+    check(canEnter(1,3,121,100), "first disjoint endpoint admitted")
+    check(not canEnter(0,3,121,100), "invalid state cannot enter")
+    check(sampleSlot(0,1,0) == 3 and sampleSlot(2,6,2) == 62, "outcome grid indexing")
+    check(math.abs(historicalDelta(array.from(1.0,1.1,1.2,1.3),1,1)-10) < 0.000001, "prior week offset units")
+    check(na(historicalDelta(array.from(1.0,float(na),1.2),1,1)), "prior missing endpoint rejected")
+    check(math.abs(historicalDelta(array.from(1.0,1.1,1.2,1.3),2,0)-20) < 0.000001, "forward delta known fixture")
+    testCount := 58
+
+// SOURCE ADAPTER
+[raw0, t0, tc0, prev0, pt0, pc0] = request.security("TVC:VN01Y", "D", [close,time,time_close,close[1],time[1],time_close[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[raw1, t1, tc1, prev1, pt1, pc1] = request.security("TVC:VN02Y", "D", [close,time,time_close,close[1],time[1],time_close[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[raw2, t2, tc2, prev2, pt2, pc2] = request.security("TVC:VN03Y", "D", [close,time,time_close,close[1],time[1],time_close[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[raw3, t3, tc3, prev3, pt3, pc3] = request.security("TVC:VN05Y", "D", [close,time,time_close,close[1],time[1],time_close[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[raw4, t4, tc4, prev4, pt4, pc4] = request.security("TVC:VN07Y", "D", [close,time,time_close,close[1],time[1],time_close[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[raw5, t5, tc5, prev5, pt5, pc5] = request.security("TVC:VN10Y", "D", [close,time,time_close,close[1],time[1],time_close[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+int cutoff = barstate.isrealtime ? math.min(timenow,time_close) : time_close
+int day = f_day(time)
+[v0, d0, c0] = f_closed(raw0,t0,tc0,prev0,pt0,pc0,cutoff)
+[v1, d1, c1] = f_closed(raw1,t1,tc1,prev1,pt1,pc1,cutoff)
+[v2, d2, c2] = f_closed(raw2,t2,tc2,prev2,pt2,pc2,cutoff)
+[v3, d3, c3] = f_closed(raw3,t3,tc3,prev3,pt3,pc3,cutoff)
+[v4, d4, c4] = f_closed(raw4,t4,tc4,prev4,pt4,pc4,cutoff)
+[v5, d5, c5] = f_closed(raw5,t5,tc5,prev5,pt5,pc5,cutoff)
+array<float> incoming = array.from(v0,v1,v2,v3,v4,v5)
+array<int> dates = array.from(f_day(d0),f_day(d1),f_day(d2),f_day(d3),f_day(d4),f_day(d5))
+var array<Ledger> bond = array.new<Ledger>()
+var array<Ledger> groups = array.new<Ledger>()
+if barstate.isfirst
+    for j = 0 to 5
+        array.push(bond,Ledger.new(array.new_float(),array.new_float()))
+    for j = 0 to 2
+        array.push(groups,Ledger.new(array.new_float(),array.new_float()))
+var array<int> clock = array.new_int()
+var array<float> levels = array.new_float()
+var array<float> slopes = array.new_float()
+var array<float> bellies = array.new_float()
+var array<float> signedBellies = array.new_float()
+var array<float> frontSlopes = array.new_float()
+var array<float> backSlopes = array.new_float()
+var array<int> stateHistory = array.new_int()
+var array<float> pendingCurve = array.new_float(6,na)
+var array<float> thresholds = array.new_float(6,na)
+var array<int> states = array.new_int(3,0)
+var array<int> runs = array.new_int(3,0)
+var array<int> groupStates = array.new_int(3,0)
+var array<int> groupRuns = array.new_int(3,0)
+var array<float> delta1 = array.new_float(6,na)
+var array<float> delta5 = array.new_float(6,na)
+var array<float> delta20 = array.new_float(6,na)
+var array<float> delta60 = array.new_float(6,na)
+var array<float> group5 = array.new_float(3,na)
+var array<float> group20 = array.new_float(3,na)
+var int processed = na
+var int bondDay = na
+var bool bondOK = false
+var string bondQA = "BUILDING"
+var int pendingN = 0
+var int broadN = 0
+var int broadDirection = 0
+var int confirmed = 0
+var int eligibleCount = 0
+var int agreementCount = 0
+var int stressStart = na
+var int dn5 = 0
+var int up5 = 0
+var int dn20 = 0
+var int up20 = 0
+bool commit = clockValid and barstate.isconfirmed and (na(processed) or processed != time)
+if commit
+    array.push(clock,day)
+    if array.size(clock) > CAP
+        array.shift(clock)
+    // Whole-cohort acceptance; invalid dates and quarantine are NA in the ledger.
+    bool present = true
+    bool inRange = true
+    bool aligned = true
+    int shocks = 0
+    int positive = 0
+    int negative = 0
+    for j = 0 to 5
+        Ledger leg = array.get(bond,j)
+        float value = array.get(incoming,j)
+        int sourceDay = array.get(dates,j)
+        present := present and not na(value) and not na(sourceDay)
+        inRange := inRange and not na(value) and value >= -5 and value <= 30
+        aligned := aligned and not na(sourceDay) and sourceDay == day
+        float threshold = jumpMin
+        if not na(leg.accepted) and not na(value) and math.abs(value-leg.accepted)*100 > jumpMin
+            threshold := f_threshold(leg.diffs,jumpMin)
+        array.set(thresholds,j,threshold)
+        if not na(leg.accepted) and not na(value) and math.abs(value-leg.accepted)*100 > threshold
+            shocks += 1
+            positive += value > leg.accepted ? 1 : 0
+            negative += value < leg.accepted ? 1 : 0
+    bondOK := false
+    if not present or not inRange or not aligned
+        bondQA := not present ? "MISSING" : not inRange ? "RANGE ERROR" : "WAIT SAME DATE"
+        pendingN := 0
+        broadN := 0
+        broadDirection := 0
+    else if shocks == 0
+        bondOK := true
+        bondQA := "PASS"
+        pendingN := 0
+        broadN := 0
+        broadDirection := 0
+    else
+        int direction = positive >= 4 and negative == 0 ? 1 : negative >= 4 and positive == 0 ? -1 : 0
+        if direction != 0
+            broadN := direction == broadDirection ? broadN+1 : 1
+            broadDirection := direction
+            pendingN := 0
+            bondOK := broadN >= 2
+            bondQA := bondOK ? "PASS BROAD SHOCK" : "QUARANTINE BROAD"
+            if bondOK
+                broadN := 0
+                broadDirection := 0
+        else
+            broadN := 0
+            broadDirection := 0
+            bool matches = pendingN > 0
+            for j = 0 to 5
+                float previousPending = array.get(pendingCurve,j)
+                float value = array.get(incoming,j)
+                float tolerance = math.max(10.0,array.get(thresholds,j)*0.5)
+                matches := matches and not na(previousPending) and math.abs(value-previousPending)*100 <= tolerance
+                array.set(pendingCurve,j,value)
+            pendingN := matches ? pendingN+1 : 1
+            bondOK := pendingN >= 2
+            bondQA := bondOK ? "PASS SHOCK" : "QUARANTINE"
+            if bondOK
+                pendingN := 0
+    for j = 0 to 5
+        Ledger leg = array.get(bond,j)
+        float value = bondOK ? array.get(incoming,j) : na
+        f_push(leg.diffs,100*(value-f_tail(leg.values,0)),DIFF_CAP)
+        f_push(leg.values,value,CAP)
+        if bondOK
+            leg.accepted := value
+            leg.sourceDay := day
+        array.set(delta1,j,f_delta(leg.values,1))
+        array.set(delta5,j,f_delta(leg.values,5))
+        array.set(delta20,j,f_delta(leg.values,20))
+        array.set(delta60,j,f_delta(leg.values,60))
+    if bondOK
+        bondDay := day
+    f_push(levels,bondOK ? (v1+v3+v5)/3 : na,CAP)
+    f_push(slopes,bondOK ? v5-v1 : na,CAP)
+    f_push(bellies,bondOK ? math.abs(f_belly(v1,v3,v5)) : na,CAP)
+    f_push(signedBellies,bondOK ? f_belly(v1,v3,v5) : na,CAP)
+    f_push(frontSlopes,bondOK ? (v3-v1)/3.0 : na,CAP)
+    f_push(backSlopes,bondOK ? (v5-v3)/5.0 : na,CAP)
+    for j = 0 to 2
+        Ledger g = array.get(groups,j)
+        float value = bondOK ? (array.get(incoming,j*2)+array.get(incoming,j*2+1))/2 : na
+        f_push(g.values,value,CAP)
+        float w = f_delta(g.values,5)
+        float m = f_delta(g.values,20)
+        array.set(group5,j,w)
+        array.set(group20,j,m)
+        int candidate = 0
+        if bondOK and not na(w) and not na(m)
+            candidate := 1
+            if m <= -noise20
+                candidate := w <= -noise5 ? 2 : 4
+            else if m >= noise20
+                candidate := w >= noise5 ? 3 : 5
+        array.set(groupRuns,j,nextRun(candidate,array.get(groupStates,j),array.get(groupRuns,j)))
+        array.set(groupStates,j,candidate)
+    // Three predefined threshold settings, always on identical observations.
+    for k = 0 to 2
+        float scale = k == 0 ? 0.75 : k == 1 ? 1.0 : 1.25
+        int n = 0
+        int dw = 0
+        int uw = 0
+        int dm = 0
+        int um = 0
+        int gd = 0
+        int gu = 0
+        for j = 0 to 5
+            float w = array.get(delta5,j)
+            float m = array.get(delta20,j)
+            n += not na(w) and not na(m) ? 1 : 0
+            dw += not na(w) and w <= -noise5*scale ? 1 : 0
+            uw += not na(w) and w >= noise5*scale ? 1 : 0
+            dm += not na(m) and m <= -noise20*scale ? 1 : 0
+            um += not na(m) and m >= noise20*scale ? 1 : 0
+        for j = 0 to 2
+            float m = array.get(group20,j)
+            gd += not na(m) and m <= -noise20*scale ? 1 : 0
+            gu += not na(m) and m >= noise20*scale ? 1 : 0
+        int candidate = bondOK ? environment(n,dm,um,gd,gu,dw,uw) : 0
+        array.set(runs,k,nextRun(candidate,array.get(states,k),array.get(runs,k)))
+        array.set(states,k,candidate)
+        if k == 1
+            dn5 := dw
+            up5 := uw
+            dn20 := dm
+            up20 := um
+            if array.get(runs,k) >= 3
+                confirmed := candidate
+    if array.get(states,1) != 0
+        eligibleCount += 1
+        if na(stressStart)
+            stressStart := day
+        agreementCount += array.get(states,0) == array.get(states,1) and array.get(states,1) == array.get(states,2) ? 1 : 0
+    array.push(stateHistory,array.get(states,1))
+    if array.size(stateHistory) > CAP
+        array.shift(stateHistory)
+    processed := time
+
+// Sequential episode outcomes, evaluated only when each horizon has matured.
+var array<Outcome> outcomes = array.new<Outcome>()
+var array<Episode> episodes = array.new<Episode>()
+var array<int> lastEntries = array.new_int(3,na)
+var array<int> auditDayStates = array.new_int(7,0)
+var array<int> auditDayAgreement = array.new_int(7,0)
+var int auditIndex = 0
+var int auditFirst = na
+var int auditLast = na
+if barstate.isfirst
+    for j = 0 to 62
+        array.push(outcomes,Outcome.new(array.new_float(),array.new_float(),array.new_float()))
+    for k = 0 to 2
+        array.push(episodes,Episode.new())
+if commit
+    auditIndex += 1
+    auditFirst := na(auditFirst) ? day : auditFirst
+    auditLast := day
+    int observedState = array.get(states,1)
+    if observedState > 0
+        array.set(auditDayStates,observedState,array.get(auditDayStates,observedState)+1)
+        if array.get(states,0) == observedState and array.get(states,2) == observedState
+            array.set(auditDayAgreement,observedState,array.get(auditDayAgreement,observedState)+1)
+    for k = 0 to 2
+        Episode ep = array.get(episodes,k)
+        if not na(ep.startIndex)
+            int elapsed = auditIndex-ep.startIndex
+            int hidx = elapsed == 5 ? 0 : elapsed == 10 ? 1 : elapsed == 20 ? 2 : -1
+            if hidx >= 0
+                float change = f_delta(levels,elapsed)
+                if not na(change)
+                    Outcome o = array.get(outcomes,sampleSlot(k,ep.state,hidx))
+                    array.push(o.changes,change)
+                    // Both endpoints in early period; boundary-crossing windows go in neither period.
+                    int splitDate = timestamp(TZ,2023,1,1,0,0)
+                    if day < splitDate
+                        array.push(o.early,change)
+                    else if ep.sourceDate >= splitDate
+                        array.push(o.late,change)
+                else
+                    ep.invalid += 1
+            if elapsed >= 20
+                ep.startIndex := na
+        int st = array.get(states,k)
+        int run = array.get(runs,k)
+        if st > 0 and run == 3
+            if canEnter(st,run,auditIndex,array.get(lastEntries,k))
+                ep.startIndex := auditIndex
+                ep.sourceDate := day
+                ep.state := st
+                ep.entered += 1
+                array.set(lastEntries,k,auditIndex)
+            else
+                ep.overlapSkipped += 1
+
+// Source lines hold the last accepted observation; the table explicitly marks unusable data.
+plot(array.get(bond,0).accepted,"1Y (%)",color.gray)
+plot(array.get(bond,1).accepted,"2Y (%)",color.blue,2)
+plot(array.get(bond,2).accepted,"3Y (%)",color.orange)
+plot(array.get(bond,3).accepted,"5Y (%)",color.green,2)
+plot(array.get(bond,4).accepted,"7Y (%)",color.purple)
+plot(array.get(bond,5).accepted,"10Y (%)",color.red,2)
+
+const color HEAD = #152333
+const color BOND = #203746
+const color TX = #302641
+const color INK = #F4F5F6
+const color MUTED = #CCD1D9
+const color WARN = #713D3D
+var table dashboard = evidenceView == "Báo cáo" ? table.new(position.top_left,1,27,bgcolor=HEAD,frame_color=HEAD,frame_width=1) : na
+string font = textSize == "Nhỏ" ? size.small : size.normal
+cell(int row, string message, color bg) =>
+    table.cell(dashboard,0,row,message,text_color=INK,bgcolor=bg,text_size=font,text_halign=text.align_left)
+
+if barstate.islast and evidenceView == "Báo cáo"
+    int runDay = f_day(timenow)
+    int ageBond = f_age(runDay,bondDay)
+    float level = f_tail(levels,0)
+    float slope = f_tail(slopes,0)
+    float belly = f_tail(bellies,0)
+    float levelRank = f_rank(levels,level,REF,1)
+    float slopeRank = f_rank(slopes,slope,REF,1)
+    float bellyRank = f_rank(bellies,belly,REF,1)
+    float longRank = f_rank(levels,level,LONG_REF,1)
+    float pressure = f_pressure(levelRank,slopeRank,bellyRank,slope)
+    float oldRefNow = f_pressure_ref(levels,slopes,bellies,level,slope,belly,21)
+    float oldRefOld = f_pressure_ref(levels,slopes,bellies,f_tail(levels,20),f_tail(slopes,20),f_tail(bellies,20),21)
+    float valueEffect = oldRefNow-oldRefOld
+    float referenceEffect = pressure-oldRefNow
+    float levelDelta = f_delta(levels,20)
+    bool tenorWindows = true
+    for j = 0 to 5
+        tenorWindows := tenorWindows and not na(array.get(delta5,j)) and not na(array.get(delta20,j)) and not na(array.get(delta60,j))
+    bool dataGate = bondOK and ageOK(ageBond,5) and tenorWindows and array.get(states,1) != 0 and not na(levelDelta) and not na(longRank) and not na(pressure) and not na(oldRefOld) and testCount == 58
+    int currentState = array.get(states,1)
+    int currentRun = array.get(runs,1)
+    string levelLabel = na(levelRank) ? "THIẾU MẪU" : levelRank >= 80 ? "CAO" : levelRank <= 20 ? "THẤP" : "TRUNG BÌNH"
+    string slopeLabel = na(slopeRank) ? "THIẾU MẪU" : slope <= 0 ? "ĐẢO NGƯỢC" : slopeRank <= 20 ? "PHẲNG TƯƠNG ĐỐI" : slopeRank >= 80 ? "DỐC TƯƠNG ĐỐI" : "TRUNG BÌNH"
+    array<float> moves20 = array.new_float()
+    for j = 0 to 5
+        float delta = array.get(delta20,j)
+        if not na(delta)
+            array.push(moves20,delta)
+    float moveDispersion = array.size(moves20) == 6 ? array.stdev(moves20,true) : na
+    float signedBelly = f_tail(signedBellies,0)
+    float bellyMove = f_bp_difference(signedBellies,20)
+    float front = f_tail(frontSlopes,0)*100
+    float back = f_tail(backSlopes,0)*100
+    float slopeMove = f_delta(slopes,20)
+    cell(0," ",HEAD)
+    cell(1,"VN YIELDCURVELAB NEW 2.1 · BUILD 20260924-02 · " + (dataGate ? "ĐỦ ĐIỀU KIỆN BẢN TIN TRÁI PHIẾU" : "DỪNG PHÁT HÀNH"),dataGate ? HEAD : WARN)
+    cell(2,"① TPCP · CHỐT " + f_date(bondDay) + " · QA " + bondQA + " · TUỔI " + str.tostring(ageBond) + "/5d",BOND)
+    cell(3,"MẶT BẰNG " + num(level,"0.0000") + "% · 20P " + signed(levelDelta) + "bp · " + levelLabel,BOND)
+    cell(4,"ĐỘ DỐC 10Y−2Y " + num(slope,"0.0000") + " điểm % · 20P " + signed(slopeMove) + "bp · " + slopeLabel,BOND)
+    cell(5,"5Y SO NỘI SUY 2Y/10Y " + signed(signedBelly) + "bp · 20P " + signed(bellyMove) + "bp · RANK |ĐỘ CONG| " + num(bellyRank,"0.0") + "/100",BOND)
+    cell(6,"DỐC THEO NĂM 2−5Y " + num(front,"0.0") + "bp/năm · 5−10Y " + num(back,"0.0") + "bp/năm · RANK MẶT BẰNG 252P " + num(levelRank,"0.0") + " · 756P " + num(longRank,"0.0"),BOND)
+    array<string> names = array.from("1Y","2Y","3Y","5Y","7Y","10Y")
+    for j = 0 to 5
+        Ledger leg = array.get(bond,j)
+        cell(7+j,array.get(names,j) + " " + num(leg.accepted,"0.0000") + "% · 1P " + signed(array.get(delta1,j)) + " · 5P " + signed(array.get(delta5,j)) + " · 20P " + signed(array.get(delta20,j)) + " · 60P " + signed(array.get(delta60,j)) + " bp",BOND)
+    cell(13,"② ĐỘ RỘNG ≥BIÊN 5P ↓" + str.tostring(dn5) + " ↑" + str.tostring(up5) + " · 20P ↓" + str.tostring(dn20) + " ↑" + str.tostring(up20) + "/6 · PHÂN TÁN BIẾN ĐỘNG Δ20P " + num(moveDispersion,"0.0") + "bp",TX)
+    for j = 0 to 2
+        string groupName = j == 0 ? "NGẮN 1Y–2Y" : j == 1 ? "TRUNG 3Y–5Y" : "DÀI 7Y–10Y"
+        cell(14+j,groupName + " · 5P " + signed(array.get(group5,j)) + " · 20P " + signed(array.get(group20,j)) + "bp · S" + str.tostring(array.get(groupStates,j)) + ":" + str.tostring(array.get(groupRuns,j)) + "P",TX)
+    string evolution = "NHÓM 5P TRƯỚC → 5P NAY: "
+    for j = 0 to 2
+        Ledger g = array.get(groups,j)
+        evolution += (j > 0 ? " | " : "") + signed(historicalDelta(g.values,5,5)) + "→" + signed(array.get(group5,j))
+    cell(17,evolution + "bp",TX)
+    cell(18,"CỬA SỔ TPCP · 5P " + f_date(f_tail_int(clock,5)) + "→" + f_date(f_tail_int(clock,0)) + " · 20P " + f_date(f_tail_int(clock,20)) + "→" + f_date(f_tail_int(clock,0)) + " · 60P " + f_date(f_tail_int(clock,60)) + "→" + f_date(f_tail_int(clock,0)),TX)
+    cell(19,"③ CHỈ SỐ CẤU TRÚC THEO QUY ƯỚC " + num(pressure,"0.0") + "/100 · 20P " + signed(pressure-oldRefOld) + " điểm · KHÔNG LÀ XÁC SUẤT",HEAD)
+    cell(20,"Δ20P = GIÁ TRỊ " + signed(valueEffect) + " + MỐC SO SÁNH " + signed(referenceEffect) + " điểm",HEAD)
+    string sensitivity = "NGƯỠNG ×0.75 / ×1 / ×1.25: "
+    for k = 0 to 2
+        sensitivity += (k > 0 ? " | " : "") + "S" + str.tostring(array.get(states,k)) + ":" + str.tostring(array.get(runs,k)) + "P"
+    int stable = stability(array.get(states,0),array.get(states,1),array.get(states,2),array.get(runs,0),array.get(runs,1),array.get(runs,2))
+    string stableText = stable == 2 ? "CÙNG NHÃN + BỀN ≥3P" : stable == 1 ? "CÙNG NHÃN · CHƯA CÙNG BỀN" : stable == 0 ? "NHẠY NGƯỠNG" : "THIẾU MẪU"
+    cell(21,"④ TRẠNG THÁI S" + str.tostring(currentState) + ":" + str.tostring(currentRun) + "P " + stateText(currentState) + " · 5 BƯỚC TRƯỚC S" + str.tostring(f_tail_int(stateHistory,5)) + " · CONFIRMED S" + str.tostring(confirmed),HEAD)
+    cell(22,sensitivity + " · " + stableText,HEAD)
+    cell(23,"ĐỘNG HỌC 20P · " + f_curve_motion(levelDelta,slopeMove,noise20) + " · CHỈ PHÂN LOẠI KHI CẢ HAI |Δ|≥" + num(noise20,"0.0") + "bp",HEAD)
+    string observation = "CHƯA CÓ ĐIỂM MỚI RÕ; KHÔNG ÉP TẠO INSIGHT"
+    if not na(referenceEffect) and referenceEffect <= -3 and math.abs(valueEffect) < 1 and math.abs(levelDelta) < noise20
+        observation := "CHỈ SỐ GIẢM CHỦ YẾU DO MỐC SO SÁNH; CHƯA PHẢI LỢI SUẤT GIẢM RỘNG"
+    cell(24,"ĐỘ PHỦ BƯỚC 1D 5P " + str.tostring(f_valid_count(levels,6,0)) + "/6 · 10P " + str.tostring(f_valid_count(levels,11,0)) + "/11 · 20P " + str.tostring(f_valid_count(levels,21,0)) + "/21 · 60P " + str.tostring(f_valid_count(levels,61,0)) + "/61 · ĐỒNG NHÃN " + str.tostring(agreementCount) + "/" + str.tostring(eligibleCount),HEAD)
+    cell(25,"QA " + bondQA + " · 5/20/60P KỲ HẠN " + (tenorWindows ? "6/6" : "THIẾU") + " · REF 252P " + str.tostring(f_valid_count(levels,REF,1)) + "/252 · 756P " + str.tostring(f_valid_count(levels,LONG_REF,1)) + "/756 · TEST " + str.tostring(testCount) + "/58",dataGate ? HEAD : WARN)
+    cell(26,"QUAN SÁT: " + observation + " · CHỈ LỢI SUẤT TPCP · P=BƯỚC 1D, CẦN XEM ĐỘ PHỦ · NGÀY NGUỒN ≠ NGÀY CÔNG BỐ",HEAD)
+
+bondWindowSummary(int horizon) =>
+    int start = f_tail_int(clock,horizon)
+    int finish = f_tail_int(clock,0)
+    int slots = horizon+1
+    int valid = f_valid_count(levels,slots,0)
+    bool ready = bondOK and not na(start) and not na(finish) and windowOK(valid,slots,0,finish-start)
+    string answer = str.tostring(horizon) + "P " + f_date(start) + "→" + f_date(finish) + " · COVER " + str.tostring(valid) + "/" + str.tostring(slots)
+    if ready
+        float lev = f_delta(levels,horizon)
+        ready := not na(lev)
+        for j = 0 to 2
+            Ledger g = array.get(groups,j)
+            ready := ready and not na(f_delta(g.values,horizon))
+        if ready
+            answer += " · LEVEL " + signed(lev) + "bp · NGẮN/TRUNG/DÀI "
+            for j = 0 to 2
+                Ledger g = array.get(groups,j)
+                answer += (j > 0 ? "/" : "") + signed(f_delta(g.values,horizon))
+            answer += "bp"
+    if not ready
+        answer += " · THIẾU CỬA SỔ HỢP LỆ"
+    answer
+
+// Base ×1 only: compare the current label with other labels selected by the
+// same 3-bar confirmation and global >20-bar exclusion rule. Descriptive
+// selected-episode peer group, not an unconditional market rate or forecast.
+peerSummary(array<Outcome> ledgers, int state, int horizonIndex) =>
+    array<float> peers = array.new_float()
+    for s = 1 to 6
+        if s != state
+            Outcome candidate = array.get(ledgers,sampleSlot(1,s,horizonIndex))
+            int n = array.size(candidate.changes)
+            if n > 0
+                for j = 0 to n - 1
+                    array.push(peers,array.get(candidate.changes,j))
+    [array.size(peers),array.size(peers) > 0 ? array.median(peers) : float(na)]
+
+peerLine(array<Outcome> ledgers, int state, int horizonIndex) =>
+    Outcome own = array.get(ledgers,sampleSlot(1,state,horizonIndex))
+    int n = array.size(own.changes)
+    [peerN,peerMedian] = peerSummary(ledgers,state,horizonIndex)
+    float ownMedian = n > 0 ? array.median(own.changes) : na
+    str.tostring(horizonIndex == 0 ? 5 : horizonIndex == 1 ? 10 : 20) + "P · S" + str.tostring(state) + " n=" + str.tostring(n) + " TV " + signed(ownMedian) + "bp · CÁC NHÃN KHÁC n=" + str.tostring(peerN) + " TV " + signed(peerMedian) + "bp · CHÊNH TV " + signed(ownMedian-peerMedian) + "bp"
+
+// Research view is a separate image so the report view is not made denser.
+var table research = evidenceView == "Nghiên cứu" ? table.new(position.top_left,1,37,bgcolor=HEAD,frame_color=HEAD,frame_width=1) : na
+researchCell(int row, string message, color bg) =>
+    table.cell(research,0,row,message,text_color=INK,bgcolor=bg,text_size=font,text_halign=text.align_left)
+if barstate.islast and evidenceView == "Nghiên cứu"
+    int st = array.get(states,1)
+    researchCell(0," ",HEAD)
+    researchCell(1,"VN YCL NEW 2.1 · NGHIÊN CỨU ĐỢT · " + f_date(auditFirst) + "→" + f_date(auditLast),HEAD)
+    researchCell(2,"ĐO ΔLEVEL SAU NGÀY XÁC NHẬN 3P · CÁCH ĐỢT >20P · GIỮ Ô THIẾU · COVER ≥80%",HEAD)
+    researchCell(3,"HIỆN TẠI S" + str.tostring(st) + " · " + stateText(st) + " · GIỮ " + str.tostring(array.get(runs,1)) + "P",BOND)
+    researchCell(4,"CÙNG NHÃN HIỆN TẠI, 3 NGƯỠNG · TB=TRUNG BÌNH · TV=TRUNG VỊ · ĐƠN VỊ bp",HEAD)
+    for k = 0 to 2
+        string factor = k == 0 ? "×0.75" : k == 1 ? "×1" : "×1.25"
+        Outcome a = array.get(outcomes,sampleSlot(k,st,0))
+        Outcome b = array.get(outcomes,sampleSlot(k,st,1))
+        Outcome c = array.get(outcomes,sampleSlot(k,st,2))
+        researchCell(5+k*2,factor + " · 5P " + outcomeText(a) + " | 10P " + outcomeText(b),BOND)
+        researchCell(6+k*2,"20P " + outcomeText(c) + " · " + periodText(c),BOND)
+    researchCell(11,"TOÀN BỘ NHÃN BASE ×1 · ĐỢT ĐỦ 20P · KHÔNG CHỌN CHỈ NHÃN CÓ KẾT QUẢ ĐẸP",HEAD)
+    for j = 1 to 6
+        Outcome o = array.get(outcomes,sampleSlot(1,j,2))
+        string rangeText = array.size(o.changes) == 0 ? "NA" : signed(array.min(o.changes)) + "…" + signed(array.max(o.changes))
+        researchCell(11+j,"S" + str.tostring(j) + " " + stateText(j) + " · " + outcomeText(o) + " · MIN/MAX " + rangeText + "bp",TX)
+    researchCell(18,"NHẠY NGƯỠNG THEO NHÃN BASE · ĐỒNG THUẬN / NGÀY ĐỦ ĐIỀU KIỆN; KHÔNG LÀ ĐỢT",HEAD)
+    string agreementLine = ""
+    for j = 1 to 6
+        agreementLine += (j > 1 ? " | " : "") + "S" + str.tostring(j) + " " + str.tostring(array.get(auditDayAgreement,j)) + "/" + str.tostring(array.get(auditDayStates,j))
+    researchCell(19,agreementLine,HEAD)
+    for k = 0 to 2
+        Episode ep = array.get(episodes,k)
+        researchCell(20+k,"CẤU HÌNH " + str.tostring(k+1) + " · NHẬN " + str.tostring(ep.entered) + " · BỎ CHỒNG " + str.tostring(ep.overlapSkipped) + " · CHỜ 20P " + (na(ep.startIndex) ? "0" : "1") + " · CỬA SỔ LỖI " + str.tostring(ep.invalid),HEAD)
+    researchCell(23,"n<10: MẪU MỎNG (QUY ƯỚC CẢNH BÁO), KHÔNG PHẢI NGƯỠNG Ý NGHĨA THỐNG KÊ",WARN)
+    researchCell(24,"CHIA TRƯỚC/TỪ 2023 ĐỂ KIỂM TRA KHÁC BIỆT GIAI ĐOẠN; KHÔNG PHẢI NGOÀI MẪU",WARN)
+    researchCell(25,"KHÔNG CHỒNG LẤN ≠ ĐỘC LẬP · BA NGƯỠNG CÙNG DỮ LIỆU · KHÔNG CỘNG n",WARN)
+    researchCell(26,"DỮ LIỆU LỊCH SỬ HIỆN CÓ, KHÔNG LƯU VINTAGE · KHÔNG XÁC SUẤT / NHÂN QUẢ",WARN)
+    researchCell(27,"CHỈ ΔLỢI SUẤT, KHÔNG LÀ LỢI NHUẬN TRÁI PHIẾU · NATIVE " + str.tostring(testCount) + "/58",HEAD)
+    researchCell(28,"ĐỐI CHỨNG MÔ TẢ: BASE ×1 · CÁC NHÃN KHÁC CÙNG QUY TẮC CHỌN ĐỢT · KHÔNG LÀ TOÀN THỊ TRƯỜNG",HEAD)
+    researchCell(29,peerLine(outcomes,st,0),BOND)
+    researchCell(30,peerLine(outcomes,st,1),BOND)
+    researchCell(31,peerLine(outcomes,st,2),BOND)
+    researchCell(32,"CHÊNH TRUNG VỊ KHÔNG LÀ DỰ BÁO / P-VALUE; MẪU NHỎ, PHỤ THUỘC VÀ VINTAGE CHƯA ĐƯỢC LOẠI TRỪ",WARN)
+    researchCell(33,"CỬA SỔ BOND: CÙNG NGÀY NGUỒN 6/6 · KHÔNG NÉN Ô THIẾU · COVER ≥80% · P=BƯỚC 1D",HEAD)
+    researchCell(34,bondWindowSummary(5),BOND)
+    researchCell(35,bondWindowSummary(10),BOND)
+    researchCell(36,bondWindowSummary(20),BOND)

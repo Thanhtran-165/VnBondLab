@@ -1,0 +1,25 @@
+📊 VN YIELDCURVELAB NEW 2.1 | 24/09/2026
+
+🔎 ĐIỂM CHÍNH
+
+🔹 Mặt bằng lợi suất TPCP ở vùng cao so với mẫu 252 và 756 bước 1D hiện có; trong 20 bước đến 23/09 chỉ tăng 2,1 điểm cơ bản.
+🔹 Chưa kỳ hạn nào trong sáu kỳ hạn tăng hoặc giảm quá biên 5 điểm cơ bản ở cửa sổ 20 bước. Thay đổi giữa các kỳ hạn phân tán 1,7 điểm cơ bản theo chỉ tiêu trên ảnh.
+
+📆 DIỄN BIẾN 20 BƯỚC 1D (26/08–23/09)
+
+🔹 Ngắn 1–2 năm: giảm 0,2 điểm cơ bản.
+🔹 Trung 3–5 năm: tăng 1,2 điểm cơ bản.
+🔹 Dài 7–10 năm: tăng 2,0 điểm cơ bản.
+
+📐 HÌNH DẠNG VÀ ĐỘ BỀN
+
+🔹 Chênh lợi suất 10 năm–2 năm còn dương +0,7955 điểm phần trăm, nhưng tương đối phẳng so với chính lịch sử của nó. Lợi suất 5 năm cao hơn đường nội suy từ 2 và 10 năm 31,2 điểm cơ bản.
+🔹 Trạng thái “chưa có xu hướng rộng” giữ 18 bước ở ngưỡng chuẩn và có cùng nhãn ở ba bộ ngưỡng. Mặt bằng +2,1 và chênh 10 năm–2 năm +1,4 điểm cơ bản trong 20 bước chưa đủ biên 5 điểm cơ bản để phân loại động học rộng.
+
+👀 CẦN THEO DÕI
+
+🔸 Ở ảnh chốt kế tiếp, số kỳ hạn vượt biên 5 điểm cơ bản trong cửa sổ 20 bước có còn là 0/6 không.
+
+Nguồn TPCP chốt: 23/09/2026; ảnh nghiệm thu: 24/09/2026, khoảng 10:06 UTC+7. Chỉ đo lợi suất TPCP.
+
+[Mẫu nghiệm thu dùng ảnh ngày 24/09; số liệu và ngày không được sao chép cho phiên khác.]
